@@ -6,6 +6,10 @@ interface ElectronAPI {
     width: number
     height: number
   }) => Promise<void>
+  updateContentDimensionsCentered: (dimensions: {
+    width: number
+    height: number
+  }) => Promise<void>
   getRecognitionLanguages: () => Promise<Record<string, any>>
   getScreenshots: () => Promise<Array<{ path: string; preview: string }>>
   deleteScreenshot: (
@@ -63,19 +67,29 @@ interface ElectronAPI {
   getNativelyUsage: () => Promise<{ ok: boolean; plan?: string; quota?: { transcription: { used: number; limit: number; remaining: number }; ai: { used: number; limit: number; remaining: number }; search: { used: number; limit: number; remaining: number }; resets_at: string }; member_since?: string; error?: string; status?: number }>
   getStoredCredentials: () => Promise<{ hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasNativelyKey: boolean; googleServiceAccountPath: string | null; sttProvider: string; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; hasSonioxKey: boolean }>
   // Free Trial
-  startTrial:     () => Promise<{ ok: boolean; trial_token?: string; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
+  startTrial:     () => Promise<{ ok: boolean; hasToken?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
   getTrialStatus: () => Promise<{ ok: boolean; expired?: boolean; remaining_ms?: number; started_at?: string; expires_at?: string; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: object; error?: string }>
-  getLocalTrial:  () => Promise<{ hasToken: boolean; trialClaimed?: boolean; trialToken?: string; expiresAt?: string; startedAt?: string; expired?: boolean }>
+  getLocalTrial:  () => Promise<{ hasToken: boolean; trialClaimed?: boolean; expiresAt?: string; startedAt?: string; expired?: boolean }>
   convertTrial:   (choice: string) => Promise<{ ok: boolean }>
   endTrialByok:   () => Promise<{ success: boolean; error?: string }>
   onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
   onModesActiveCleared: (cb: () => void) => () => void
 
   // STT Provider Management
-  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => Promise<{ success: boolean; error?: string }>
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively' | 'local-whisper') => Promise<{ success: boolean; error?: string }>
+  localWhisperGetModels: () => Promise<{ models: any[]; activeModelId: string }>
+  localWhisperSetModel: (modelId: string) => Promise<{ success: boolean }>
+  localWhisperDeleteModel: (modelId: string) => Promise<{ success: boolean; error?: string }>
+  localWhisperStartDownload: (modelId: string) => Promise<{ success: boolean; error?: string }>
+  onLocalWhisperDownloadProgress: (callback: (data: { modelId: string; progress: number }) => void) => () => void
+  onLocalWhisperDownloadComplete: (callback: (data: { modelId: string }) => void) => () => void
+  onLocalWhisperDownloadError: (callback: (data: { modelId: string; error: string }) => void) => () => void
+  localWhisperPreload: (modelId?: string) => Promise<{ success: boolean; reason?: string; error?: string }>
+  localWhisperGetHardware: () => Promise<{ arch: string; platform: string; cpuModel: string; isAppleSilicon: boolean; totalRamGb: number; tier: string; recommendation: string; recommendedModel: string }>
   getSttProvider: () => Promise<string>
   setGroqSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setOpenAiSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
+  setOpenAiSttBaseUrl: (url: string) => Promise<{ success: boolean; error?: string }>
   setDeepgramApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setElevenLabsApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setAzureApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
@@ -108,17 +122,21 @@ interface ElectronAPI {
   getAiResponseLanguage: () => Promise<string>
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
+  onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => () => void
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean }) => void) => () => void
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => () => void
 
   // Intelligence Mode IPC
   generateAssist: () => Promise<{ insight: string | null }>
-  generateWhatToSay: (question?: string, imagePaths?: string[]) => Promise<{ answer: string | null; question?: string; error?: string }>
+  generateWhatToSay: (question?: string, imagePaths?: string[], options?: { promptInstruction?: string }) => Promise<{ answer: string | null; question?: string; error?: string; screenContextStatus?: 'not_available' | 'available' | 'failed'; ocrTextLength?: number; imageCount?: number; usedImageInput?: boolean }>
   generateFollowUp: (intent: string, userRequest?: string) => Promise<{ refined: string | null; intent: string }>
   generateRecap: () => Promise<{ summary: string | null }>
   submitManualQuestion: (question: string) => Promise<{ answer: string | null; question: string }>
   getIntelligenceContext: () => Promise<{ context: string; lastAssistantMessage: string | null; activeMode: string }>
+  testInjectTranscript: (segment: { speaker: string; text: string; timestamp?: number; final?: boolean }) => Promise<{ success: boolean; error?: string }>
+  testGetModeContext: () => Promise<{ success: boolean; block?: string; suffix?: string; error?: string }>
   resetIntelligence: () => Promise<{ success: boolean; error?: string }>
 
   // Meeting Lifecycle
@@ -142,12 +160,21 @@ interface ElectronAPI {
   onIntelligenceManualResult: (callback: (data: { answer: string; question: string }) => void) => () => void
   onIntelligenceModeChanged: (callback: (data: { mode: string }) => void) => () => void
   onIntelligenceError: (callback: (data: { error: string; mode: string }) => void) => () => void
+  // Sprint 7: dedicated negotiation-coaching channel. Replaces the
+  // sentinel-string multiplex through suggested_answer_token / suggested_answer.
+  onIntelligenceNegotiationCoaching: (callback: (data: { payload: any }) => void) => () => void
+  // Sprint 9: time-batched IPC token channel. Carries a batch of streaming
+  // tokens for ANY of the 5 streaming kinds in one IPC send. Replaces
+  // per-token sends to the 5 individual channels (which still exist as
+  // unused defense-in-depth bridges).
+  onIntelligenceTokenBatch: (callback: (data: { kind: 'suggested_answer' | 'refined_answer' | 'recap' | 'clarify' | 'follow_up_questions'; items: any[] }) => void) => () => void
 
   // Model Management
   getDefaultModel: () => Promise<{ model: string }>
   setModel: (modelId: string) => Promise<{ success: boolean; error?: string }>
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>
   toggleModelSelector: (coords: { x: number; y: number }) => Promise<void>
+  modelSelectorCloseIfOpen: () => Promise<void>
   forceRestartOllama: () => Promise<void>
 
   // Settings Window
@@ -156,6 +183,9 @@ interface ElectronAPI {
   // Groq Fast Text Mode
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>
   setGroqFastTextMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>
+  getCodexCliConfig: () => Promise<{ enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number }>
+  setCodexCliConfig: (config: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number }) => Promise<{ success: boolean; error?: string; config?: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number } }>
+  testCodexCli: (config?: { enabled?: boolean; path?: string; model?: string; fastModel?: string; timeoutMs?: number }) => Promise<{ success: boolean; error?: string; resolvedPath?: string; config?: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number } }>
 
   // Demo
   seedDemo: () => Promise<{ success: boolean }>
@@ -255,6 +285,22 @@ interface ElectronAPI {
   // Global shortcut events (stealth: fired even when window is not focused)
   onGlobalShortcut: (callback: (data: { action: string }) => void) => () => void
 
+  // CGEventTap-backed stealth keyboard tap (macOS only). Returns false on
+  // non-macOS or when the native module / Accessibility permission is missing.
+  stealthTapAvailable: () => Promise<boolean>
+  stealthTapPermissionGranted: () => Promise<boolean>
+  stealthTapRequestPermission: () => Promise<boolean>
+  stealthTapOpenSettings: () => Promise<void>
+  stealthTapIsActive: () => Promise<boolean>
+  stealthTapStop: () => Promise<void>
+  stealthTapStart: () => Promise<boolean>
+  /** False on macOS when a composition IME (Pinyin/Hangul/Kanji/…) is
+   *  enabled — the tap captures below the IME and breaks composition, so
+   *  the renderer falls back to plain DOM focus on click. */
+  stealthTapShouldAutoEngage: () => Promise<boolean>
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => () => void
+  onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => () => void
+
   // Donation API
   getDonationStatus: () => Promise<{ shouldShow: boolean; hasDonated: boolean; lifetimeShows: number }>;
   markDonationToastShown: () => Promise<{ success: boolean }>;
@@ -286,6 +332,24 @@ interface ElectronAPI {
   // Verbose / Debug Logging
   getVerboseLogging: () => Promise<boolean>;
   setVerboseLogging: (enabled: boolean) => Promise<{ success: boolean }>;
+  getMeetingRetention: () => Promise<'forever' | '7d' | '30d' | 'never'>;
+  setMeetingRetention: (retention: 'forever' | '7d' | '30d' | 'never') => Promise<{ success: boolean; error?: string }>;
+  onMeetingRetentionChanged: (callback: (retention: 'forever' | '7d' | '30d' | 'never') => void) => () => void;
+  getProviderDataScopes: () => Promise<{ transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }>;
+  setProviderDataScopes: (scopes: { transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }) => Promise<{ success: boolean; error?: string }>;
+  onProviderDataScopesChanged: (callback: (scopes: { transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }) => void) => () => void;
+  getScreenUnderstandingMode: () => Promise<'vision_first' | 'vision_only' | 'private_vision'>;
+  setScreenUnderstandingMode: (mode: 'vision_first' | 'vision_only' | 'private_vision') => Promise<{ success: boolean; error?: string }>;
+  onScreenUnderstandingModeChanged: (callback: (mode: 'vision_first' | 'vision_only' | 'private_vision') => void) => () => void;
+  getTechnicalInterviewVisionFirst: () => Promise<boolean>;
+  setTechnicalInterviewVisionFirst: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  onTechnicalInterviewVisionFirstChanged: (callback: (enabled: boolean) => void) => () => void;
+  /** @deprecated alias for technicalInterviewVisionFirst — retained so older renderer builds keep working. */
+  getTechnicalInterviewDirectVision: () => Promise<boolean>;
+  /** @deprecated alias for technicalInterviewVisionFirst — retained so older renderer builds keep working. */
+  setTechnicalInterviewDirectVision: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  /** @deprecated alias for technicalInterviewVisionFirstChanged — retained so older renderer builds keep working. */
+  onTechnicalInterviewDirectVisionChanged: (callback: (enabled: boolean) => void) => () => void;
   getLogFilePath: () => Promise<string | null>;
   openLogFile: () => Promise<{ success: boolean; error?: string }>;
 
@@ -339,6 +403,8 @@ export const PROCESSING_EVENTS = {
 contextBridge.exposeInMainWorld("electronAPI", {
   updateContentDimensions: (dimensions: { width: number; height: number }) =>
     ipcRenderer.invoke("update-content-dimensions", dimensions),
+  updateContentDimensionsCentered: (dimensions: { width: number; height: number }) =>
+    ipcRenderer.invoke("update-content-dimensions-centered", dimensions),
   getRecognitionLanguages: () => ipcRenderer.invoke("get-recognition-languages"),
   takeScreenshot: () => ipcRenderer.invoke("take-screenshot"),
   takeSelectiveScreenshot: () => ipcRenderer.invoke("take-selective-screenshot"),
@@ -522,6 +588,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
     }
   },
 
+  // Phone Mirror — stream live AI responses to a paired phone over the LAN.
+  phoneMirrorGetInfo: () => ipcRenderer.invoke("phone-mirror:get-info"),
+  phoneMirrorEnable: (exposeOnLan: boolean) => ipcRenderer.invoke("phone-mirror:enable", exposeOnLan),
+  phoneMirrorDisable: () => ipcRenderer.invoke("phone-mirror:disable"),
+  phoneMirrorSetLan: (exposeOnLan: boolean) => ipcRenderer.invoke("phone-mirror:set-lan", exposeOnLan),
+  phoneMirrorRotateToken: () => ipcRenderer.invoke("phone-mirror:rotate-token"),
+  onPhoneMirrorStatus: (callback: (info: any) => void) => {
+    const subscription = (_: any, info: any) => callback(info)
+    ipcRenderer.on('phone-mirror:status', subscription)
+    return () => { ipcRenderer.removeListener('phone-mirror:status', subscription) }
+  },
+
   onSettingsVisibilityChange: (callback: (isVisible: boolean) => void) => {
     const subscription = (_: any, isVisible: boolean) => callback(isVisible)
     ipcRenderer.on("settings-visibility-changed", subscription)
@@ -573,10 +651,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   // STT Provider Management
-  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively') => ipcRenderer.invoke("set-stt-provider", provider),
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively' | 'local-whisper') => ipcRenderer.invoke("set-stt-provider", provider),
   getSttProvider: () => ipcRenderer.invoke("get-stt-provider"),
   setGroqSttApiKey: (apiKey: string) => ipcRenderer.invoke("set-groq-stt-api-key", apiKey),
   setOpenAiSttApiKey: (apiKey: string) => ipcRenderer.invoke("set-openai-stt-api-key", apiKey),
+  setOpenAiSttBaseUrl: (url: string) => ipcRenderer.invoke("set-openai-stt-base-url", url),
   setDeepgramApiKey: (apiKey: string) => ipcRenderer.invoke("set-deepgram-api-key", apiKey),
   setElevenLabsApiKey: (apiKey: string) => ipcRenderer.invoke("set-elevenlabs-api-key", apiKey),
   setAzureApiKey: (apiKey: string) => ipcRenderer.invoke("set-azure-api-key", apiKey),
@@ -586,6 +665,27 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setSonioxApiKey: (apiKey: string) => ipcRenderer.invoke("set-soniox-api-key", apiKey),
   setIbmWatsonRegion: (region: string) => ipcRenderer.invoke("set-ibmwatson-region", region),
   testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', apiKey: string, region?: string) => ipcRenderer.invoke("test-stt-connection", provider, apiKey, region),
+  localWhisperGetModels: () => ipcRenderer.invoke('local-whisper-get-models'),
+  localWhisperSetModel: (modelId: string) => ipcRenderer.invoke('local-whisper-set-model', modelId),
+  localWhisperDeleteModel: (modelId: string) => ipcRenderer.invoke('local-whisper-delete-model', modelId),
+  localWhisperStartDownload: (modelId: string) => ipcRenderer.invoke('local-whisper-start-download', modelId),
+  onLocalWhisperDownloadProgress: (cb: (data: { modelId: string; progress: number }) => void) => {
+    const listener = (_: any, data: any) => cb(data);
+    ipcRenderer.on('local-whisper-download-progress', listener);
+    return () => ipcRenderer.removeListener('local-whisper-download-progress', listener);
+  },
+  onLocalWhisperDownloadComplete: (cb: (data: { modelId: string }) => void) => {
+    const listener = (_: any, data: any) => cb(data);
+    ipcRenderer.on('local-whisper-download-complete', listener);
+    return () => ipcRenderer.removeListener('local-whisper-download-complete', listener);
+  },
+  onLocalWhisperDownloadError: (cb: (data: { modelId: string; error: string }) => void) => {
+    const listener = (_: any, data: any) => cb(data);
+    ipcRenderer.on('local-whisper-download-error', listener);
+    return () => ipcRenderer.removeListener('local-whisper-download-error', listener);
+  },
+  localWhisperPreload: (modelId?: string) => ipcRenderer.invoke('local-whisper-preload', modelId),
+  localWhisperGetHardware: () => ipcRenderer.invoke('local-whisper-get-hardware'),
 
   // STT Config Events (Adapted from public PR #173 — verify premium interaction)
   onSttConfigChanged: (callback: (data: { configured: boolean; provider: string }) => void) => {
@@ -670,6 +770,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on('system-audio-permission-denied', subscription);
     return () => { ipcRenderer.removeListener('system-audio-permission-denied', subscription); };
   },
+  onDeviceSelectionApplied: (callback: (payload: { kind: 'input' | 'output'; requested: string | null; actual: string | null; fellBack: boolean; reason?: string }) => void) => {
+    const subscription = (_: any, payload: any) => callback(payload);
+    ipcRenderer.on('device-selection-applied', subscription);
+    return () => { ipcRenderer.removeListener('device-selection-applied', subscription); };
+  },
+  onAudioCaptureFailed: (callback: (payload: { channel: 'system' | 'mic'; message: string; attempt: number; maxAttempts: number; terminal?: boolean; stuck?: boolean }) => void) => {
+    const subscription = (_: any, payload: any) => callback(payload);
+    ipcRenderer.on('audio-capture-failed', subscription);
+    return () => { ipcRenderer.removeListener('audio-capture-failed', subscription); };
+  },
 
   // STT Status Events
   onSttStatusChanged: (callback: (data: { state: 'connected' | 'reconnecting' | 'failed'; provider: string; error?: string; channel: 'user' | 'interviewer'; reconnectAttempts?: number }) => void) => {
@@ -680,7 +790,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // Intelligence Mode IPC
   generateAssist: () => ipcRenderer.invoke("generate-assist"),
-  generateWhatToSay: (question?: string, imagePaths?: string[]) => ipcRenderer.invoke("generate-what-to-say", question, imagePaths),
+  generateWhatToSay: (question?: string, imagePaths?: string[], options?: { promptInstruction?: string }) => ipcRenderer.invoke("generate-what-to-say", question, imagePaths, options),
   generateClarify: () => ipcRenderer.invoke("generate-clarify"),
   generateCodeHint: (imagePaths?: string[], problemStatement?: string) => ipcRenderer.invoke("generate-code-hint", imagePaths, problemStatement),
   generateBrainstorm: (imagePaths?: string[], problemStatement?: string) => ipcRenderer.invoke("generate-brainstorm", imagePaths, problemStatement),
@@ -689,6 +799,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   generateRecap: () => ipcRenderer.invoke("generate-recap"),
   submitManualQuestion: (question: string) => ipcRenderer.invoke("submit-manual-question", question),
   getIntelligenceContext: () => ipcRenderer.invoke("get-intelligence-context"),
+  testInjectTranscript: (segment: { speaker: string; text: string; timestamp?: number; final?: boolean }) => ipcRenderer.invoke("test-inject-transcript", segment),
+  testGetModeContext: () => ipcRenderer.invoke("test-get-mode-context"),
   resetIntelligence: () => ipcRenderer.invoke("reset-intelligence"),
 
   // Action Button Mode (Dynamic Recap / Brainstorm toggle)
@@ -735,6 +847,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.removeListener("intelligence-assist-update", subscription)
     }
   },
+  // Phase 3 — Dynamic Action Cards
+  onIntelligenceDynamicAction: (callback: (data: { action: any }) => void) => {
+    const subscription = (_: any, data: any) => callback(data)
+    ipcRenderer.on("intelligence-dynamic-action", subscription)
+    return () => {
+      ipcRenderer.removeListener("intelligence-dynamic-action", subscription)
+    }
+  },
+  acceptDynamicAction: (actionId: string) => ipcRenderer.invoke("dynamic-action:accept", actionId),
+  dismissDynamicAction: (actionId: string) => ipcRenderer.invoke("dynamic-action:dismiss", actionId),
+  listDynamicActions: () => ipcRenderer.invoke("dynamic-action:list"),
   onIntelligenceSuggestedAnswerToken: (callback: (data: { token: string; question: string; confidence: number }) => void) => {
     const subscription = (_: any, data: any) => callback(data)
     ipcRenderer.on("intelligence-suggested-answer-token", subscription)
@@ -747,6 +870,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("intelligence-suggested-answer", subscription)
     return () => {
       ipcRenderer.removeListener("intelligence-suggested-answer", subscription)
+    }
+  },
+  // Sprint 7: dedicated negotiation-coaching channel.
+  onIntelligenceNegotiationCoaching: (callback: (data: { payload: any }) => void) => {
+    const subscription = (_: any, data: any) => callback(data)
+    ipcRenderer.on("intelligence-negotiation-coaching", subscription)
+    return () => {
+      ipcRenderer.removeListener("intelligence-negotiation-coaching", subscription)
+    }
+  },
+  // Sprint 9: time-batched IPC token channel.
+  onIntelligenceTokenBatch: (callback: (data: { kind: string; items: any[] }) => void) => {
+    const subscription = (_: any, data: any) => callback(data)
+    ipcRenderer.on("intelligence-token-batch", subscription)
+    return () => {
+      ipcRenderer.removeListener("intelligence-token-batch", subscription)
     }
   },
   onIntelligenceRefinedAnswerToken: (callback: (data: { token: string; intent: string }) => void) => {
@@ -874,6 +1013,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setModel: (modelId: string) => ipcRenderer.invoke('set-model', modelId),
   setDefaultModel: (modelId: string) => ipcRenderer.invoke('set-default-model', modelId),
   toggleModelSelector: (coords: { x: number; y: number }) => ipcRenderer.invoke('toggle-model-selector', coords),
+  modelSelectorCloseIfOpen: () => ipcRenderer.invoke('model-selector:close-if-open'),
   forceRestartOllama: () => ipcRenderer.invoke('force-restart-ollama'),
 
   // Settings Window
@@ -882,6 +1022,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Groq Fast Text Mode
   getGroqFastTextMode: () => ipcRenderer.invoke('get-groq-fast-text-mode'),
   setGroqFastTextMode: (enabled: boolean) => ipcRenderer.invoke('set-groq-fast-text-mode', enabled),
+  getCodexCliConfig: () => ipcRenderer.invoke('get-codex-cli-config'),
+  setCodexCliConfig: (config: { enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number }) => ipcRenderer.invoke('set-codex-cli-config', config),
+  testCodexCli: (config?: { enabled?: boolean; path?: string; model?: string; fastModel?: string; timeoutMs?: number }) => ipcRenderer.invoke('test-codex-cli', config),
 
   // Demo
   seedDemo: () => ipcRenderer.invoke('seed-demo'),
@@ -1095,6 +1238,26 @@ contextBridge.exposeInMainWorld("electronAPI", {
     }
   },
 
+  // Stealth keyboard tap bridge
+  stealthTapAvailable: () => ipcRenderer.invoke('stealth-tap:available'),
+  stealthTapPermissionGranted: () => ipcRenderer.invoke('stealth-tap:permission-granted'),
+  stealthTapRequestPermission: () => ipcRenderer.invoke('stealth-tap:request-permission'),
+  stealthTapOpenSettings: () => ipcRenderer.invoke('stealth-tap:open-settings'),
+  stealthTapIsActive: () => ipcRenderer.invoke('stealth-tap:is-active'),
+  stealthTapStop: () => ipcRenderer.invoke('stealth-tap:stop'),
+  stealthTapStart: () => ipcRenderer.invoke('stealth-tap:start'),
+  stealthTapShouldAutoEngage: () => ipcRenderer.invoke('stealth-tap:should-auto-engage'),
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => {
+    const sub = (_: any, state: { active: boolean; reason?: string }) => cb(state)
+    ipcRenderer.on('stealth-tap-state', sub)
+    return () => { ipcRenderer.removeListener('stealth-tap-state', sub) }
+  },
+  onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => {
+    const sub = (_: any, ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => cb(ev)
+    ipcRenderer.on('stealth-key-captured', sub)
+    return () => { ipcRenderer.removeListener('stealth-key-captured', sub) }
+  },
+
   // Donation API
   getDonationStatus: () => ipcRenderer.invoke("get-donation-status"),
   markDonationToastShown: () => ipcRenderer.invoke("mark-donation-toast-shown"),
@@ -1161,6 +1324,45 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Verbose / Debug Logging
   getVerboseLogging: () => ipcRenderer.invoke('get-verbose-logging'),
   setVerboseLogging: (enabled: boolean) => ipcRenderer.invoke('set-verbose-logging', enabled),
+  getMeetingRetention: () => ipcRenderer.invoke('get-meeting-retention'),
+  setMeetingRetention: (retention: 'forever' | '7d' | '30d' | 'never') => ipcRenderer.invoke('set-meeting-retention', retention),
+  onMeetingRetentionChanged: (callback: (retention: 'forever' | '7d' | '30d' | 'never') => void) => {
+    const subscription = (_: any, retention: 'forever' | '7d' | '30d' | 'never') => callback(retention);
+    ipcRenderer.on('meeting-retention-changed', subscription);
+    return () => { ipcRenderer.removeListener('meeting-retention-changed', subscription); };
+  },
+  getProviderDataScopes: () => ipcRenderer.invoke('get-provider-data-scopes'),
+  setProviderDataScopes: (scopes: any) => ipcRenderer.invoke('set-provider-data-scopes', scopes),
+  onProviderDataScopesChanged: (callback: (scopes: any) => void) => {
+    const subscription = (_: any, scopes: any) => callback(scopes);
+    ipcRenderer.on('provider-data-scopes-changed', subscription);
+    return () => { ipcRenderer.removeListener('provider-data-scopes-changed', subscription); };
+  },
+  getScreenUnderstandingMode: () => ipcRenderer.invoke('get-screen-understanding-mode'),
+  setScreenUnderstandingMode: (mode: 'vision_first' | 'vision_only' | 'private_vision') =>
+    ipcRenderer.invoke('set-screen-understanding-mode', mode),
+  onScreenUnderstandingModeChanged: (callback: (mode: 'vision_first' | 'vision_only' | 'private_vision') => void) => {
+    const subscription = (_: any, mode: 'vision_first' | 'vision_only' | 'private_vision') => callback(mode);
+    ipcRenderer.on('screen-understanding-mode-changed', subscription);
+    return () => { ipcRenderer.removeListener('screen-understanding-mode-changed', subscription); };
+  },
+  getTechnicalInterviewVisionFirst: () => ipcRenderer.invoke('get-technical-interview-vision-first'),
+  setTechnicalInterviewVisionFirst: (enabled: boolean) =>
+    ipcRenderer.invoke('set-technical-interview-vision-first', enabled),
+  onTechnicalInterviewVisionFirstChanged: (callback: (enabled: boolean) => void) => {
+    const subscription = (_: any, enabled: boolean) => callback(enabled);
+    ipcRenderer.on('technical-interview-vision-first-changed', subscription);
+    return () => { ipcRenderer.removeListener('technical-interview-vision-first-changed', subscription); };
+  },
+  // Deprecated aliases — kept so renderer builds compiled against the old API keep working.
+  getTechnicalInterviewDirectVision: () => ipcRenderer.invoke('get-technical-interview-direct-vision'),
+  setTechnicalInterviewDirectVision: (enabled: boolean) =>
+    ipcRenderer.invoke('set-technical-interview-direct-vision', enabled),
+  onTechnicalInterviewDirectVisionChanged: (callback: (enabled: boolean) => void) => {
+    const subscription = (_: any, enabled: boolean) => callback(enabled);
+    ipcRenderer.on('technical-interview-vision-first-changed', subscription);
+    return () => { ipcRenderer.removeListener('technical-interview-vision-first-changed', subscription); };
+  },
   getLogFilePath: () => ipcRenderer.invoke('get-log-file-path'),
   openLogFile: () => ipcRenderer.invoke('open-log-file'),
   

@@ -19,6 +19,10 @@ export interface Meeting {
         actionItemsTitle?: string;
         keyPointsTitle?: string;
         sections?: Array<{ title: string; bullets: string[] }>;
+        schemaVersion?: number;
+        actionItemsStructured?: Array<{ id: string; text: string; owner?: string; deadline?: string; sourceTimestamp?: number }>;
+        followUpDraft?: string;
+        coachingInsights?: Array<{ id: string; type: string; title: string; detail: string; severity: 'info' | 'opportunity' | 'warning'; evidence?: string }>;
     };
     transcript?: Array<{
         speaker: string;
@@ -704,7 +708,7 @@ export class DatabaseManager {
     }
 
     public addReferenceFile(file: { id: string; modeId: string; fileName: string; content: string }): void {
-        if (!this.db) return;
+        if (!this.db) throw new Error('Database not initialized');
         try {
             this.db.prepare(`
                 INSERT INTO mode_reference_files (id, mode_id, file_name, content)
@@ -712,6 +716,7 @@ export class DatabaseManager {
             `).run(file.id, file.modeId, file.fileName, file.content);
         } catch (e) {
             console.error('[DatabaseManager] addReferenceFile failed:', e);
+            throw e;
         }
     }
 

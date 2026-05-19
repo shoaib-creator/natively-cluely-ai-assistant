@@ -17,11 +17,23 @@ import WebSocket from 'ws';
 import axios from 'axios';
 import FormData from 'form-data';
 import { RECOGNITION_LANGUAGES } from '../config/languages';
+import { streamingStttWsOptions } from './dnsHelpers';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+const DEFAULT_OPENAI_BASE = 'https://api.openai.com';
 const REALTIME_WS_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
 const REST_ENDPOINT   = 'https://api.openai.com/v1/audio/transcriptions';
+
+/** Derive REST transcription endpoint from a user-supplied base URL.
+ *  Strips a trailing slash so we don't end up with `//v1/...`. Accepts both
+ *  `https://my-host.tld` and `https://my-host.tld/v1` (the latter occurs in the wild). */
+function deriveRestEndpoint(baseUrl: string): string {
+    const trimmed = baseUrl.replace(/\/+$/, '');
+    return /\/v\d+$/.test(trimmed)
+        ? `${trimmed}/audio/transcriptions`
+        : `${trimmed}/v1/audio/transcriptions`;
+}
 
 /** WebSocket model priority order */
 const WS_MODELS = ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe'] as const;
@@ -109,12 +121,24 @@ export class OpenAIStreamingSTT extends EventEmitter {
     private restIsUploading        = false;
     private restFlushPending       = false;
 
+    // Custom OpenAI-compatible endpoint (e.g. self-hosted Speaches). When set, the
+    // WebSocket Realtime path is skipped — third-party servers don't implement it.
+    private restEndpoint: string = REST_ENDPOINT;
+    private isCustomEndpoint = false;
+
     // ─── Constructor ──────────────────────────────────────────────────────────
 
-    constructor(apiKey: string) {
+    constructor(apiKey: string, baseUrl?: string) {
         super();
         this.apiKey = apiKey;
-        console.log('[OpenAIStreaming] Initialized — WebSocket priority (gpt-4o-transcribe → gpt-4o-mini-transcribe → whisper-1 REST)');
+        const effectiveBase = (baseUrl || '').trim();
+        if (effectiveBase && effectiveBase !== DEFAULT_OPENAI_BASE) {
+            this.restEndpoint = deriveRestEndpoint(effectiveBase);
+            this.isCustomEndpoint = true;
+            console.log(`[OpenAIStreaming] Initialized — custom endpoint (REST only): ${this.restEndpoint}`);
+        } else {
+            console.log('[OpenAIStreaming] Initialized — WebSocket priority (gpt-4o-transcribe → gpt-4o-mini-transcribe → whisper-1 REST)');
+        }
     }
 
     // ─── Public Configuration (STTProvider interface) ─────────────────────────
@@ -159,8 +183,16 @@ export class OpenAIStreamingSTT extends EventEmitter {
         this.wsModelIndex   = 0;
         this.wsFailures     = 0;
         this.reconnectAttempts = 0;
-        this.mode           = 'ws';
 
+        // Custom endpoints (e.g. Speaches) don't implement OpenAI's Realtime WebSocket
+        // protocol. Go straight to REST mode for them.
+        if (this.isCustomEndpoint) {
+            this.mode = 'rest';
+            this._switchToRest();
+            return;
+        }
+
+        this.mode = 'ws';
         this._connectWs();
     }
 
@@ -172,19 +204,26 @@ export class OpenAIStreamingSTT extends EventEmitter {
 
         // Flush any remaining buffered audio to the WS before closing so we
         // don't silently drop up to ~250ms of speech at the end of a session.
+        // Then commit the input buffer so the server transcribes the trailing
+        // audio even if its VAD hasn't tripped on the silence yet.
         if (this.mode === 'ws' && this.ws?.readyState === WebSocket.OPEN &&
-            this.isSessionReady && this.pcmAccumulatorLen > 0) {
-            const combined = new Int16Array(this.pcmAccumulatorLen);
-            let offset = 0;
-            for (const arr of this.pcmAccumulator) {
-                combined.set(arr, offset);
-                offset += arr.length;
+            this.isSessionReady) {
+            if (this.pcmAccumulatorLen > 0) {
+                const combined = new Int16Array(this.pcmAccumulatorLen);
+                let offset = 0;
+                for (const arr of this.pcmAccumulator) {
+                    combined.set(arr, offset);
+                    offset += arr.length;
+                }
+                try {
+                    this.ws.send(JSON.stringify({
+                        type:  'input_audio_buffer.append',
+                        audio: Buffer.from(combined.buffer).toString('base64'),
+                    }));
+                } catch { /* ignore — we're closing anyway */ }
             }
             try {
-                this.ws.send(JSON.stringify({
-                    type:  'input_audio_buffer.append',
-                    audio: Buffer.from(combined.buffer).toString('base64'),
-                }));
+                this.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
             } catch { /* ignore — we're closing anyway */ }
         }
 
@@ -235,6 +274,41 @@ export class OpenAIStreamingSTT extends EventEmitter {
         // WebSocket path: server VAD handles this; nothing to do.
     }
 
+    public finalize(): void {
+        if (!this.isActive) return;
+        if (this.mode === 'rest') {
+            console.log('[OpenAIStreaming][REST] Finalize — flushing buffer');
+            this._restFlushAndUpload();
+            return;
+        }
+        if (this.ws?.readyState !== WebSocket.OPEN || !this.isSessionReady) return;
+
+        if (this.pcmAccumulatorLen > 0) {
+            const combined = new Int16Array(this.pcmAccumulatorLen);
+            let offset = 0;
+            for (const arr of this.pcmAccumulator) {
+                combined.set(arr, offset);
+                offset += arr.length;
+            }
+            this.pcmAccumulator = [];
+            this.pcmAccumulatorLen = 0;
+            try {
+                this.ws.send(JSON.stringify({
+                    type:  'input_audio_buffer.append',
+                    audio: Buffer.from(combined.buffer).toString('base64'),
+                }));
+            } catch (err) {
+                console.error('[OpenAIStreaming][WS] Finalize append failed:', err);
+            }
+        }
+        try {
+            this.ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+            console.log('[OpenAIStreaming][WS] Finalize — committed input buffer');
+        } catch (err) {
+            console.error('[OpenAIStreaming][WS] Finalize commit failed:', err);
+        }
+    }
+
     // ─── WebSocket Path ───────────────────────────────────────────────────────
 
     private _connectWs(): void {
@@ -245,12 +319,13 @@ export class OpenAIStreamingSTT extends EventEmitter {
         const model: WsModel = WS_MODELS[this.wsModelIndex] ?? WS_MODELS[0];
         console.log(`[OpenAIStreaming] Connecting WebSocket (model=${model}, attempt=${this.reconnectAttempts + 1})...`);
 
-        this.ws = new WebSocket(REALTIME_WS_URL, {
+        // streamingStttWsOptions: IPv4-only DNS + 15s handshake cap (dnsHelpers.ts).
+        this.ws = new WebSocket(REALTIME_WS_URL, streamingStttWsOptions({
             headers: {
                 Authorization:   `Bearer ${this.apiKey}`,
                 'OpenAI-Beta':   'realtime=v1',
             },
-        });
+        }) as any);
 
         // 10-second connection timeout to prevent hanging on dropped networks
         this.connectionTimeoutTimer = setTimeout(() => {
@@ -408,7 +483,7 @@ export class OpenAIStreamingSTT extends EventEmitter {
 
             case 'transcript.text.done':
                 if (msg.text) {
-                    console.log(`[OpenAIStreaming] Final: "${msg.text.substring(0, 60)}"`);
+                    console.log(`[OpenAIStreaming] Final transcript received`, { length: msg.text.length });
                     this.emit('transcript', {
                         text:       msg.text,
                         isFinal:    true,
@@ -655,7 +730,7 @@ export class OpenAIStreamingSTT extends EventEmitter {
         try {
             const transcript = await this._restUpload(wavBuffer);
             if (transcript && transcript.trim().length > 0) {
-                console.log(`[OpenAIStreaming][REST] Transcript: "${transcript.substring(0, 60)}"`);
+                console.log(`[OpenAIStreaming][REST] Transcript received`, { length: transcript.trim().length });
                 this.emit('transcript', {
                     text:       transcript.trim(),
                     isFinal:    true,
@@ -687,7 +762,7 @@ export class OpenAIStreamingSTT extends EventEmitter {
             : '';
         if (lang) form.append('language', lang);
 
-        const response = await axios.post(REST_ENDPOINT, form, {
+        const response = await axios.post(this.restEndpoint, form, {
             headers: {
                 Authorization: `Bearer ${this.apiKey}`,
                 ...form.getHeaders(),

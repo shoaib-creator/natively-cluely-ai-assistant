@@ -8,9 +8,14 @@ import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
 import { AudioDevices } from "./audio/AudioDevices";
+import { PhoneMirrorService } from "./services/PhoneMirrorService";
+import { CodexCliService } from "./services/CodexCliService";
+import { SettingsManager } from "./services/SettingsManager";
 
 
 import { RECOGNITION_LANGUAGES, AI_RESPONSE_LANGUAGES } from "./config/languages"
+import { TRIAL_SENTINEL_KEY } from "./config/constants"
+import { CHAT_MODE_PROMPT } from "./llm/prompts"
 
 export function initializeIpcHandlers(appState: AppState): void {
   const safeHandle = (channel: string, listener: (event: any, ...args: any[]) => Promise<any> | any) => {
@@ -227,6 +232,20 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   )
 
+  // Centered variant: keeps horizontal center fixed during width changes.
+  // Used by code-expansion animations to prevent the top pill from sliding sideways.
+  safeHandle(
+    "update-content-dimensions-centered",
+    async (event, { width, height }: { width: number; height: number }) => {
+      if (!width || !height) return
+      const senderWebContents = event.sender
+      const overlayWin = appState.getWindowHelper().getOverlayWindow()
+      if (overlayWin && !overlayWin.isDestroyed() && overlayWin.webContents.id === senderWebContents.id) {
+        appState.getWindowHelper().setOverlayDimensionsCentered(width, height)
+      }
+    }
+  )
+
   safeHandle("set-window-mode", async (event, mode: 'launcher' | 'overlay', inactive?: boolean) => {
     appState.getWindowHelper().setWindowMode(mode, inactive);
     return { success: true };
@@ -392,7 +411,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const result = await appState.processingHelper.getLLMHelper().chatWithGemini(message, imagePaths, context, options?.skipSystemPrompt);
 
-      console.log(`[IPC] gemini - chat response: `, result ? result.substring(0, 50) : "(empty)");
+      console.log(`[IPC] gemini - chat response received`, { length: result?.length ?? 0 });
 
       // Don't process empty responses
       if (!result || result.trim().length === 0) {
@@ -416,7 +435,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // 2. Add assistant response and set as last message
       console.log(`[IPC] Updating IntelligenceManager with assistant message...`);
       intelligenceManager.addAssistantMessage(result);
-      console.log(`[IPC] Updated IntelligenceManager.Last message: `, intelligenceManager.getLastAssistantMessage()?.substring(0, 50));
+      console.log(`[IPC] Updated IntelligenceManager.Last message`, { length: intelligenceManager.getLastAssistantMessage()?.length ?? 0 });
 
       // Log Usage
       intelligenceManager.logUsage('chat', message, result);
@@ -434,6 +453,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   // that a newer stream has taken over.
   let _chatStreamId = 0;
 
+  // Matches narrow identity/meta probes only. Kept tight so coding/normal asks don't trip it.
+  // Prevents the small fast-mode model from over-firing the "I'm Natively" canned reply
+  // (which used to escape the prompt's hard rule for any ambiguous input).
+  const IDENTITY_PROBE_RE = /^\s*(who\s+(are|r)\s+(you|u|this|natively)|what\s+(are|r)\s+(you|u)|are\s+you\s+(chatgpt|gpt[-\s]?\d?|claude|gemini|llama|an?\s+(ai|bot|llm|model|assistant))|what('?s|\s+is)\s+your\s+(name|model)|which\s+(ai|model|llm)\s+are\s+you|who\s+(made|built|created|developed|trained)\s+(you|this|natively)|what\s+model\s+(are\s+you|do\s+you\s+use)|introduce\s+yourself)\s*\??\s*$/i;
+  const CREATOR_PROBE_RE = /^\s*(who\s+(made|built|created|developed|trained)\s+(you|this|natively))\s*\??\s*$/i;
+
   safeHandle("gemini-chat-stream", async (event, message: string, imagePaths?: string[], context?: string, options?: { skipSystemPrompt?: boolean, ignoreKnowledgeMode?: boolean }) => {
     try {
       console.log("[IPC] gemini-chat-stream started using LLMHelper.streamChat");
@@ -442,8 +467,49 @@ export function initializeIpcHandlers(appState: AppState): void {
       // Claim a new stream ID — any prior stream will detect this and stop emitting.
       const myStreamId = ++_chatStreamId;
 
-      // Update IntelligenceManager with USER message immediately
       const intelligenceManager = appState.getIntelligenceManager();
+
+      // Identity probe short-circuit — bypasses the LLM entirely so small models can't
+      // reframe the canned reply or misfire it on coding asks (the original bug).
+      // Regex is `^...$` anchored, so non-probe questions cannot match.
+      if (!imagePaths?.length && typeof message === 'string') {
+        const identityHit = CREATOR_PROBE_RE.test(message)
+          ? "I was developed by Evin John."
+          : (IDENTITY_PROBE_RE.test(message) ? "I'm Natively, an AI assistant." : null);
+        if (identityHit) {
+          intelligenceManager.addTranscript({ text: message, speaker: 'user', timestamp: Date.now(), final: true }, true);
+          try { PhoneMirrorService.getInstance().publishUserMessage(String(myStreamId), message); } catch (_) { /* noop */ }
+          // Guard against a newer chat stream having taken over while we were computing
+          // the canned reply — matches the protection the LLM path uses around its token
+          // loop. Prevents cross-stream UI bleed.
+          if (_chatStreamId !== myStreamId) {
+            console.log(`[IPC] gemini-chat-stream ${myStreamId} (identity probe) superseded by ${_chatStreamId}, skipping emit.`);
+            return null;
+          }
+          event.sender.send("gemini-stream-token", identityHit);
+          event.sender.send("gemini-stream-done");
+          try { PhoneMirrorService.getInstance().publishToken(String(myStreamId), identityHit); } catch (_) { /* noop */ }
+          try { PhoneMirrorService.getInstance().publishDone(String(myStreamId), identityHit); } catch (_) { /* noop */ }
+          intelligenceManager.addAssistantMessage(identityHit);
+          intelligenceManager.logUsage('chat', message, identityHit);
+          return null;
+        }
+      }
+
+      // Capture rolling context BEFORE adding the new user message — otherwise the
+      // 100s window would echo back the user's just-typed message as both context and
+      // question, confusing small models (the "20-char context" log line was just an echo).
+      let autoContextSnapshot: string | undefined;
+      if (!context) {
+        try {
+          const snap = intelligenceManager.getFormattedContext(100);
+          if (snap && snap.trim().length > 0) autoContextSnapshot = snap;
+        } catch (ctxErr) {
+          console.warn("[IPC] Failed to capture pre-turn context:", ctxErr);
+        }
+      }
+
+      // Now add USER message to IntelligenceManager (after context snapshot)
       intelligenceManager.addTranscript({
         text: message,
         speaker: 'user',
@@ -451,26 +517,25 @@ export function initializeIpcHandlers(appState: AppState): void {
         final: true
       }, true);
 
+      // Mirror to phone (no-op if PhoneMirrorService isn't running).
+      try { PhoneMirrorService.getInstance().publishUserMessage(String(myStreamId), message); } catch (_) { /* noop */ }
+
       let fullResponse = "";
 
-      // Context Injection for "Answer" button (100s rolling window)
-      if (!context) {
-        // User requested 100 seconds of context for the answer button
-        // Logic: If no explicit context provided (like from manual override), auto-inject from IntelligenceManager
-        try {
-          const autoContext = intelligenceManager.getFormattedContext(100);
-          if (autoContext && autoContext.trim().length > 0) {
-            context = autoContext;
-            console.log(`[IPC] Auto - injected 100s context for gemini - chat - stream(${context.length} chars)`);
-          }
-        } catch (ctxErr) {
-          console.warn("[IPC] Failed to auto-inject context:", ctxErr);
-        }
+      if (!context && autoContextSnapshot) {
+        context = autoContextSnapshot;
+        console.log(`[IPC] Auto-injected 100s context for gemini-chat-stream (${context.length} chars)`);
       }
+
+      // Use CHAT_MODE_PROMPT for general chat — bypasses the interview-copilot
+      // framing in HARD_SYSTEM_PROMPT/ASSIST_MODE_PROMPT that was causing coding
+      // questions to be answered with "At Aetherbot AI, I was responsible for..."
+      // (resume hijack via CONTEXT_INTELLIGENCE_LAYER's "you ARE the user").
+      const systemPromptOverride: string | undefined = options?.skipSystemPrompt ? "" : CHAT_MODE_PROMPT;
 
       try {
         // USE streamChat which handles routing
-        const stream = llmHelper.streamChat(message, imagePaths, context, options?.skipSystemPrompt ? "" : undefined, options?.ignoreKnowledgeMode);
+        const stream = llmHelper.streamChat(message, imagePaths, context, systemPromptOverride, options?.ignoreKnowledgeMode);
 
         for await (const token of stream) {
           // Bail if a newer stream has taken over (user triggered a new request)
@@ -479,12 +544,14 @@ export function initializeIpcHandlers(appState: AppState): void {
             return null;
           }
           event.sender.send("gemini-stream-token", token);
+          try { PhoneMirrorService.getInstance().publishToken(String(myStreamId), token); } catch (_) { /* noop */ }
           fullResponse += token;
         }
 
         // Final check: only send done if we are still the active stream
         if (_chatStreamId === myStreamId) {
           event.sender.send("gemini-stream-done");
+          try { PhoneMirrorService.getInstance().publishDone(String(myStreamId), fullResponse); } catch (_) { /* noop */ }
 
           // Update IntelligenceManager with ASSISTANT message after completion
           if (fullResponse.trim().length > 0) {
@@ -498,6 +565,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         console.error("[IPC] Streaming error:", streamError);
         if (_chatStreamId === myStreamId) {
           event.sender.send("gemini-stream-error", streamError.message || "Unknown streaming error");
+          try { PhoneMirrorService.getInstance().publishError(String(myStreamId), streamError?.message || "Unknown streaming error"); } catch (_) { /* noop */ }
         }
       }
 
@@ -667,6 +735,100 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  safeHandle("get-meeting-retention", async () => {
+    return SettingsManager.getInstance().get('meetingRetention') ?? 'forever';
+  });
+
+  safeHandle("set-meeting-retention", async (_, retention: 'forever' | '7d' | '30d' | 'never') => {
+    if (!['forever', '7d', '30d', 'never'].includes(retention)) {
+      return { success: false, error: 'invalid_retention' };
+    }
+    SettingsManager.getInstance().set('meetingRetention', retention);
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('meeting-retention-changed', retention);
+      }
+    });
+    return { success: true };
+  });
+
+  safeHandle("get-provider-data-scopes", async () => {
+    return SettingsManager.getInstance().get('providerDataScopes') ?? {};
+  });
+
+  safeHandle("set-provider-data-scopes", async (_, scopes: Record<string, boolean>) => {
+    if (!scopes || typeof scopes !== 'object') {
+      return { success: false, error: 'invalid_scopes' };
+    }
+    const allowedKeys = new Set(['transcript', 'screenshots', 'reference_files', 'profile_history', 'embeddings', 'post_call_summary']);
+    const sanitized: Record<string, boolean> = {};
+    for (const [key, value] of Object.entries(scopes)) {
+      if (allowedKeys.has(key) && typeof value === 'boolean') {
+        sanitized[key] = value;
+      }
+    }
+    SettingsManager.getInstance().set('providerDataScopes', sanitized as any);
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('provider-data-scopes-changed', sanitized);
+      }
+    });
+    return { success: true };
+  });
+
+  safeHandle("get-screen-understanding-mode", async () => {
+    return SettingsManager.getInstance().getScreenUnderstandingMode();
+  });
+
+  safeHandle("set-screen-understanding-mode", async (_, mode: 'vision_first' | 'vision_only' | 'private_vision') => {
+    if (!['vision_first', 'vision_only', 'private_vision'].includes(mode)) {
+      return { success: false, error: 'invalid_mode' };
+    }
+    SettingsManager.getInstance().setScreenUnderstandingMode(mode);
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('screen-understanding-mode-changed', mode);
+      }
+    });
+    return { success: true };
+  });
+
+  safeHandle("get-technical-interview-vision-first", async () => {
+    return SettingsManager.getInstance().getTechnicalInterviewVisionFirst();
+  });
+
+  safeHandle("set-technical-interview-vision-first", async (_, enabled: boolean) => {
+    if (typeof enabled !== 'boolean') {
+      return { success: false, error: 'invalid_value' };
+    }
+    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('technical-interview-vision-first-changed', enabled);
+      }
+    });
+    return { success: true };
+  });
+
+  // Legacy alias for renderer builds that still call the old IPC name.
+  // Maps the deprecated technicalInterviewDirectVision channel onto the new
+  // technicalInterviewVisionFirst getter/setter so old renderer builds keep working.
+  safeHandle("get-technical-interview-direct-vision", async () => {
+    return SettingsManager.getInstance().getTechnicalInterviewVisionFirst();
+  });
+  safeHandle("set-technical-interview-direct-vision", async (_, enabled: boolean) => {
+    if (typeof enabled !== 'boolean') {
+      return { success: false, error: 'invalid_value' };
+    }
+    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('technical-interview-vision-first-changed', enabled);
+      }
+    });
+    return { success: true };
+  });
+
   safeHandle("get-log-file-path", async () => {
     try {
       return path.join(app.getPath('documents'), 'natively_debug.log');
@@ -774,10 +936,10 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       // First try to kill it if it's running
       await appState.processingHelper.getLLMHelper().forceRestartOllama();
-      
+
       // The forceRestartOllama now calls OllamaManager.getInstance().init() internally
       // so we don't need to do it again here.
-      
+
       return true;
     } catch (error: any) {
       console.error("[IPC restart-ollama] Failed to restart:", error);
@@ -1038,10 +1200,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       } catch { /* LicenseManager not available — fall back */ }
 
       const res = await fetch('https://api.natively.software/v1/trial/start', {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ hwid }),
-        signal:  AbortSignal.timeout(10_000),
+        body: JSON.stringify({ hwid }),
+        signal: AbortSignal.timeout(10_000),
       });
 
       if (!res.ok) {
@@ -1056,16 +1218,17 @@ export function initializeIpcHandlers(appState: AppState): void {
 
         // Auto-configure natively as the model + STT provider during trial
         const prevSttProvider = cm.getSttProvider();
-        cm.setNativelyApiKey('__trial__');   // sentinel — activates natively model routing
+        cm.setNativelyApiKey(TRIAL_SENTINEL_KEY);   // sentinel — activates natively model routing
         const newSttProvider = cm.getSttProvider();
         if (newSttProvider !== prevSttProvider) {
           await appState.reconfigureSttProvider();
         }
         const llmHelper = appState.processingHelper?.getLLMHelper?.();
-        if (llmHelper) llmHelper.setNativelyKey('__trial__');
+        if (llmHelper) llmHelper.setNativelyKey(TRIAL_SENTINEL_KEY);
       }
 
-      return { ok: true, ...data };
+      const { trial_token, ...safeData } = data;
+      return { ok: true, ...safeData, hasToken: Boolean(data.trial_token) };
     } catch (error: any) {
       console.error('[IPC] trial:start failed:', error);
       return { ok: false, error: error.message || 'network_error' };
@@ -1081,7 +1244,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       const res = await fetch('https://api.natively.software/v1/trial/status', {
         headers: { 'x-trial-token': token },
-        signal:  AbortSignal.timeout(8_000),
+        signal: AbortSignal.timeout(8_000),
       });
 
       if (!res.ok) {
@@ -1099,18 +1262,17 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle("trial:get-local", async () => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
-      const cm    = CredentialsManager.getInstance();
+      const cm = CredentialsManager.getInstance();
       const token = cm.getTrialToken();
       if (!token) return { hasToken: false, trialClaimed: cm.getTrialClaimed() };
       return {
-        hasToken:     true,
+        hasToken: true,
         trialClaimed: true,
-        trialToken:   token,
-        expiresAt:    cm.getTrialExpiresAt(),
-        startedAt:    cm.getTrialStartedAt(),
-        expired:      cm.getTrialExpiresAt()
-                        ? new Date(cm.getTrialExpiresAt()!).getTime() < Date.now()
-                        : false,
+        expiresAt: cm.getTrialExpiresAt(),
+        startedAt: cm.getTrialStartedAt(),
+        expired: cm.getTrialExpiresAt()
+          ? new Date(cm.getTrialExpiresAt()!).getTime() < Date.now()
+          : false,
       };
     } catch {
       return { hasToken: false, trialClaimed: false };
@@ -1125,11 +1287,11 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!token) return { ok: true };  // no token to report
 
       await fetch('https://api.natively.software/v1/trial/convert', {
-        method:  'POST',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-trial-token': token },
-        body:    JSON.stringify({ choice }),
-        signal:  AbortSignal.timeout(5_000),
-      }).catch(() => {});  // fire-and-forget — don't block local cleanup on network failure
+        body: JSON.stringify({ choice }),
+        signal: AbortSignal.timeout(5_000),
+      }).catch(() => { });  // fire-and-forget — don't block local cleanup on network failure
 
       return { ok: true };
     } catch {
@@ -1147,11 +1309,11 @@ export function initializeIpcHandlers(appState: AppState): void {
       const token = cm.getTrialToken();
       if (token) {
         fetch('https://api.natively.software/v1/trial/convert', {
-          method:  'POST',
+          method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-trial-token': token },
-          body:    JSON.stringify({ choice: 'byok' }),
-          signal:  AbortSignal.timeout(4_000),
-        }).catch(() => {});
+          body: JSON.stringify({ choice: 'byok' }),
+          signal: AbortSignal.timeout(4_000),
+        }).catch(() => { });
       }
 
       // 2. Clear trial token
@@ -1426,15 +1588,16 @@ export function initializeIpcHandlers(appState: AppState): void {
         ibmWatsonRegion: creds.ibmWatsonRegion || 'us-south',
         hasSonioxKey: hasKey(creds.sonioxApiKey),
         // STT key values — returned so the settings UI can pre-populate input fields.
-        // AI model keys (Gemini/Groq/OpenAI/Claude) remain boolean-only; STT keys are
-        // surfaced here because users need to see which key is active when switching providers.
-        sttGroqKey: creds.groqSttApiKey || '',
-        sttOpenaiKey: creds.openAiSttApiKey || '',
-        sttDeepgramKey: creds.deepgramApiKey || '',
-        sttElevenLabsKey: creds.elevenLabsApiKey || '',
-        sttAzureKey: creds.azureApiKey || '',
-        sttIbmKey: creds.ibmWatsonApiKey || '',
-        sttSonioxKey: creds.sonioxApiKey || '',
+        // SECURITY FIX (P0): Return masked keys only, never raw API keys.
+        // The hasSttGroqKey boolean tells UI if key exists — no raw key needed.
+        sttGroqKey: creds.groqSttApiKey ? `sk-...${creds.groqSttApiKey.slice(-4)}` : '',
+        sttOpenaiKey: creds.openAiSttApiKey ? `sk-...${creds.openAiSttApiKey.slice(-4)}` : '',
+        sttDeepgramKey: creds.deepgramApiKey ? `sk-...${creds.deepgramApiKey.slice(-4)}` : '',
+        sttElevenLabsKey: creds.elevenLabsApiKey ? `sk-...${creds.elevenLabsApiKey.slice(-4)}` : '',
+        sttAzureKey: creds.azureApiKey ? `sk-...${creds.azureApiKey.slice(-4)}` : '',
+        sttIbmKey: creds.ibmWatsonApiKey ? `sk-...${creds.ibmWatsonApiKey.slice(-4)}` : '',
+        sttSonioxKey: creds.sonioxApiKey ? `sk-...${creds.sonioxApiKey.slice(-4)}` : '',
+        openAiSttBaseUrl: creds.openAiSttBaseUrl || '',
         hasTavilyKey: hasKey(creds.tavilyApiKey),
         // Dynamic Model Discovery - preferred models
         geminiPreferredModel: creds.geminiPreferredModel || undefined,
@@ -1443,6 +1606,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         claudePreferredModel: creds.claudePreferredModel || undefined,
       };
     } catch (error: any) {
+      // SECURITY FIX (P0): Error fallback returns masked keys, not raw strings
       return { hasGeminiKey: false, hasGroqKey: false, hasOpenaiKey: false, hasClaudeKey: false, hasNativelyKey: false, googleServiceAccountPath: null, sttProvider: 'none', groqSttModel: 'whisper-large-v3-turbo', hasSttGroqKey: false, hasSttOpenaiKey: false, hasDeepgramKey: false, hasElevenLabsKey: false, hasAzureKey: false, azureRegion: 'eastus', hasIbmWatsonKey: false, ibmWatsonRegion: 'us-south', hasSonioxKey: false, hasTavilyKey: false, sttGroqKey: '', sttOpenaiKey: '', sttDeepgramKey: '', sttElevenLabsKey: '', sttAzureKey: '', sttIbmKey: '', sttSonioxKey: '' };
     }
   });
@@ -1544,6 +1708,23 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { success: true };
     } catch (error: any) {
       console.error("Error saving OpenAI STT API key:", error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("set-openai-stt-base-url", async (_, url: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      CredentialsManager.getInstance().setOpenAiSttBaseUrl(url);
+      // Reconfigure the active pipeline so the new endpoint is used immediately,
+      // matching the behavior of azure/ibmwatson region setters.
+      await appState.reconfigureSttProvider();
+      BrowserWindow.getAllWindows().forEach(win => {
+        if (!win.isDestroyed()) win.webContents.send('credentials-changed');
+      });
+      return { success: true };
+    } catch (error: any) {
+      console.error("Error saving OpenAI STT base URL:", error);
       return { success: false, error: error.message };
     }
   });
@@ -1839,9 +2020,21 @@ export function initializeIpcHandlers(appState: AppState): void {
         );
       } else {
         // Groq / OpenAI: multipart FormData
+        let openAiEndpoint = 'https://api.openai.com/v1/audio/transcriptions';
+        if (provider === 'openai') {
+          // If a custom OpenAI-compatible base URL is configured, test against it.
+          const { CredentialsManager } = require('./services/CredentialsManager');
+          const customBase = (CredentialsManager.getInstance().getOpenAiSttBaseUrl() || '').trim();
+          if (customBase) {
+            const trimmed = customBase.replace(/\/+$/, '');
+            openAiEndpoint = /\/v\d+$/.test(trimmed)
+              ? `${trimmed}/audio/transcriptions`
+              : `${trimmed}/v1/audio/transcriptions`;
+          }
+        }
         const endpoint = provider === 'groq'
           ? 'https://api.groq.com/openai/v1/audio/transcriptions'
-          : 'https://api.openai.com/v1/audio/transcriptions';
+          : openAiEndpoint;
         const model = provider === 'groq' ? 'whisper-large-v3-turbo' : 'whisper-1';
 
         const form = new FormData();
@@ -1865,6 +2058,136 @@ export function initializeIpcHandlers(appState: AppState): void {
       console.error("STT connection test failed:", msg);
       return { success: false, error: msg };
     }
+  });
+
+  // ==========================================
+  // Local Whisper STT Handlers
+  // ==========================================
+
+  const activeWhisperDownloads = new Set<string>();
+
+  safeHandle("local-whisper-get-models", async () => {
+    try {
+      const { getAvailableModels } = require('./audio/whisper/modelManager');
+      const models = getAvailableModels();
+      const activeModelId = SettingsManager.getInstance().get('localWhisperModel') ?? '';
+      return { models, activeModelId };
+    } catch (e: any) {
+      console.error('[IPC] local-whisper-get-models error:', e.message);
+      return { models: [], activeModelId: '' };
+    }
+  });
+
+  safeHandle("local-whisper-set-model", async (_, modelId: string) => {
+    try {
+      SettingsManager.getInstance().set('localWhisperModel', modelId);
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  // Per-channel model overrides (mic / system audio). When enabled, the two
+  // STT instances pick their own model via these slots. When disabled, both
+  // fall back to localWhisperModel (the existing global setting).
+  safeHandle("local-whisper-get-channel-config", async () => {
+    const sm = SettingsManager.getInstance();
+    return {
+      enabled: !!sm.get('localWhisperPerChannelEnabled'),
+      micModelId: sm.get('localWhisperModelMic') ?? '',
+      systemModelId: sm.get('localWhisperModelSystem') ?? '',
+      globalModelId: sm.get('localWhisperModel') ?? '',
+    };
+  });
+
+  safeHandle("local-whisper-set-channel-config", async (_, cfg: { enabled?: boolean; micModelId?: string; systemModelId?: string }) => {
+    try {
+      const sm = SettingsManager.getInstance();
+      if (typeof cfg?.enabled === 'boolean') sm.set('localWhisperPerChannelEnabled', cfg.enabled);
+      if (typeof cfg?.micModelId === 'string') sm.set('localWhisperModelMic', cfg.micModelId);
+      if (typeof cfg?.systemModelId === 'string') sm.set('localWhisperModelSystem', cfg.systemModelId);
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("local-whisper-delete-model", async (_, modelId: string) => {
+    try {
+      const { deleteModel } = require('./audio/whisper/modelManager');
+      deleteModel(modelId);
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("local-whisper-start-download", async (event, modelId: string) => {
+    if (activeWhisperDownloads.has(modelId)) {
+      return { success: false, error: 'already-downloading' };
+    }
+    activeWhisperDownloads.add(modelId);
+    try {
+      const { Worker } = require('worker_threads');
+      const nodePath = require('path');
+      const { buildWorkerInitMessage } = require('./audio/whisper/inferenceConfig');
+      const workerPath = nodePath.join(__dirname, 'audio', 'whisper', 'whisperWorker.js');
+      const w = new Worker(workerPath);
+      const sender = event.sender;
+      w.on('message', (msg: any) => {
+        if (sender.isDestroyed()) return;
+        if (msg.type === 'progress') {
+          sender.send('local-whisper-download-progress', { modelId, progress: msg.progress });
+        } else if (msg.type === 'ready') {
+          activeWhisperDownloads.delete(modelId);
+          sender.send('local-whisper-download-complete', { modelId });
+          w.terminate();
+        } else if (msg.type === 'error') {
+          activeWhisperDownloads.delete(modelId);
+          sender.send('local-whisper-download-error', { modelId, error: msg.message });
+          w.terminate();
+        }
+      });
+      w.on('error', (err: Error) => {
+        activeWhisperDownloads.delete(modelId);
+        if (!sender.isDestroyed()) {
+          sender.send('local-whisper-download-error', { modelId, error: err.message });
+        }
+      });
+      w.postMessage(buildWorkerInitMessage(modelId));
+      return { success: true };
+    } catch (e: any) {
+      activeWhisperDownloads.delete(modelId);
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("local-whisper-preload", async (_, modelId: string) => {
+    try {
+      const { modelPreloader } = require('./audio/whisper/modelPreloader');
+      const { isModelCached } = require('./audio/whisper/modelManager');
+      const { resolveInferenceConfig } = require('./audio/whisper/inferenceConfig');
+      const { SettingsManager } = require('./services/SettingsManager');
+      const id = modelId || SettingsManager.getInstance().get('localWhisperModel') || 'Xenova/whisper-tiny.en';
+      // Pass active dtype so the cache check verifies the SPECIFIC ONNX
+      // files (e.g. encoder_model.onnx for fp32) are present — not just
+      // "directory non-empty". Otherwise a v2-cached _quantized.onnx-only
+      // directory would be reported "available" but trigger a 142MB
+      // background fetch on first start().
+      const { dtype } = resolveInferenceConfig();
+      if (!isModelCached(id, dtype)) {
+        return { success: false, reason: 'model-not-cached' };
+      }
+      modelPreloader.preload(id);
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("local-whisper-get-hardware", () => {
+    const { detectHardware } = require('./audio/whisper/hardwareDetect');
+    return detectHardware();
   });
 
   safeHandle("test-llm-connection", async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude', apiKey?: string) => {
@@ -1932,7 +2255,18 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
 
     } catch (error: any) {
-      console.error("LLM connection test failed:", error);
+      // CRITICAL: do NOT log the raw axios error — it includes the request config
+      // with the Authorization header (full API key) and is dumped verbatim by
+      // Node's util.inspect. Strip to a safe shape before logging.
+      const safeInfo = {
+        provider,
+        status: error?.response?.status,
+        statusText: error?.response?.statusText,
+        code: error?.code,
+        message: error?.message,
+        responseError: error?.response?.data?.error?.message || error?.response?.data?.message,
+      };
+      console.error("LLM connection test failed:", safeInfo);
       const rawMsg = error?.response?.data?.error?.message || error?.response?.data?.message || (error.response?.data?.error?.type ? `${error.response.data.error.type}: ${error.response.data.error.message}` : error.message) || 'Connection failed';
       const msg = sanitizeErrorMessage(rawMsg);
       return { success: false, error: msg };
@@ -1963,6 +2297,52 @@ export function initializeIpcHandlers(appState: AppState): void {
       });
 
       return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("get-codex-cli-config", () => {
+    try {
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      return llmHelper.getCodexCliConfig();
+    } catch {
+      return CodexCliService.normalizeConfig({});
+    }
+  });
+
+  safeHandle("set-codex-cli-config", (_, config: any) => {
+    try {
+      const normalized = CodexCliService.normalizeConfig(config || {});
+      const sm = SettingsManager.getInstance();
+      sm.set('codexCliEnabled', normalized.enabled);
+      sm.set('codexCliPath', normalized.path);
+      sm.set('codexCliModel', normalized.model);
+      sm.set('codexCliFastModel', normalized.fastModel);
+      sm.set('codexCliTimeoutMs', normalized.timeoutMs);
+      sm.set('codexCliSandboxMode', normalized.sandboxMode);
+      appState.processingHelper.getLLMHelper().setCodexCliConfig(normalized);
+      return { success: true, config: normalized };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("test-codex-cli", async (_, config?: any) => {
+    try {
+      const current = appState.processingHelper.getLLMHelper().getCodexCliConfig();
+      const normalized = CodexCliService.normalizeConfig({ ...current, ...(config || {}) });
+      const result = await CodexCliService.validateExecutable(normalized.path);
+      // If auto-detection found a different working path, persist it so
+      // subsequent chat calls don't re-ENOENT.
+      if (result.success && result.resolvedPath && result.resolvedPath !== normalized.path) {
+        const updated = CodexCliService.normalizeConfig({ ...normalized, path: result.resolvedPath });
+        const sm = SettingsManager.getInstance();
+        sm.set('codexCliPath', updated.path);
+        appState.processingHelper.getLLMHelper().setCodexCliConfig(updated);
+        return { success: true, resolvedPath: result.resolvedPath, config: updated };
+      }
+      return result;
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -2053,6 +2433,19 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("toggle-model-selector", (_, coords: { x: number; y: number }) => {
     appState.modelSelectorWindowHelper.toggleWindow(coords.x, coords.y);
+  });
+
+  // ROUND 3 FIX (#4): click-outside close for ModelSelector. With panel-
+  // nonactivating + becomesKeyOnlyIfNeeded, the on('blur') auto-close in
+  // ModelSelectorWindowHelper fires unreliably (panel may never become key
+  // → never receives blur). The overlay's renderer fires this IPC on every
+  // mousedown that isn't on the toggle button itself; if the model selector
+  // is open, we close it. No-op when closed (toggleWindow handled the open).
+  safeHandle("model-selector:close-if-open", () => {
+    const win = appState.modelSelectorWindowHelper.getWindow();
+    if (win && !win.isDestroyed() && win.isVisible()) {
+      appState.modelSelectorWindowHelper.hideWindow();
+    }
   });
 
 
@@ -2150,20 +2543,22 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("open-external", async (event, url: string) => {
     try {
-      // For macOS System Settings, URL() parsing might act differently or we can just check string prefix
-      if (url.startsWith('x-apple.systempreferences:')) {
-        await shell.openExternal(url);
+      if (typeof url !== 'string') {
+        console.warn('[IPC] Blocked invalid open-external request', { reason: 'non-string' });
         return;
       }
-      
+
       const parsed = new URL(url);
-      if (['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
+      const allowedWebUrl = parsed.protocol === 'https:' && parsed.hostname === 'mail.google.com' && parsed.pathname === '/mail/';
+      const allowedSystemSettingsUrl = parsed.protocol === 'x-apple.systempreferences:';
+
+      if (allowedWebUrl || allowedSystemSettingsUrl) {
         await shell.openExternal(url);
       } else {
-        console.warn(`[IPC] Blocked potentially unsafe open-external: ${url}`);
+        console.warn('[IPC] Blocked open-external request', { protocol: parsed.protocol, hostname: parsed.hostname });
       }
     } catch {
-      console.warn(`[IPC] Invalid URL in open-external: ${url}`);
+      console.warn('[IPC] Invalid URL in open-external');
     }
   });
 
@@ -2183,16 +2578,119 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // MODE 2: What Should I Say (Primary auto-answer)
-  safeHandle("generate-what-to-say", async (_, question?: string, imagePaths?: string[]) => {
+  //
+  // VISION-FIRST: image paths are validated and forwarded to IntelligenceManager
+  // which routes them through the vision provider fallback chain.
+  // LEGACY OCR PATH DISABLED: the previous build called ScreenContextService.captureScreenFromPath
+  // here to run Tesseract OCR before answering. That path is now removed from the runtime —
+  // Natively answers from the image directly via a vision-capable provider. Do not re-introduce
+  // OCR here unless a future explicit OCR-only mode is reintroduced.
+  safeHandle("generate-what-to-say", async (_, question?: string, imagePaths?: string[], options?: { promptInstruction?: string }) => {
     try {
+      let screenContext: any;
+      let screenContextStatus: 'not_available' | 'available' | 'failed' = 'not_available';
+      let visionProviderUsed: string | undefined;
+      let visionModelUsed: string | undefined;
+      let visionAttempts: number | undefined;
+      let visionFailureReason: string | undefined;
+
+      const validatedImagePaths: string[] | undefined = imagePaths?.length ? [] : undefined;
+
+      // SECURITY (P0): Validate image paths if provided from renderer
+      if (imagePaths && imagePaths.length > 0) {
+        if (!Array.isArray(imagePaths) || imagePaths.length > 5 || imagePaths.some(imagePath => typeof imagePath !== 'string' || imagePath.trim().length === 0)) {
+          console.warn('[IPC] generate-what-to-say: malformed image path payload rejected');
+          return {
+            answer: null,
+            question: question || 'unknown',
+            screenContextStatus,
+            error: 'Invalid image path payload'
+          };
+        }
+
+        const { app } = require('electron');
+        const { validateImagePath } = require('./utils/curlUtils');
+        const userDataDir = app.getPath('userData');
+
+        for (const imagePath of imagePaths) {
+          const validation = validateImagePath(imagePath, userDataDir);
+          if (!validation.isValid) {
+            console.warn(`[IPC] generate-what-to-say: invalid image path rejected: ${validation.reason}`);
+            return {
+              answer: null,
+              question: question || 'unknown',
+              screenContextStatus,
+              error: `Invalid image path: ${validation.reason}`
+            };
+          }
+          validatedImagePaths!.push(imagePath);
+        }
+
+        // Vision-first: run the ScreenUnderstandingService so the image is hashed, optimized,
+        // and routed through the vision provider fallback chain. The structured result becomes
+        // the screenContext that PromptAssembler consumes.
+        try {
+          const { getScreenUnderstandingService } = require('./services/screen/ScreenUnderstandingService');
+          const { CredentialsManager } = require('./services/CredentialsManager');
+          const sus = getScreenUnderstandingService();
+          const settings = SettingsManager.getInstance();
+          const credentials = CredentialsManager.getInstance();
+          const providerScopes = settings.get('providerDataScopes') || {};
+
+          const sur = await sus.understand({
+            modeId: 'what-to-say',
+            transcript: question,
+            userAction: 'what_to_say',
+            qualityMode: 'balanced',
+            imagePaths: validatedImagePaths,
+            screenUnderstandingMode: settings.getScreenUnderstandingMode(),
+            technicalInterviewVisionFirst: settings.getTechnicalInterviewVisionFirst(),
+            providerPolicy: {
+              localOnly: settings.getScreenUnderstandingMode() === 'private_vision',
+              allowScreenshots: providerScopes.screenshots !== false,
+              visionAvailable: credentials.anyVisionProviderConfigured?.() ?? true,
+              localVisionAvailable: credentials.anyLocalVisionProviderConfigured?.() ?? false,
+            },
+          });
+
+          screenContext = sur.status === 'available' ? sur : undefined;
+          screenContextStatus = sur.status === 'available' ? 'available' : (sur.status === 'failed' ? 'failed' : 'not_available');
+          visionProviderUsed = sur.providerUsed;
+          visionModelUsed = sur.modelUsed;
+          visionAttempts = Array.isArray(sur.attempts) ? sur.attempts.length : undefined;
+          visionFailureReason = sur.failureReason;
+        } catch (sErr: any) {
+          screenContextStatus = 'failed';
+          console.warn('[IPC] generate-what-to-say: ScreenUnderstandingService failed', {
+            errorClass: sErr?.name || 'Error',
+          });
+        }
+      }
+
       const intelligenceManager = appState.getIntelligenceManager();
       // Question and imagePaths are now optional - IntelligenceManager infers from transcript
-      const answer = await intelligenceManager.runWhatShouldISay(question, 0.8, imagePaths);
-      return { answer, question: question || 'inferred from context' };
-    } catch (error: any) {
-      // Return graceful fallback instead of throwing
+      const answer = await intelligenceManager.runWhatShouldISay(question, 0.8, validatedImagePaths, {
+        skipCooldown: process.env.NODE_ENV === 'test',
+        screenContext,
+        promptInstruction: typeof options?.promptInstruction === 'string' ? options.promptInstruction : undefined,
+      });
       return {
-        question: question || 'unknown'
+        answer,
+        question: question || 'inferred from context',
+        screenContextStatus,
+        visionProviderUsed,
+        visionModelUsed,
+        visionAttempts,
+        visionFailureReason,
+        imageCount: validatedImagePaths?.length || 0,
+        usedImageInput: Boolean(validatedImagePaths?.length),
+      };
+    } catch (error: any) {
+      console.error('[IPC] generate-what-to-say error:', error);
+      return {
+        answer: null,
+        question: question || 'unknown',
+        error: error?.message || 'unknown_error'
       };
     }
   });
@@ -2213,20 +2711,69 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // Shared helper: validate, then run images through the vision-first ImageOptimizer
+  // so downstream provider calls send compressed JPEG payloads instead of raw retina PNGs.
+  // Falls back to the original paths if optimization fails — image input is more important
+  // than payload size, so a Sharp failure must not block the request.
+  async function optimizeImagesForVision(
+    paths: string[],
+    handlerLabel: string,
+    profile: 'fast' | 'balanced' | 'technical' | 'best' = 'technical',
+  ): Promise<string[]> {
+    if (paths.length === 0) return paths;
+    try {
+      const { getImageOptimizer } = require('./services/screen/ImageOptimizer');
+      const optimizer = getImageOptimizer();
+      const optimized: string[] = [];
+      for (const p of paths) {
+        try {
+          const out = await optimizer.optimize(p, { profile, provider: 'openai', cacheKey: p });
+          optimized.push(out.path);
+        } catch (err: any) {
+          console.warn(`[IPC] ${handlerLabel}: image optimization failed for ${p}, using original`, { errorClass: err?.name });
+          optimized.push(p);
+        }
+      }
+      return optimized;
+    } catch {
+      return paths;
+    }
+  }
+
   safeHandle("generate-code-hint", async (_, imagePaths?: string[], problemStatement?: string) => {
     try {
       // If no explicit images were passed from the frontend, fall back to the
       // screenshot queue so the AI can always "see" the user's screen.
+      const screenshotQueue = appState.getScreenshotQueue();
       const resolvedImagePaths: string[] =
         imagePaths && imagePaths.length > 0
           ? imagePaths
-          : appState.getScreenshotQueue();
+          : screenshotQueue;
+
+      // SECURITY (P0): Validate image paths if provided from renderer
+      if (imagePaths && imagePaths.length > 0) {
+        const { app } = require('electron');
+        const { validateImagePath } = require('./utils/curlUtils');
+        const userDataDir = app.getPath('userData');
+
+        for (const imagePath of imagePaths) {
+          const validation = validateImagePath(imagePath, userDataDir);
+          if (!validation.isValid) {
+            console.warn(`[IPC] generate-code-hint: invalid image path rejected: ${validation.reason}`);
+            return { error: `Invalid image path: ${validation.reason}`, hint: null };
+          }
+        }
+      }
 
       console.log(`[IPC] generate-code-hint: using ${resolvedImagePaths.length} image(s) (${imagePaths?.length ? 'explicit' : 'queue fallback'})`);
 
+      // VISION-FIRST: optimize the screenshot(s) with Sharp before they reach the LLM,
+      // using the 'technical' profile so code text stays sharp at 1536px.
+      const optimizedPaths = await optimizeImagesForVision(resolvedImagePaths, 'generate-code-hint', 'technical');
+
       const intelligenceManager = appState.getIntelligenceManager();
       const hint = await intelligenceManager.runCodeHint(
-        resolvedImagePaths.length > 0 ? resolvedImagePaths : undefined,
+        optimizedPaths.length > 0 ? optimizedPaths : undefined,
         problemStatement
       );
       return { hint };
@@ -2239,16 +2786,35 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       // If no explicit images were passed from the frontend, fall back to the
       // screenshot queue so the AI can always "see" the user's screen.
+      const screenshotQueue = appState.getScreenshotQueue();
       const resolvedImagePaths: string[] =
         imagePaths && imagePaths.length > 0
           ? imagePaths
-          : appState.getScreenshotQueue();
+          : screenshotQueue;
+
+      // SECURITY (P0): Validate image paths if provided from renderer
+      if (imagePaths && imagePaths.length > 0) {
+        const { app } = require('electron');
+        const { validateImagePath } = require('./utils/curlUtils');
+        const userDataDir = app.getPath('userData');
+
+        for (const imagePath of imagePaths) {
+          const validation = validateImagePath(imagePath, userDataDir);
+          if (!validation.isValid) {
+            console.warn(`[IPC] generate-brainstorm: invalid image path rejected: ${validation.reason}`);
+            return { error: `Invalid image path: ${validation.reason}`, script: null };
+          }
+        }
+      }
 
       console.log(`[IPC] generate-brainstorm: using ${resolvedImagePaths.length} image(s) (${imagePaths?.length ? 'explicit' : 'queue fallback'})`);
 
+      // VISION-FIRST: balanced profile (1280px) — brainstorm doesn't need code-sharp text.
+      const optimizedPaths = await optimizeImagesForVision(resolvedImagePaths, 'generate-brainstorm', 'balanced');
+
       const intelligenceManager = appState.getIntelligenceManager();
       const script = await intelligenceManager.runBrainstorm(
-        resolvedImagePaths.length > 0 ? resolvedImagePaths : undefined,
+        optimizedPaths.length > 0 ? optimizedPaths : undefined,
         problemStatement
       );
       return { script };
@@ -2342,6 +2908,94 @@ export function initializeIpcHandlers(appState: AppState): void {
       const intelligenceManager = appState.getIntelligenceManager();
       intelligenceManager.reset();
       return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Phase 3 — Dynamic Actions IPC. Accept/dismiss/list. The action emission
+  // direction is push-only (intelligence-dynamic-action channel from main →
+  // renderer); these handlers are the renderer → main control plane.
+  safeHandle("dynamic-action:accept", async (_, actionId: string) => {
+    try {
+      if (typeof actionId !== 'string' || !actionId) {
+        return { success: false, error: 'invalid_action_id' };
+      }
+      const intelligenceManager = appState.getIntelligenceManager();
+      const action = intelligenceManager.acceptDynamicAction(actionId);
+      if (!action) return { success: false, error: 'not_found' };
+      // Phase 6 — telemetry on accept (no transcript, no evidence body).
+      try {
+        const { telemetryService } = require('./services/telemetry/TelemetryService');
+        telemetryService.track({
+          name: 'dynamic_action_accepted',
+          sessionId: action.sessionId,
+          modeId: action.modeId,
+          properties: { actionId: action.id, actionType: action.type, modeTemplateType: action.modeTemplateType },
+        });
+      } catch { /* non-fatal */ }
+      // Caller (renderer) is expected to follow up with a normal Ask-AI call
+      // using action.promptInstruction. We return the action so the renderer
+      // can populate the answer prompt without a second round-trip.
+      return { success: true, action };
+    } catch (error: any) {
+      return { success: false, error: error?.message ?? 'internal_error' };
+    }
+  });
+
+  safeHandle("dynamic-action:dismiss", async (_, actionId: string) => {
+    try {
+      if (typeof actionId !== 'string' || !actionId) {
+        return { success: false, error: 'invalid_action_id' };
+      }
+      const intelligenceManager = appState.getIntelligenceManager();
+      intelligenceManager.dismissDynamicAction(actionId);
+      // Phase 6 — telemetry on dismiss.
+      try {
+        const { telemetryService } = require('./services/telemetry/TelemetryService');
+        telemetryService.track({ name: 'dynamic_action_dismissed', properties: { actionId } });
+      } catch { /* non-fatal */ }
+      return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error?.message ?? 'internal_error' };
+    }
+  });
+
+  safeHandle("dynamic-action:list", async () => {
+    try {
+      const intelligenceManager = appState.getIntelligenceManager();
+      return { success: true, actions: intelligenceManager.getActiveDynamicActions() };
+    } catch (error: any) {
+      return { success: false, error: error?.message ?? 'internal_error', actions: [] };
+    }
+  });
+
+  safeHandle("test-inject-transcript", async (_, segment: { speaker: string; text: string; timestamp?: number; final?: boolean }) => {
+    try {
+      if (process.env.NODE_ENV !== 'test') return { success: false, error: 'test_only' };
+      const intelligenceManager = appState.getIntelligenceManager();
+      intelligenceManager.addTranscript({
+        speaker: segment.speaker,
+        text: segment.text,
+        timestamp: segment.timestamp ?? Date.now(),
+        final: segment.final ?? true,
+      }, true);
+      return { success: true };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("test-get-mode-context", async () => {
+    try {
+      if (process.env.NODE_ENV !== 'test') return { success: false, error: 'test_only' };
+      const { ModesManager } = require('./services/ModesManager');
+      const manager = ModesManager.getInstance();
+      return {
+        success: true,
+        block: manager.buildActiveModeContextBlock(),
+        suffix: manager.getActiveModeSystemPromptSuffix(),
+      };
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -2568,8 +3222,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { fallback: true };
     }
 
-    // Check if JIT indexing is active and has chunks
-    if (!ragManager.isLiveIndexingActive('live-meeting-current')) {
+    // Check if JIT indexing is active AND has at least one embedded chunk.
+    // isLiveIndexingActive() only tells us the indexer is running — it may have
+    // received segments but not yet produced queryable embeddings. Calling
+    // queryMeeting() with zero chunks throws NO_MEETING_EMBEDDINGS, adding
+    // ~300ms of wasted try/catch overhead before the fallback fires.
+    if (!ragManager.isLiveIndexingActive('live-meeting-current') || !ragManager.hasLiveChunks()) {
       return { fallback: true };
     }
 
@@ -2863,7 +3521,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           const { NativelySearchProvider } = require('../premium/electron/knowledge/NativelySearchProvider');
           // Pass the real trial token when key is the __trial__ sentinel so the
           // server can authenticate via x-trial-token instead of the invalid key.
-          const trialToken = nativelyKey === '__trial__' ? cm.getTrialToken() : undefined;
+          const trialToken = nativelyKey === TRIAL_SENTINEL_KEY ? cm.getTrialToken() : undefined;
           engine.setSearchProvider(new NativelySearchProvider(nativelyKey, trialToken ?? undefined));
           console.log('[IPC] Company research: using Natively API search (no Tavily key configured)');
         }
@@ -3015,7 +3673,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // ── Permissions ──────────────────────────────────────────────
   safeHandle("permissions:check", async () => {
     if (process.platform === 'darwin') {
-      const mic    = systemPreferences.getMediaAccessStatus('microphone')
+      const mic = systemPreferences.getMediaAccessStatus('microphone')
       const screen = systemPreferences.getMediaAccessStatus('screen')
       return { microphone: mic, screen, platform: 'darwin' }
     }
@@ -3123,12 +3781,44 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
       }
       const { ModesManager } = require('./services/ModesManager');
+      // BUG-MODE-BLEEDING fix: clear mode-specific session context BEFORE switching modes
+      // so Interview mode resume/JD context doesn't bleed into the new mode's responses.
+      try {
+        const appStateIntMgr = appState.getIntelligenceManager();
+        if (appStateIntMgr) appStateIntMgr.clearSessionContext();
+      } catch { /* non-fatal — session may not exist during startup */ }
+
       ModesManager.getInstance().setActiveMode(id);
       // Broadcast mode change to all windows so indicators update immediately
-      const activeName = id ? (ModesManager.getInstance().getActiveMode()?.name ?? null) : null;
+      const activeMode = id ? ModesManager.getInstance().getActiveMode() : null;
+      const activeName = activeMode?.name ?? null;
       BrowserWindow.getAllWindows().forEach(win => {
         if (!win.isDestroyed()) win.webContents.send('mode-changed', { id, name: activeName });
       });
+      // Phase 3 — re-bind dynamic action engine so the new mode's trigger pack
+      // takes effect immediately. New (sessionId, modeId) pair flushes the per-
+      // session store inside DynamicActionEngine, killing any old-mode candidates.
+      try {
+        const appStateIntMgr = appState.getIntelligenceManager();
+        if (appStateIntMgr && activeMode) {
+          appStateIntMgr.setDynamicActionContext({
+            sessionId: `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            modeId: activeMode.id,
+            modeTemplateType: activeMode.templateType,
+          });
+        } else if (appStateIntMgr && !id) {
+          appStateIntMgr.clearDynamicActionContext();
+        }
+      } catch { /* non-fatal */ }
+      // Phase 6 — mode_switched telemetry (no PII).
+      try {
+        const { telemetryService } = require('./services/telemetry/TelemetryService');
+        telemetryService.track({
+          name: 'mode_switched',
+          modeId: activeMode?.id,
+          properties: { modeTemplateType: activeMode?.templateType, cleared: !id },
+        });
+      } catch { /* non-fatal */ }
       return { success: true };
     } catch (e: any) {
       console.error('[IPC] modes:set-active error:', e);
@@ -3149,10 +3839,24 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle("modes:upload-reference-file", async (_, modeId: string) => {
     try {
       if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
-      const result = await dialog.showOpenDialog({
+      // Server-side allow-list. The dialog filter is a hint to users — never
+      // trust it for validation, since the user can rename a file or the
+      // filter can be bypassed by selecting "All Files" in the dialog UI.
+      // Plain-text formats parse trivially; PDF and DOCX go through their
+      // dedicated parsers below.
+      const ALLOWED_EXTENSIONS = new Set([
+        '.txt', '.md', '.markdown', '.json', '.csv', '.tsv', '.xml', '.html', '.htm', '.log',
+        '.pdf', '.docx', '.doc',
+      ]);
+      // 10 MiB per file. Anything larger is almost always a database dump,
+      // a media file, or a misclicked archive; the modes layer would just
+      // truncate it to ~40 KB anyway via MAX_TOTAL_CHARS.
+      const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+      const result: any = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
-          { name: 'Text & Documents', extensions: ['txt', 'md', 'pdf', 'docx', 'doc'] },
+          { name: 'Text & Documents', extensions: ['txt', 'md', 'json', 'csv', 'xml', 'html', 'pdf', 'docx', 'doc'] },
           { name: 'All Files', extensions: ['*'] },
         ],
       });
@@ -3163,18 +3867,110 @@ export function initializeIpcHandlers(appState: AppState): void {
       const fileName = path.basename(filePath);
       const ext = path.extname(filePath).toLowerCase();
 
+      if (!ALLOWED_EXTENSIONS.has(ext)) {
+        // Friendly, actionable message — UI surfaces this to the user.
+        return {
+          success: false,
+          error: `Unsupported file type "${ext || 'none'}". Supported formats: TXT, MD, JSON, CSV, XML, HTML, LOG, PDF, DOCX, DOC. For resumes and job descriptions, use Profile Intelligence under Settings instead.`,
+        };
+      }
+
+      // Pre-flight stat. Use lstat so we don't auto-follow symlinks — a
+      // symlink to /dev/zero or a network mount that lies about size would
+      // otherwise hang the renderer-IPC reply forever via readFileSync.
+      let stats: ReturnType<typeof fs.lstatSync>;
+      try {
+        stats = fs.lstatSync(filePath);
+      } catch {
+        return { success: false, error: 'Could not read the selected file. It may have moved or been deleted.' };
+      }
+      if (!stats.isFile()) {
+        return {
+          success: false,
+          error: 'Selected path is not a regular file (it may be a symlink, device, or directory). Pick a real document file.',
+        };
+      }
+      if (stats.size > MAX_FILE_BYTES) {
+        const mb = (stats.size / (1024 * 1024)).toFixed(1);
+        return {
+          success: false,
+          error: `File is ${mb} MB; the maximum is 10 MB. Trim the file or split it into smaller reference documents.`,
+        };
+      }
+
+      // Wrap the parser branches in a per-call timeout. pdf-parse and mammoth
+      // have both hung historically on malformed input or zip-bomb DOCX —
+      // 15 s is generous for a 10 MiB document.
+      const PARSE_TIMEOUT_MS = 15_000;
+      function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+        return Promise.race([
+          p,
+          new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+        ]);
+      }
+
       let content = '';
-      if (ext === '.pdf') {
-        const pdfParse = require('pdf-parse');
-        const buffer = fs.readFileSync(filePath);
-        const data = await pdfParse(buffer);
-        content = data.text;
-      } else if (ext === '.docx' || ext === '.doc') {
-        const mammoth = require('mammoth');
-        const result2 = await mammoth.extractRawText({ path: filePath });
-        content = result2.value;
-      } else {
-        content = fs.readFileSync(filePath, 'utf8');
+      try {
+        if (ext === '.pdf') {
+          const { PDFParse } = require('pdf-parse');
+          const buffer = fs.readFileSync(filePath);
+          const parser = new PDFParse({ data: buffer });
+          const data: any = await withTimeout<any>(parser.getText(), PARSE_TIMEOUT_MS, 'PDF parse');
+          content = data.text;
+        } else if (ext === '.docx' || ext === '.doc') {
+          const mammoth = require('mammoth');
+          const result2: any = await withTimeout<any>(mammoth.extractRawText({ path: filePath }), PARSE_TIMEOUT_MS, 'DOCX parse');
+          content = result2.value;
+        } else {
+          // Plain-text family. Read raw bytes first so we can detect text
+          // encoding from a leading byte-order-mark before deciding whether
+          // a null byte is binary noise or a legitimate UTF-16 zero-pad.
+          const probe = fs.readFileSync(filePath, { encoding: null });
+          if (probe.length === 0) {
+            return { success: false, error: `"${fileName}" is empty.` };
+          }
+          // BOM-aware decode. UTF-16 files have many embedded null bytes; we
+          // must NOT treat those as a binary-rename signal.
+          if (probe.length >= 2 && probe[0] === 0xFF && probe[1] === 0xFE) {
+            content = probe.subarray(2).toString('utf16le');
+          } else if (probe.length >= 2 && probe[0] === 0xFE && probe[1] === 0xFF) {
+            // UTF-16 BE → swap pairs then decode as utf16le.
+            const swapped = Buffer.allocUnsafe(probe.length - 2);
+            for (let i = 2; i + 1 < probe.length; i += 2) {
+              swapped[i - 2] = probe[i + 1];
+              swapped[i - 1] = probe[i];
+            }
+            content = swapped.toString('utf16le');
+          } else if (probe.length >= 3 && probe[0] === 0xEF && probe[1] === 0xBB && probe[2] === 0xBF) {
+            content = probe.subarray(3).toString('utf8');
+          } else {
+            // No BOM. Sniff the first 2 KiB for a null byte — that's the
+            // strongest signal of a renamed binary.
+            const sniffWindow = probe.subarray(0, Math.min(2048, probe.length));
+            if (sniffWindow.includes(0)) {
+              return {
+                success: false,
+                error: `"${fileName}" looks like a binary file even though its extension is ${ext}. Re-save the file as plain text or pick a supported document format.`,
+              };
+            }
+            content = probe.toString('utf8');
+          }
+        }
+      } catch (parseErr: any) {
+        // Parser-specific failures (timeout, malformed PDF, zip-bomb DOCX).
+        // Log detail to main-process; return a generic message.
+        console.error('[IPC] modes:upload-reference-file parser error:', parseErr?.message ?? parseErr);
+        return {
+          success: false,
+          error: `Could not parse "${fileName}". The file may be corrupt, password-protected, or in an unsupported variant of ${ext}.`,
+        };
+      }
+
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          error: `"${fileName}" parsed to empty text. The file may be password-protected, image-only, or corrupt.`,
+        };
       }
 
       const { ModesManager } = require('./services/ModesManager');
@@ -3182,7 +3978,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { success: true, file };
     } catch (e: any) {
       console.error('[IPC] modes:upload-reference-file error:', e);
-      return { success: false, error: e.message };
+      // Do not leak raw error.message to the renderer (may contain absolute
+      // paths or library internals). Return a generic message; the detail is
+      // already in the main-process log above.
+      return { success: false, error: 'Could not read the selected file. Please try a different file or contact support.' };
     }
   });
 
@@ -3257,5 +4056,55 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { success: false, error: e.message };
     }
   });
-}
 
+  // -----------------------------------------------------------------------
+  // Phone Mirror — stream live AI responses to a paired phone over WS.
+  // -----------------------------------------------------------------------
+
+  // Push status updates to the renderer whenever the service starts/stops
+  // or a phone connects/disconnects. Idempotent — multiple windows can listen.
+  PhoneMirrorService.getInstance().onStatusChange((info) => {
+    const win = appState.getMainWindow();
+    win?.webContents.send('phone-mirror:status', info);
+    try {
+      const settingsWin = (appState as any).settingsWindowHelper?.getWindow?.();
+      settingsWin?.webContents?.send('phone-mirror:status', info);
+    } catch (_) { /* settings window may not exist yet */ }
+  });
+
+  safeHandle("phone-mirror:get-info", async () => {
+    return PhoneMirrorService.getInstance().snapshot();
+  });
+
+  safeHandle("phone-mirror:enable", async (_, exposeOnLan?: boolean) => {
+    try {
+      return await PhoneMirrorService.getInstance().start({ exposeOnLan: !!exposeOnLan, persist: true });
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:enable error:', e);
+      return { error: e?.message || 'failed to start phone mirror' };
+    }
+  });
+
+  safeHandle("phone-mirror:disable", async () => {
+    await PhoneMirrorService.getInstance().stop({ persist: true });
+    return { success: true };
+  });
+
+  safeHandle("phone-mirror:set-lan", async (_, exposeOnLan: boolean) => {
+    try {
+      return await PhoneMirrorService.getInstance().setExposeOnLan(!!exposeOnLan);
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:set-lan error:', e);
+      return { error: e?.message || 'failed to update lan setting' };
+    }
+  });
+
+  safeHandle("phone-mirror:rotate-token", async () => {
+    try {
+      return await PhoneMirrorService.getInstance().rotateToken();
+    } catch (e: any) {
+      console.error('[IPC] phone-mirror:rotate-token error:', e);
+      return { error: e?.message || 'failed to rotate token' };
+    }
+  });
+}
