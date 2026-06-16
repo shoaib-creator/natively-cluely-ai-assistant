@@ -17,6 +17,17 @@ export interface AppSettings {
     codexCliFastModel?: string;
     codexCliTimeoutMs?: number;
     codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
+    codexCliServiceTier?: 'default' | 'fast' | 'flex';
+    codexCliModelReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    // Hindsight long-term memory server (optional, user-provisioned sidecar — Cloud OR
+    // local). baseUrl empty by default → feature off. Env (HINDSIGHT_BASE_URL) overrides
+    // these for dev. apiKey only for Hindsight Cloud. autoStart/serverCommand reserved for
+    // the deferred auto-spawn follow-up (auto-start-when-installed, like Ollama).
+    hindsightBaseUrl?: string;
+    hindsightApiKey?: string;
+    hindsightAutoStart?: boolean;
+    hindsightServerCommand?: string;
+    hindsightLlmProvider?: string;
     knowledgeMode?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
@@ -43,7 +54,15 @@ export interface AppSettings {
         profile_history?: boolean;
         embeddings?: boolean;
         post_call_summary?: boolean;
+        // Verified code execution: when false, the model's code is NOT sent to
+        // the cloud (Piston) runner for languages we can't run locally. Default
+        // allowed; only the cloud path consults this (local py/js never sends).
+        code_execution?: boolean;
     };
+    // Kill-switch for verified code execution (running model code against test
+    // cases in a sandbox after the answer). Default ON; set false to disable at
+    // runtime without a redeploy. Also overridable by env NATIVELY_CODE_VERIFY=off.
+    codeVerificationEnabled?: boolean;
     // Screen-understanding routing — VISION-ONLY architecture (legacy OCR removed from runtime).
     //   vision_first   — Default. Send screenshot to the first available vision-capable provider; cascade through fallback chain on failure.
     //   vision_only    — Stricter: require vision-capable provider. No text-only provider fallback. No OCR fallback.
@@ -52,6 +71,39 @@ export interface AppSettings {
     // When true (default) and the active mode is a technical / coding interview, prefer
     // direct vision LLM over structured-extract-then-answer for lowest latency.
     technicalInterviewVisionFirst?: boolean;
+    // Onboarding and gate flags for persistent settings backup
+    seenStartup?: boolean;
+    seenProfileOnboarding?: boolean;
+    seenModesOnboarding?: boolean;
+    permsShown?: boolean;
+    // Live SessionMemory rollout controls (release 2026-06-07c). Env vars take
+    // precedence; these let the rollout be driven from settings without a redeploy.
+    enableLiveSessionMemory?: boolean;
+    liveSessionMemoryKillSwitch?: boolean;
+    liveSessionMemoryRolloutPercent?: number;
+
+    // ── Regional STT relay (Phase 7/8) ─────────────────────────────────────
+    // Master switch. When false (DEFAULT), NativelyProSTT behaves byte-for-byte
+    // identical to today: it never calls /v1/stt/session and connects directly
+    // to the hardcoded Railway WS with the legacy auth frame.
+    regionalSttRelayEnabled?: boolean;
+    // Client-side rollout gate (0–100). enabled = regionalSttRelayEnabled &&
+    // (hash(apiKey) % 100) < regionalSttRelayPercent. PRECEDENCE: if percent is 0
+    // but regionalSttRelayEnabled is true, Enabled acts as an explicit override
+    // (treated as 100%) — a developer flipping the master switch always gets the
+    // relay regardless of the rollout dial. See isRegionalSttRelayEnabledForKey().
+    regionalSttRelayPercent?: number;
+    // Forced region hint passed to session-create as region_hint. null → let the
+    // control plane decide (geo/latency).
+    forceSttRelayRegion?: 'us' | 'asia' | null;
+    // When false, do NOT append the Railway URL to the fallback chain (lets QA
+    // test relays in isolation). DEFAULT true so production always has the net.
+    sttRailwayFallbackEnabled?: boolean;
+    // Client-side caps echoed into the session-create request. The server is
+    // still authoritative (it re-clamps), these are advisory ceilings.
+    sttMaxSampleRate?: number;
+    sttMaxChannels?: number;
+    sttAllowDualStream?: boolean;
 }
 
 export const VALID_SCREEN_UNDERSTANDING_MODES = ['vision_first', 'vision_only', 'private_vision'] as const;
@@ -67,6 +119,24 @@ const LEGACY_SCREEN_MODE_MIGRATION: Record<string, ScreenUnderstandingMode> = {
     ocr_only: 'vision_first',
     private: 'private_vision',
 };
+
+/**
+ * Stable FNV-1a 32-bit bucket in [0,99] for a string. Used by the client-side
+ * STT relay rollout gate so the same key deterministically lands in the same
+ * bucket. Mirrors the server's deterministic-rollout intent (docs/01 §8): the
+ * exact hash function need not match the server's (the server gates by key-id,
+ * the client by key string) — what matters is stability per key on THIS side so
+ * a given install's relay decision doesn't flap.
+ */
+export function fnv1aBucket(input: string): number {
+    let h = 0x811c9dc5; // FNV offset basis
+    for (let i = 0; i < input.length; i++) {
+        h ^= input.charCodeAt(i);
+        // 32-bit FNV prime multiply via shifts (avoids float precision loss).
+        h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return h % 100;
+}
 
 export class SettingsManager {
     private static instance: SettingsManager;
@@ -117,6 +187,68 @@ export class SettingsManager {
 
     public getTechnicalInterviewVisionFirst(): boolean {
         return this.settings.technicalInterviewVisionFirst !== false;
+    }
+
+    // ── Regional STT relay (Phase 7/8) typed accessors ─────────────────────
+    // These apply the documented defaults consistently so callers never have to
+    // remember them. The class is the single source of truth for the relay flag
+    // defaults; NativelyProSTT reads through these.
+
+    public getRegionalSttRelayEnabled(): boolean {
+        return this.settings.regionalSttRelayEnabled === true; // default false
+    }
+
+    public getRegionalSttRelayPercent(): number {
+        const raw = this.settings.regionalSttRelayPercent;
+        if (typeof raw !== 'number' || !Number.isFinite(raw)) return 0; // default 0
+        return Math.max(0, Math.min(100, Math.floor(raw)));
+    }
+
+    public getForceSttRelayRegion(): 'us' | 'asia' | null {
+        const raw = this.settings.forceSttRelayRegion;
+        return raw === 'us' || raw === 'asia' ? raw : null; // default null
+    }
+
+    public getSttRailwayFallbackEnabled(): boolean {
+        return this.settings.sttRailwayFallbackEnabled !== false; // default true
+    }
+
+    public getSttMaxSampleRate(): number {
+        const raw = this.settings.sttMaxSampleRate;
+        return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 16000; // default 16000
+    }
+
+    public getSttMaxChannels(): number {
+        const raw = this.settings.sttMaxChannels;
+        return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1; // default 1
+    }
+
+    public getSttAllowDualStream(): boolean {
+        return this.settings.sttAllowDualStream === true; // default false
+    }
+
+    /**
+     * Deterministic client-side rollout gate for the regional STT relay.
+     *
+     * PRECEDENCE (documented):
+     *   - Master OFF (regionalSttRelayEnabled !== true)  → always false.
+     *   - Master ON + percent <= 0                       → true (override = 100%).
+     *     Rationale: a developer/dogfooder who flips the master switch with no
+     *     rollout dial set expects the relay ON, not silently gated to nothing.
+     *   - Master ON + percent >= 100                     → true.
+     *   - Master ON + 0 < percent < 100                  → (hash(key) % 100) < percent.
+     *
+     * The hash is a stable FNV-1a over the key string, so the same key always
+     * lands in the same bucket; raising the percent only ever adds keys
+     * (monotonic) — mirroring the server's rollout semantics (docs/01 §8).
+     */
+    public isRegionalSttRelayEnabledForKey(apiKey: string | undefined | null): boolean {
+        if (!this.getRegionalSttRelayEnabled()) return false;
+        const percent = this.getRegionalSttRelayPercent();
+        if (percent <= 0) return true;   // Enabled-as-override
+        if (percent >= 100) return true;
+        const bucket = fnv1aBucket(apiKey ?? '');
+        return bucket < percent;
     }
 
     private loadSettings(): void {

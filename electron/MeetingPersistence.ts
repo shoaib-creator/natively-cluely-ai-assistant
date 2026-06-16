@@ -7,7 +7,11 @@ import { LLMHelper } from './LLMHelper';
 import { DatabaseManager, Meeting } from './db/DatabaseManager';
 import { GROQ_TITLE_PROMPT, GROQ_SUMMARY_JSON_PROMPT } from './llm';
 import { buildPostCallEnhancements } from './services/post-call/PostCallWorkflow';
+import { MeetingMemoryService } from './intelligence/MeetingMemoryService';
+import { LongTermMemoryService } from './intelligence/memory/LongTermMemoryService';
+import { isIntelligenceFlagEnabled } from './intelligence/intelligenceFlags';
 import { telemetryService } from './services/telemetry/TelemetryService';
+import type { ProviderDataScopePolicy } from './llm/ProviderRouter';
 const crypto = require('crypto');
 
 export class MeetingPersistence {
@@ -49,7 +53,10 @@ export class MeetingPersistence {
             // (e.g. set via the renderer "Do not persist this meeting" toggle).
             const meta = this.session.getMeetingMetadata?.();
             if (meta && (meta as any).doNotPersist === true) doNotPersist = true;
-        } catch { /* non-fatal */ }
+        } catch (err) {
+            console.error('[MeetingPersistence] Failed to read retention settings, defaulting to discard for safety:', err);
+            doNotPersist = true; // Fail-secure fallback
+        }
         if (doNotPersist) {
             console.log('[MeetingPersistence] doNotPersist set — skipping save (no DB row, no summary).');
             try {
@@ -210,7 +217,7 @@ export class MeetingPersistence {
                     //   - `post_call_summary === false` → no mode context at all
                     //   - `reference_files === false`   → customContext only, no retrieved snippets
                     if (modeSnapshot) {
-                        let scopePolicy: any = undefined;
+                        let scopePolicy: ProviderDataScopePolicy | undefined = undefined;
                         try {
                             const { SettingsManager } = require('./services/SettingsManager');
                             scopePolicy = SettingsManager.getInstance().get('providerDataScopes');
@@ -227,7 +234,7 @@ export class MeetingPersistence {
                                 includeReferenceSnippets: referenceSnippetsAllowed,
                             }) || '';
                         } else {
-                            console.log('[MeetingPersistence] post_call_summary scope denied — skipping mode context injection');
+                            console.warn('[ScopeFallback] post_call_summary denied for cloud; routing to Ollama');
                             modeContextBlock = '';
                         }
                     }
@@ -340,6 +347,41 @@ Return ONLY valid JSON (no markdown code blocks):
                     summaryData,
                 }),
             };
+
+            // MEETING MEMORY V2 (Phase 8 wiring, behind meeting_memory_v2_enabled):
+            // extract first-class structured memory (entities/topics/decisions/questions/
+            // action-items/skills/companies) and PERSIST it into summary_json under a
+            // `meetingMemory` key. This runs in the ALREADY-BACKGROUND processAndSaveMeeting
+            // worker (fired fire-and-forget from stopMeeting), so it can never block live
+            // answering (non-negotiable rule). It's a NEW key in summary_json — no DB
+            // migration, fully backward-compatible (old meetings just lack it; readers
+            // handle absence). Deterministic, no LLM, no extra provider call. Flag OFF →
+            // summaryData is byte-for-byte unchanged.
+            try {
+                if (isIntelligenceFlagEnabled('meetingMemoryV2')) {
+                    const record = new MeetingMemoryService().buildMeetingRecord({
+                        meetingId,
+                        segments: data.transcript,
+                        mode: modeSnapshot?.templateType,
+                        startedAt: data.startTime,
+                        endedAt: data.startTime + data.durationMs,
+                    });
+                    (summaryData as any).meetingMemory = {
+                        topics: record.topics,
+                        questionsAsked: record.questionsAsked,
+                        decisions: record.decisions,
+                        actionItems: record.actionItems,
+                        entities: record.entities,
+                        skillsDiscussed: record.skillsDiscussed,
+                        companiesDiscussed: record.companiesDiscussed,
+                        participants: record.participants,
+                        sourceQuality: record.sourceQuality,
+                        schemaVersion: 1,
+                    };
+                }
+            } catch (memErr) {
+                console.warn('[MeetingMemoryV2] extraction skipped (non-fatal):', (memErr as any)?.message);
+            }
         } catch (e) {
             console.error("Error generating meeting metadata", e);
         }
@@ -364,6 +406,39 @@ Return ONLY valid JSON (no markdown code blocks):
             };
 
             DatabaseManager.getInstance().saveMeeting(meetingData, data.startTime, data.durationMs);
+
+            // HINDSIGHT POST-MEETING RETAIN (Phase 13 wiring, behind
+            // hindsight_post_meeting_retain_enabled). After the meeting is persisted
+            // locally, ASYNC-retain its summary into long-term memory IF Hindsight is
+            // configured. LongTermMemoryService.fromFlags returns a NoopMemoryProvider
+            // unless hindsight_memory is ALSO on AND a baseUrl is configured AND the
+            // optional @vectorize-io/hindsight-client is installed — so with no server
+            // this is a guaranteed no-op (the app works fully without Hindsight). retain
+            // is async/queued (never blocks). Scope tags enforce per-user/org isolation.
+            // Runs in the already-background processAndSaveMeeting worker.
+            try {
+                // Config from HindsightManager (settings OR env) so this works in a packaged
+                // build, not just when HINDSIGHT_BASE_URL is exported in a dev shell.
+                const { HindsightManager } = require('./services/HindsightManager') as typeof import('./services/HindsightManager');
+                const _hm = HindsightManager.getInstance();
+                const hsCfg = _hm.getHindsightConfig();
+                // Skip a known-down server (cached health) — don't queue a retain that
+                // can't land (2026-06-14 fix).
+                if (isIntelligenceFlagEnabled('hindsightPostMeetingRetain') && hsCfg && _hm.isAvailable()) {
+                    const ltm = LongTermMemoryService.fromFlags({ hindsight: hsCfg });
+                    if (ltm.enabled) {
+                        const summaryText = typeof summaryData?.overview === 'string'
+                            ? summaryData.overview
+                            : JSON.stringify(summaryData?.keyPoints ?? []);
+                        // Per-install scope id (isolates two installs sharing one Cloud
+                        // account); mode tag scopes by meeting mode.
+                        ltm.retainMeetingSummary(meetingId, summaryText, { userId: _hm.localUserId(), meetingId }, modeSnapshot?.templateType);
+                        console.log('[Hindsight] queued post-meeting summary retain', { meetingId, provider: ltm.providerName });
+                    }
+                }
+            } catch (hsErr) {
+                console.warn('[Hindsight] post-meeting retain skipped (non-fatal):', (hsErr as any)?.message);
+            }
 
             // Metadata was already snapshotted before session.reset() — nothing to clear here.
 

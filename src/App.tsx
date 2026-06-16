@@ -15,9 +15,11 @@ import { FreeTrialBanner }      from "./components/trial/FreeTrialBanner"
 import { FreeTrialModal }       from "./components/trial/FreeTrialModal"
 import { TrialPromoToaster }    from "./components/trial/TrialPromoToaster"
 import { PermissionsToaster }   from "./components/onboarding/PermissionsToaster"
-import { AlertCircle } from "lucide-react"
+import { AlertCircle, RefreshCw } from "lucide-react"
 import { clampOverlayOpacity, OVERLAY_OPACITY_DEFAULT, getDefaultOverlayOpacity } from "./lib/overlayAppearance"
 import { getMeetingInterfaceTheme, type MeetingInterfaceTheme } from './lib/meetingInterfaceTheme'
+import { isMac } from "./utils/platformUtils"
+import { trackAppOpen, markToasterAsShown } from "./lib/toasterGating"
 import {
   JDAwarenessToaster,
   ProfileFeatureToaster,
@@ -89,15 +91,7 @@ const App: React.FC = () => {
   }, [isLauncherWindow, isOverlayWindow, isDefault]);
 
   // State
-  // One-shot first-run startup sequence. Once the user dismisses it (or any
-  // future code flips the flag), it never appears again on subsequent launches.
-  const [showStartup, setShowStartup] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('natively_seen_startup_v1') !== 'true';
-    } catch {
-      return true;
-    }
-  });
+  const [showStartup, setShowStartup] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<string>('general');
   const [isModesOpen, setIsModesOpen] = useState(false);
@@ -151,6 +145,8 @@ const App: React.FC = () => {
 
   // Re-index State
   const [incompatibleWarning, setIncompatibleWarning] = useState<{count: number; oldProvider: string; newProvider: string} | null>(null);
+  // Automatic background re-index progress (fired after an embedding-model upgrade).
+  const [reindexProgress, setReindexProgress] = useState<{done: number; total: number} | null>(null);
   
   // API check
   const [hasNativelyApi, setHasNativelyApi] = useState<boolean>(false);
@@ -158,6 +154,7 @@ const App: React.FC = () => {
   // ── Onboarding / promo toasters ───────────────────────────
   const [showPermissionsToaster, setShowPermissionsToaster] = useState(false);
   const [showTrialPromo,         setShowTrialPromo]         = useState(false);
+
 
   // ── Free Trial global state ────────────────────────────────
   const [activeTrial, setActiveTrial] = useState<{
@@ -167,7 +164,7 @@ const App: React.FC = () => {
   const [showTrialExpiredModal, setShowTrialExpiredModal] = useState(false);
 
   const isAppReady = !isSettingsWindow && !isOverlayWindow && !isModelSelectorWindow && !showStartup && !isSettingsOpen && isLauncherMainView && !isProfileOpen;
-  const { activeAd, dismissAd, previewAd } = useAdCampaigns(
+  const { activeAd, dismissAd } = useAdCampaigns(
     planDetails,
     hasProfile,
     isAppReady,
@@ -177,30 +174,72 @@ const App: React.FC = () => {
     hasNativelyApi
   );
 
-  // Preview shortcuts — Ctrl/Cmd+Shift+1-5 force-show any ad card.
-  // Uses e.code so Shift doesn't remap the digit to a symbol ('!' etc.).
-  useEffect(() => {
-    const CODE_MAP: Record<string, string> = {
-      'Digit1': 'max_ultra_upgrade',
-      'Digit2': 'promo',
-      'Digit3': 'natively_api',
-      'Digit4': 'profile',
-      'Digit5': 'jd',
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || !e.shiftKey) return;
-      const ad = CODE_MAP[e.code];
-      if (!ad) return;
-      e.preventDefault();
-      previewAd(ad as any);
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [previewAd]);
+
 
   useEffect(() => {
+    // Track app opens for global gating
+    trackAppOpen();
+
     // Clean up old local storage
     localStorage.removeItem('useLegacyAudioBackend');
+
+    const fallbackLocal = () => {
+      // The classic launch animation is intentionally shown on every launcher
+      // startup, matching the older app behavior from 93ee4a21.
+    };
+
+    if (window.electronAPI?.onboardingGetFlags) {
+      window.electronAPI.onboardingGetFlags()
+        .then((flags) => {
+          if (flags) {
+            // 1. seenStartup intentionally no longer suppresses the classic
+            // black-logo launch animation; the old app played it every launch.
+
+            // 2. seenModesOnboarding
+            if (flags.seenModesOnboarding) {
+              try { localStorage.setItem('natively_seen_modes_onboarding_v5', 'true'); } catch {}
+            } else {
+              try {
+                const localSeen = localStorage.getItem('natively_seen_modes_onboarding_v5') === 'true';
+                if (localSeen) {
+                  window.electronAPI?.onboardingSetFlag?.('seenModesOnboarding', true).catch(() => {});
+                }
+              } catch {}
+            }
+
+            // 3. seenProfileOnboarding
+            if (flags.seenProfileOnboarding) {
+              try { localStorage.setItem('natively_seen_profile_onboarding_v1', 'true'); } catch {}
+            } else {
+              try {
+                const localSeen = localStorage.getItem('natively_seen_profile_onboarding_v1') === 'true';
+                if (localSeen) {
+                  window.electronAPI?.onboardingSetFlag?.('seenProfileOnboarding', true).catch(() => {});
+                }
+              } catch {}
+            }
+
+            // 4. permsShown
+            if (flags.permsShown) {
+              try { localStorage.setItem('natively_perms_shown_v1', '1'); } catch {}
+            } else {
+              try {
+                const localSeen = localStorage.getItem('natively_perms_shown_v1') === '1';
+                if (localSeen) {
+                  window.electronAPI?.onboardingSetFlag?.('permsShown', true).catch(() => {});
+                }
+              } catch {}
+            }
+          } else {
+            fallbackLocal();
+          }
+        })
+        .catch(() => {
+          fallbackLocal();
+        });
+    } else {
+      fallbackLocal();
+    }
 
     // Basic status check for campaign targeting
     window.electronAPI?.profileGetStatus?.().then(s => setHasProfile(s?.hasProfile || false)).catch(() => {});
@@ -283,8 +322,42 @@ const App: React.FC = () => {
         // First ever launch — show permissions toaster
         setShowPermissionsToaster(true);
       } else {
-        // Subsequent launches — trial promo will self-gate via TrialPromoToaster
-        setShowTrialPromo(true);
+        // Returning launch: re-check live TCC status. A macOS permission grant
+        // can be DROPPED out from under a returning user — most commonly after
+        // an app update changes the code signature (macOS may re-evaluate /
+        // invalidate the Screen Recording or Microphone grant for the new
+        // binary), or if the user revoked it in System Settings. In that state
+        // askForMediaAccess() returns denied WITHOUT a prompt (macOS only
+        // prompts from 'not-determined'), so the app would silently fail to
+        // capture with nothing on screen. Surface the recoverable permissions
+        // card (it deep-links to the exact System Settings pane) instead of the
+        // trial promo when mic/screen is denied or restricted. The main process
+        // also broadcasts a denied banner at startup, but that targets the
+        // in-overlay meeting surface — at launch the user is on the launcher,
+        // so this launcher-side check is what they actually see.
+        const showTrialPromoFallback = () => {
+          // Subsequent launches — trial promo will self-gate via TrialPromoToaster
+          const trialShown = localStorage.getItem('natively_trial_promo_ts');
+          if (!trialShown) {
+            setShowTrialPromo(true);
+          }
+        };
+        const maybeSurfacePermissions = window.electronAPI?.checkPermissions;
+        if (maybeSurfacePermissions) {
+          maybeSurfacePermissions()
+            .then((p) => {
+              const blocked = (s?: string) => s === 'denied' || s === 'restricted';
+              if (p?.platform === 'darwin' && (blocked(p.microphone) || blocked(p.screen))) {
+                setShowPermissionsToaster(true);
+              } else {
+                showTrialPromoFallback();
+              }
+            })
+            .catch(showTrialPromoFallback);
+        } else {
+          // Non-macOS or API unavailable — preserve the original behaviour.
+          showTrialPromoFallback();
+        }
       }
     }
 
@@ -325,6 +398,25 @@ const App: React.FC = () => {
       });
     }
 
+    let removeReindexProgress: (() => void) | undefined;
+    if (window.electronAPI?.onReindexProgress) {
+      removeReindexProgress = window.electronAPI.onReindexProgress((phase, data) => {
+        if (phase === 'started') {
+          setReindexProgress({ done: 0, total: data.count ?? 0 });
+        } else if (phase === 'progress') {
+          setReindexProgress({ done: data.done ?? 0, total: data.total ?? 0 });
+        } else if (phase === 'complete') {
+          // On a full completion show 100%; on a partial bail (paused by continuous
+          // live meetings — resumes next launch) reflect the actual done count rather
+          // than forcing 100%. Either way, briefly show then dismiss.
+          const total = data.total ?? 0;
+          const done = data.partial ? (data.done ?? 0) : total;
+          setReindexProgress({ done, total });
+          setTimeout(() => setReindexProgress(null), 4000);
+        }
+      });
+    }
+
     // Listen for real-time license status changes (activation, revocation, deactivation)
     const removeLicenseListener = window.electronAPI?.onLicenseStatusChanged?.((data) => {
       setIsPremiumActive(data.isPremium);
@@ -337,6 +429,7 @@ const App: React.FC = () => {
       if (removeProgress) removeProgress();
       if (removeComplete) removeComplete();
       if (removeWarning) removeWarning();
+      if (removeReindexProgress) removeReindexProgress();
       if (removeLicenseListener) removeLicenseListener();
       if (trialPollId) clearInterval(trialPollId);
       if (removeTrialListener) removeTrialListener();
@@ -367,9 +460,26 @@ const App: React.FC = () => {
   }, [isOverlayWindow]);
 
   useEffect(() => {
+    // Two propagation channels:
+    //  1. `storage` event — fires within the same window when our own
+    //     setMeetingInterfaceTheme() dispatches it (covers settings-pane → App
+    //     state in the launcher).
+    //  2. IPC `interface-theme:changed` broadcast — main relays the new theme
+    //     to EVERY BrowserWindow, including the overlay. Without this the
+    //     overlay holds a stale theme value across hide/show cycles, which
+    //     yielded the half-painted UI on next meeting start.
     const handleStorage = () => setMeetingInterfaceThemeState(getMeetingInterfaceTheme());
     window.addEventListener('storage', handleStorage);
-    return () => window.removeEventListener('storage', handleStorage);
+    const unsubscribeIpc = window.electronAPI?.onMeetingInterfaceThemeChanged?.((theme) => {
+      const valid: MeetingInterfaceTheme[] = ['default', 'liquid-glass', 'modern'];
+      if (valid.includes(theme as MeetingInterfaceTheme)) {
+        setMeetingInterfaceThemeState(theme as MeetingInterfaceTheme);
+      }
+    });
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      unsubscribeIpc?.();
+    };
   }, []);
 
 
@@ -386,14 +496,21 @@ const App: React.FC = () => {
       localStorage.setItem('natively_last_meeting_start', Date.now().toString());
       const inputDeviceId = localStorage.getItem('preferredInputDeviceId');
       let outputDeviceId = localStorage.getItem('preferredOutputDeviceId');
-      const useExperimentalSck = localStorage.getItem('useExperimentalSckBackend') === 'true';
+      // SCK is a macOS-only backend (ScreenCaptureKit + CoreAudio Process Tap
+      // live in the Rust speaker module under #[cfg(target_os = "macos")]).
+      // F-003 hid the toggle UI on Windows, but the localStorage key can be
+      // present on a Windows machine via cross-OS sync or restored backup —
+      // routing "sck" as an outputDeviceId then hands the Windows speaker
+      // module an unknown WASAPI device id and silently breaks system audio.
+      // Defense-in-depth: also require isMac at the consumer.
+      const useExperimentalSck = isMac && localStorage.getItem('useExperimentalSckBackend') === 'true';
 
       // Override output device ID to force SCK if experimental mode is enabled
       // Default to CoreAudio unless experimental is enabled
       if (useExperimentalSck) {
         console.log("[App] Using ScreenCaptureKit backend (Experimental).");
         outputDeviceId = "sck";
-      } else {
+      } else if (isMac) {
         console.log("[App] Using CoreAudio backend (Default).");
       }
 
@@ -409,9 +526,26 @@ const App: React.FC = () => {
         // launcher. No follow-up setWindowMode IPC needed here.
       } else {
         console.error("Failed to start meeting:", result.error);
+        // A mic-permission denial aborts the meeting before the overlay (which
+        // hosts the in-meeting audio banner) is ever shown — so the user is
+        // left on the launcher with nothing actionable. Re-open the permissions
+        // card, which checks live mic/screen status, re-requests the mic, and
+        // deep-links to System Settings. This is the recoverable surface for
+        // the "I press Start Natively and nothing happens" report.
+        if (result.code === 'mic-permission-denied') {
+          setShowPermissionsToaster(true);
+        }
       }
     } catch (err) {
       console.error("Failed to start meeting:", err);
+      // Defense-in-depth: today the start-meeting IPC handler catches and
+      // resolves {success:false, code}, so a mic denial lands in the else
+      // branch above. If the call ever rejects instead, Electron preserves the
+      // serialized error .code across ipcRenderer.invoke — keep the recovery
+      // working so the denial never regresses to a silent failure.
+      if ((err as { code?: string })?.code === 'mic-permission-denied') {
+        setShowPermissionsToaster(true);
+      }
     }
   };
 
@@ -447,11 +581,13 @@ const App: React.FC = () => {
     });
   };
 
+  const interfaceThemeAttribute = meetingInterfaceTheme === 'default' ? undefined : meetingInterfaceTheme;
+
   // Render Logic
   if (isSettingsWindow) {
     return (
       <ErrorBoundary context="SettingsPopup">
-        <div className="h-full min-h-0 w-full">
+        <div className="h-full min-h-0 w-full" data-interface-theme={interfaceThemeAttribute}>
           <QueryClientProvider client={queryClient}>
             <ToastProvider>
               <SettingsPopup />
@@ -466,7 +602,10 @@ const App: React.FC = () => {
   if (isModelSelectorWindow) {
     return (
       <ErrorBoundary context="ModelSelector">
-        <div className="h-full min-h-0 w-full overflow-hidden">
+        <div
+          className="h-full min-h-0 w-full overflow-hidden"
+          data-interface-theme={interfaceThemeAttribute}
+        >
           <QueryClientProvider client={queryClient}>
             <ToastProvider>
               <ModelSelectorWindow />
@@ -482,7 +621,7 @@ const App: React.FC = () => {
   if (isOverlayWindow) {
     return (
       <ErrorBoundary context="Overlay">
-        <div className="w-full relative bg-transparent">
+        <div className="w-full h-full relative overflow-hidden bg-transparent">
           <QueryClientProvider client={queryClient}>
             <ToastProvider>
               <div
@@ -509,29 +648,27 @@ const App: React.FC = () => {
   // Renders if window=launcher OR no param
   return (
     <ErrorBoundary context="Launcher">
-    <div className="h-full min-h-0 w-full relative bg-[#000000]">
+    <div className="h-full min-h-0 w-full relative bg-transparent">
       <AnimatePresence>
         {showStartup ? (
           <motion.div
             key="startup"
-            initial={{ opacity: 1 }}
-            exit={{ opacity: 0, scale: 1.1, pointerEvents: "none", transition: { duration: 0.6, ease: "easeInOut" } }}
+            className="h-full w-full"
+            initial={{ opacity: 0, scale: 1.01 }}
+            animate={{ opacity: 1, scale: 1, transition: { duration: 0.5, ease: [0.23, 1, 0.32, 1] } }}
+            exit={{ opacity: 0, scale: 1.04, pointerEvents: "none", transition: { duration: 0.55, ease: [0.4, 0, 0.2, 1] } }}
           >
-            <StartupSequence onComplete={() => {
-              try { localStorage.setItem('natively_seen_startup_v1', 'true'); } catch {}
-              setShowStartup(false);
-            }} />
+            <StartupSequence onComplete={() => setShowStartup(false)} />
           </motion.div>
         ) : (
           <motion.div
             key="main"
             className="h-full w-full"
-            initial={{ opacity: 0, scale: 0.98, y: 15 }} // "Linear" style entry: slightly down and scaled down
-            animate={{ opacity: 1, scale: 1, y: 0 }}      // Slide up and snap to place
+            initial={{ opacity: 0, scale: 0.99, y: 8 }} // "Linear" style entry: slightly down and scaled down
+            animate={{ opacity: 1, scale: 1, y: 0 }}    // Slide up and snap to place
             transition={{
-              duration: 0.8,
+              duration: 0.6,
               ease: [0.19, 1, 0.22, 1], // Expo-out: snappy start, smooth landing
-              delay: 0.1
             }}
           >
             <QueryClientProvider client={queryClient}>
@@ -668,6 +805,43 @@ const App: React.FC = () => {
         )}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {reindexProgress && isDefault && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95, y: 20 }}
+            className="fixed bottom-6 right-6 z-50 pointer-events-auto"
+          >
+            <div className="bg-[#1A1A1A] border border-white/10 shadow-2xl rounded-2xl p-5 max-w-[340px] flex flex-col gap-3">
+              <div className="flex items-start gap-3">
+                <RefreshCw className={`w-5 h-5 text-[#A0A0A0] shrink-0 mt-0.5 ${reindexProgress.done < reindexProgress.total ? 'animate-spin' : ''}`} />
+                <div className="flex-1">
+                  <h3 className="text-[#E0E0E0] font-medium text-sm">
+                    {reindexProgress.done >= reindexProgress.total && reindexProgress.total > 0
+                      ? 'Search index updated'
+                      : 'Updating search index'}
+                  </h3>
+                  <p className="text-[#A0A0A0] text-xs mt-1 leading-relaxed">
+                    {reindexProgress.done >= reindexProgress.total && reindexProgress.total > 0
+                      ? 'Your past conversations are searchable again.'
+                      : `Re-indexing your past conversations for the upgraded AI model… ${reindexProgress.done}/${reindexProgress.total}`}
+                  </p>
+                  {reindexProgress.total > 0 && (
+                    <div className="mt-2 h-1 w-full rounded-full bg-white/10 overflow-hidden">
+                      <div
+                        className="h-full bg-[#E0E0E0] transition-all duration-500"
+                        style={{ width: `${Math.min(100, Math.round((reindexProgress.done / reindexProgress.total) * 100))}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <UpdateBanner />
       <SupportToaster />
       <NativelyQuotaBanner />
@@ -688,8 +862,12 @@ const App: React.FC = () => {
         isOpen={showPermissionsToaster}
         onDismiss={() => {
           localStorage.setItem('natively_perms_shown_v1', '1');
+          window.electronAPI?.onboardingSetFlag?.('permsShown', true).catch(() => {});
           setShowPermissionsToaster(false);
-          // After permissions, allow trial promo on next launch
+          // Show the trial promo immediately after permissions setup (with a 1.5s transition delay)
+          setTimeout(() => {
+            setShowTrialPromo(true);
+          }, 1500);
         }}
       />
 
@@ -732,16 +910,15 @@ const App: React.FC = () => {
           }}
         />
       )}
-      {/* Ad toasters — render whenever activeAd is set (isLauncherMainView guard bypassed
-          when triggered via preview shortcut so the card always surfaces) */}
-      {(isLauncherMainView || !!activeAd) && !isSettingsOpen && (
+      {/* Ad toasters */}
+      {isLauncherMainView && !isSettingsOpen && (
         <NativelyApiPromoToaster
           isOpen={activeAd === 'natively_api'}
           onDismiss={() => dismissAd('natively_api')}
           onOpenSettings={(tab: string) => openSettingsExclusive(tab)}
         />
       )}
-      {(isLauncherMainView || !!activeAd) && (
+      {isLauncherMainView && (
         <>
           <ProfileFeatureToaster
             isOpen={activeAd === 'profile'}
@@ -768,12 +945,13 @@ const App: React.FC = () => {
             }}
           />
 
-          {/* Remote Campaigns Render Logic */}
+          {/* Remote Campaigns Render Logic (Commented out)
           <RemoteCampaignToaster
             isOpen={typeof activeAd === 'object' && activeAd !== null}
             campaign={typeof activeAd === 'object' && activeAd !== null ? activeAd : undefined as any}
             onDismiss={dismissAd}
           />
+          */}
         </>
       )}
 

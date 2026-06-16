@@ -2,21 +2,27 @@
 import path from 'path';
 import { app } from 'electron';
 import { IEmbeddingProvider } from './IEmbeddingProvider';
+import { embeddingSpaceKey } from '../embeddingSpace';
 
 export class LocalEmbeddingProvider implements IEmbeddingProvider {
   readonly name = 'local';
   readonly dimensions = 384; // all-MiniLM-L6-v2
+  readonly model = 'Xenova/all-MiniLM-L6-v2';
+  readonly space: string;
 
   private pipe: any = null;
   private loadingPromise: Promise<void> | null = null; // prevents concurrent init races
   private modelPath: string;
 
   constructor() {
+    this.space = embeddingSpaceKey({ name: this.name, model: this.model, dimensions: this.dimensions });
     // Point to the bundled model inside the app's resources.
-    // In dev: __dirname = dist-electron/electron/rag/providers → need 4 levels up to project root.
+    // In dev: use app.getAppPath() so the path is independent of how esbuild
+    // bundles this file (bundle: true inlines the provider into main.js, which
+    // makes __dirname-relative paths fragile).
     // In prod: app.isPackaged = true → use process.resourcesPath (electron-builder extraResources).
     this.modelPath = path.join(
-      app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../../../resources'),
+      app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'resources'),
       'models'
     );
   }

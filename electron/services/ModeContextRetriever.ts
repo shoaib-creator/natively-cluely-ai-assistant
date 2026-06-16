@@ -3,6 +3,25 @@ import { ModeHybridRetriever, ModeRetrievedContext as HybridContext } from './mo
 import { VectorStore } from '../rag/VectorStore';
 import { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
 import { DatabaseManager } from '../db/DatabaseManager';
+// Imported from the leaf module (not the ../llm barrel) to avoid a require cycle.
+import { classifyCustomContext, selectCustomContextForAnswer } from '../llm/customContextClassifier';
+import type { AnswerType } from '../llm/AnswerPlanner';
+
+/**
+ * Gate the mode's raw customContext blob by answer type (Phase 3). Returns only
+ * the chunks the answer type may see — sensitive chunks (salary/pricing/private
+ * strategy) are dropped unless the answer is a negotiation. When `answerType` is
+ * undefined the full blob is returned unchanged (backward compatible). Returns
+ * `{ text, sensitiveDropped }` so the caller can record safety telemetry.
+ */
+function scopeCustomContext(raw: string, answerType?: AnswerType): { text: string; sensitiveDropped: boolean } {
+    const trimmed = raw.trim();
+    if (!trimmed || !answerType) return { text: trimmed, sensitiveDropped: false };
+    const classified = classifyCustomContext(trimmed);
+    const selection = selectCustomContextForAnswer(classified, answerType);
+    const sensitiveDropped = classified.sensitive.length > 0 && !selection.sensitiveIncluded;
+    return { text: selection.included.map(c => c.text).join('\n'), sensitiveDropped };
+}
 
 export interface ModeKnowledgeSource {
     id: string;
@@ -30,6 +49,18 @@ interface RetrieveOptions {
     transcript?: string;
     tokenBudget?: number;
     topK?: number;
+    /**
+     * When set, the mode's customContext is scoped by answer type so sensitive
+     * chunks (salary/pricing/private strategy) never leak into a non-negotiation
+     * answer. Undefined → the full customContext blob is used (backward compat).
+     */
+    answerType?: AnswerType;
+    /**
+     * PI v3 (W2): callers that PIN the mode's customContext directly into the
+     * prompt (getActiveModePinnedInstructions) set this so retrieval doesn't
+     * surface the same text a second time. Reference files are unaffected.
+     */
+    excludeCustomContext?: boolean;
 }
 
 const DEFAULT_TOKEN_BUDGET = 1800;
@@ -119,12 +150,25 @@ export class ModeContextRetriever {
 
         const sources: ModeKnowledgeSource[] = [];
 
-        if (mode.customContext.trim()) {
-            sources.push({
-                id: `${mode.id}:custom_context`,
-                type: 'custom_context',
-                content: mode.customContext.trim(),
-            });
+        // Scope customContext by answer type before it enters retrieval, so a
+        // salary/pricing note in the mode's custom context can't be retrieved
+        // into a coding/identity/behavioral answer. No-op when answerType is
+        // unset (backward compatible). Skipped entirely when the caller pins
+        // the customContext directly (PI v3 W2 — no duplicate injection).
+        if (!options.excludeCustomContext) {
+            const scopedCustom = scopeCustomContext(mode.customContext, options.answerType);
+            if (scopedCustom.sensitiveDropped) {
+                console.warn('[ModeContextRetriever] dropped sensitive customContext chunk(s) — not relevant to answer type', {
+                    answerType: options.answerType,
+                });
+            }
+            if (scopedCustom.text) {
+                sources.push({
+                    id: `${mode.id}:custom_context`,
+                    type: 'custom_context',
+                    content: scopedCustom.text,
+                });
+            }
         }
 
         for (const file of files) {
@@ -209,33 +253,61 @@ export class ModeContextRetriever {
      * Hybrid retrieval combining FTS/BM25 + vector semantic search.
      * Falls back to lexical-only if embedding provider is unavailable.
      */
+    /**
+     * Lazily create (and cache) the hybrid retriever. Returns null when the
+     * database isn't available yet — callers degrade to lexical.
+     */
+    private ensureHybridRetriever(): ModeHybridRetriever | null {
+        if (this._hybridRetriever) return this._hybridRetriever;
+        const db = DatabaseManager.getInstance().getDb();
+        const dbPath = DatabaseManager.getInstance().getDbPath();
+        if (!db) return null;
+        // VectorStore needs db, dbPath, and extPath - create minimal instance for mode retrieval
+        const vectorStore = new VectorStore(db, dbPath, '');
+        const embeddingPipeline = new EmbeddingPipeline(db, vectorStore);
+        this._hybridRetriever = new ModeHybridRetriever(db, vectorStore, embeddingPipeline);
+        return this._hybridRetriever;
+    }
+
+    // ── PI v3 (W3): upload-time indexing pass-throughs ─────────────────────
+    /** Chunk + embed + persist one file's vectors (idempotent, never throws). */
+    async indexReferenceFile(file: ModeReferenceFile): Promise<void> {
+        const retriever = this.ensureHybridRetriever();
+        if (!retriever) return;
+        await retriever.indexFile(file);
+    }
+
+    /** Index status for the Modes Manager UI badge. */
+    getReferenceFileIndexStatus(fileId: string): { status: string; chunkCount: number } {
+        const retriever = this.ensureHybridRetriever();
+        if (!retriever) return { status: 'pending', chunkCount: 0 };
+        return retriever.getFileIndexStatus(fileId);
+    }
+
+    /** Drop a deleted file's persisted chunks + index state. */
+    removeReferenceFileIndex(fileId: string): void {
+        this.ensureHybridRetriever()?.removeFileIndex(fileId);
+    }
+
     async retrieveHybrid(mode: Mode, files: ModeReferenceFile[], options: RetrieveOptions): Promise<HybridContext> {
         // Lazily create hybrid retriever on first use
-        if (!this._hybridRetriever) {
-            const db = DatabaseManager.getInstance().getDb();
-            const dbPath = DatabaseManager.getInstance().getDbPath();
-            if (!db) {
-                console.warn('[ModeContextRetriever] Database not available for hybrid retrieval');
-                // Route through the same throttle the hybrid retriever uses
-                // so a sticky DB outage during a 1-hour meeting can't spam
-                // hundreds of identical events (the retriever is called per
-                // transcript turn). See FINDING-007 in BUGFIX_LOG.
-                ModeHybridRetriever.emitFallbackTelemetryStatic({
-                    reason: 'db_unavailable',
-                    modeId: mode.id,
-                });
-                return { chunks: [], formattedContext: '', usedFallback: true, usedHybrid: false };
-            }
-            // VectorStore needs db, dbPath, and extPath - create minimal instance for mode retrieval
-            const vectorStore = new VectorStore(db, dbPath, '');
-            const embeddingPipeline = new EmbeddingPipeline(db, vectorStore);
-            this._hybridRetriever = new ModeHybridRetriever(db, vectorStore, embeddingPipeline);
+        if (!this.ensureHybridRetriever()) {
+            console.warn('[ModeContextRetriever] Database not available for hybrid retrieval');
+            // Route through the same throttle the hybrid retriever uses
+            // so a sticky DB outage during a 1-hour meeting can't spam
+            // hundreds of identical events (the retriever is called per
+            // transcript turn). See FINDING-007 in BUGFIX_LOG.
+            ModeHybridRetriever.emitFallbackTelemetryStatic({
+                reason: 'db_unavailable',
+                modeId: mode.id,
+            });
+            return { chunks: [], formattedContext: '', usedFallback: true, usedHybrid: false };
         }
 
         const queryText = `${options.query}\n${options.transcript ?? ''}`.trim();
         const hasTranscript = !!options.transcript && options.transcript.trim().length > 0;
 
-        const result = await this._hybridRetriever.retrieve({
+        const result = await this._hybridRetriever!.retrieve({
             query: queryText,
             modeId: mode.id,
             files,

@@ -13,6 +13,15 @@ export interface CustomProvider {
     id: string;
     name: string;
     curlCommand: string;
+    /**
+     * Whether this provider can accept screenshots. When undefined, vision
+     * support is auto-detected from the cURL template (an `{{IMAGE_BASE64}}`
+     * placeholder, or an OpenAI-compatible `messages` body). Set explicitly to
+     * override the guess. See customProviderSupportsVision().
+     */
+    multimodal?: boolean;
+    /** True if this provider's endpoint is loopback/local (skips cloud-scope gating). */
+    localOnly?: boolean;
 }
 
 export interface CurlProvider {
@@ -27,6 +36,11 @@ export interface StoredCredentials {
     groqApiKey?: string;
     openaiApiKey?: string;
     claudeApiKey?: string;
+    deepseekApiKey?: string;
+    litellmApiKey?: string;
+    litellmBaseURL?: string;
+    /** Manual output ceiling for LiteLLM-proxied models. Unset → Auto (per-model via /model/info). */
+    litellmMaxTokens?: number;
     googleServiceAccountPath?: string;
     customProviders?: CustomProvider[];
     curlProviders?: CurlProvider[];
@@ -56,6 +70,7 @@ export interface StoredCredentials {
     groqPreferredModel?: string;
     openaiPreferredModel?: string;
     claudePreferredModel?: string;
+    deepseekPreferredModel?: string;
     // Free trial state
     trialToken?: string;   // server-issued signed token (natively_trial_…)
     trialExpiresAt?: string;   // ISO timestamp — local copy for startup check
@@ -105,6 +120,22 @@ export class CredentialsManager {
 
     public getClaudeApiKey(): string | undefined {
         return this.credentials.claudeApiKey;
+    }
+
+    public getDeepseekApiKey(): string | undefined {
+        return this.credentials.deepseekApiKey;
+    }
+
+    public getLitellmApiKey(): string | undefined {
+        return this.credentials.litellmApiKey;
+    }
+
+    public getLitellmBaseURL(): string | undefined {
+        return this.credentials.litellmBaseURL;
+    }
+
+    public getLitellmMaxTokens(): number | undefined {
+        return this.credentials.litellmMaxTokens;
     }
 
     public getGoogleServiceAccountPath(): string | undefined {
@@ -185,7 +216,11 @@ export class CredentialsManager {
         return this.credentials.aiResponseLanguage || 'auto';
     }
     public getDefaultModel(): string {
-        return this.credentials.defaultModel || 'gemini-3.1-flash-lite-preview';
+        // Default to Flash-Lite: ~0.65s first-token vs ~2.3s for full Flash on
+        // the same prompt (measured), and faster output streaming — the
+        // Cluely-class interactive latency target. Full Flash / Pro remain
+        // user-selectable for harder problems.
+        return this.credentials.defaultModel || 'gemini-3.1-flash-lite';
     }
 
     public getNativelyApiKey(): string | undefined {
@@ -258,6 +293,41 @@ export class CredentialsManager {
         this.credentials.claudeApiKey = key;
         this.saveCredentials();
         console.log('[CredentialsManager] Claude API Key updated');
+    }
+
+    public setDeepseekApiKey(key: string): void {
+        const trimmed = key.trim();
+        this.credentials.deepseekApiKey = trimmed || undefined;
+        this.saveCredentials();
+        console.log('[CredentialsManager] DeepSeek API Key updated');
+    }
+
+    /**
+     * Persist LiteLLM proxy config. baseURL is the proxy location (required to
+     * enable the provider); apiKey is the optional virtual/master key;
+     * maxTokens is the optional user-set output ceiling (0/undefined → default).
+     * Passing an empty baseURL clears everything, disabling the provider.
+     */
+    public setLitellmConfig(apiKey: string, baseURL: string, maxTokens?: number): void {
+        const trimmedURL = (baseURL || '').trim();
+        const trimmedKey = (apiKey || '').trim();
+        if (!trimmedURL) {
+            this.credentials.litellmApiKey = undefined;
+            this.credentials.litellmBaseURL = undefined;
+            this.credentials.litellmMaxTokens = undefined;
+            this.saveCredentials();
+            console.log('[CredentialsManager] LiteLLM config cleared');
+            return;
+        }
+        // Empty key + existing stored key = keep it (the Settings field is masked
+        // and left blank when re-saving e.g. just the max-tokens). Clearing the
+        // key entirely is done via Remove (empty baseURL clears everything).
+        this.credentials.litellmApiKey = trimmedKey || this.credentials.litellmApiKey || undefined;
+        this.credentials.litellmBaseURL = trimmedURL;
+        const mt = Number(maxTokens);
+        this.credentials.litellmMaxTokens = Number.isFinite(mt) && mt > 0 ? Math.floor(mt) : undefined;
+        this.saveCredentials();
+        console.log('[CredentialsManager] LiteLLM config updated');
     }
 
     public setGoogleServiceAccountPath(filePath: string): void {
@@ -392,8 +462,8 @@ export class CredentialsManager {
         } else {
             // Key cleared — revert natively-auto-set defaults back to safe fallbacks
             if (this.credentials.defaultModel === 'natively') {
-                this.credentials.defaultModel = 'gemini-3.1-flash-lite-preview';
-                console.log('[CredentialsManager] Natively key cleared — reset default model to Gemini Flash');
+                this.credentials.defaultModel = 'gemini-3.1-flash-lite';
+                console.log('[CredentialsManager] Natively key cleared — reset default model to Gemini Flash-Lite');
             }
             if (this.credentials.sttProvider === 'natively') {
                 this.credentials.sttProvider = 'none';
@@ -405,12 +475,12 @@ export class CredentialsManager {
         console.log('[CredentialsManager] Natively API Key updated');
     }
 
-    public getPreferredModel(provider: 'gemini' | 'groq' | 'openai' | 'claude'): string | undefined {
+    public getPreferredModel(provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek'): string | undefined {
         const key = `${provider}PreferredModel` as keyof StoredCredentials;
         return this.credentials[key] as string | undefined;
     }
 
-    public setPreferredModel(provider: 'gemini' | 'groq' | 'openai' | 'claude', modelId: string): void {
+    public setPreferredModel(provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', modelId: string): void {
         const key = `${provider}PreferredModel` as keyof StoredCredentials;
         (this.credentials as any)[key] = modelId;
         this.saveCredentials();

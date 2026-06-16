@@ -2,13 +2,103 @@ import React, { useState } from 'react';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { ArrowLeft, Search, Mail, Link, ChevronDown, Play, ArrowUp, Copy, Check, MoreHorizontal, Settings, ArrowRight } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { genMessageId } from '../utils/messageId';
 import MeetingChatOverlay from './MeetingChatOverlay';
 import EditableTextBlock from './EditableTextBlock';
 import NativelyLogo from './icon.png';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import SyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import python from 'react-syntax-highlighter/dist/esm/languages/prism/python';
+import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript';
+import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript';
+import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash';
+import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml';
+import sql from 'react-syntax-highlighter/dist/esm/languages/prism/sql';
+import go from 'react-syntax-highlighter/dist/esm/languages/prism/go';
+import rust from 'react-syntax-highlighter/dist/esm/languages/prism/rust';
+import cpp from 'react-syntax-highlighter/dist/esm/languages/prism/cpp';
+import csharp from 'react-syntax-highlighter/dist/esm/languages/prism/csharp';
+import css from 'react-syntax-highlighter/dist/esm/languages/prism/css';
+import json from 'react-syntax-highlighter/dist/esm/languages/prism/json';
+import markdown from 'react-syntax-highlighter/dist/esm/languages/prism/markdown';
+import markup from 'react-syntax-highlighter/dist/esm/languages/prism/markup';
+
+SyntaxHighlighter.registerLanguage('python', python);
+SyntaxHighlighter.registerLanguage('py', python);
+SyntaxHighlighter.registerLanguage('javascript', javascript);
+SyntaxHighlighter.registerLanguage('js', javascript);
+SyntaxHighlighter.registerLanguage('typescript', typescript);
+SyntaxHighlighter.registerLanguage('ts', typescript);
+SyntaxHighlighter.registerLanguage('bash', bash);
+SyntaxHighlighter.registerLanguage('sh', bash);
+SyntaxHighlighter.registerLanguage('shell', bash);
+SyntaxHighlighter.registerLanguage('yaml', yaml);
+SyntaxHighlighter.registerLanguage('yml', yaml);
+SyntaxHighlighter.registerLanguage('sql', sql);
+SyntaxHighlighter.registerLanguage('go', go);
+SyntaxHighlighter.registerLanguage('rust', rust);
+SyntaxHighlighter.registerLanguage('rs', rust);
+SyntaxHighlighter.registerLanguage('cpp', cpp);
+SyntaxHighlighter.registerLanguage('c++', cpp);
+SyntaxHighlighter.registerLanguage('csharp', csharp);
+SyntaxHighlighter.registerLanguage('cs', csharp);
+SyntaxHighlighter.registerLanguage('css', css);
+SyntaxHighlighter.registerLanguage('json', json);
+SyntaxHighlighter.registerLanguage('markdown', markdown);
+SyntaxHighlighter.registerLanguage('md', markdown);
+SyntaxHighlighter.registerLanguage('markup', markup);
+SyntaxHighlighter.registerLanguage('html', markup);
+
+const mapLanguageForPrism = (lang: string, code: string): string => {
+  if (!lang) {
+    if (code.includes('def ') || code.includes('import ') || code.includes('elif ') || code.includes('print(') || code.includes(':\n')) {
+      return 'python';
+    }
+    return 'javascript';
+  }
+  const lower = lang.toLowerCase().trim();
+  const mapper: Record<string, string> = {
+    'js': 'javascript',
+    'javascript': 'javascript',
+    'ts': 'typescript',
+    'typescript': 'typescript',
+    'py': 'python',
+    'python': 'python',
+    'rb': 'ruby',
+    'ruby': 'ruby',
+    'sh': 'bash',
+    'bash': 'bash',
+    'shell': 'bash',
+    'zsh': 'bash',
+    'go': 'go',
+    'golang': 'go',
+    'rs': 'rust',
+    'rust': 'rust',
+    'cs': 'csharp',
+    'csharp': 'csharp',
+    'cpp': 'cpp',
+    'c++': 'cpp',
+    'h': 'cpp',
+    'c': 'c',
+    'java': 'java',
+    'kt': 'kotlin',
+    'kotlin': 'kotlin',
+    'swift': 'swift',
+    'yml': 'yaml',
+    'yaml': 'yaml',
+    'xml': 'markup',
+    'html': 'markup',
+    'svg': 'markup',
+    'json': 'json',
+    'css': 'css',
+    'md': 'markdown',
+    'markdown': 'markdown',
+    'sql': 'sql',
+  };
+  return mapper[lower] || lower;
+};
 
 const formatTime = (ms: number) => {
     const date = new Date(ms);
@@ -89,6 +179,21 @@ const MeetingDetails: React.FC<MeetingDetailsProps> = ({ meeting: initialMeeting
     const [isCopied, setIsCopied] = useState(false);
     const [isChatOpen, setIsChatOpen] = useState(false);
     const [submittedQuery, setSubmittedQuery] = useState('');
+
+    // Stable client-side keys for the action-item and key-point lists. The
+    // persisted shape is string[], so React keyed the rows by index, but the
+    // onEnter handler splices a new empty row in mid-list — shifting indices
+    // and causing React to reuse the wrong EditableTextBlock instance for the
+    // shifted rows (focus, draft text, and selection jump to the wrong row).
+    // Same bug class as issue #253; keep the ids array in lockstep with the
+    // items array via state updates rather than a ref so React re-renders
+    // see the post-splice ordering atomically.
+    const [actionItemKeys, setActionItemKeys] = useState<string[]>(() =>
+        (initialMeeting.detailedSummary?.actionItems ?? []).map(() => genMessageId()),
+    );
+    const [keyPointKeys, setKeyPointKeys] = useState<string[]>(() =>
+        (initialMeeting.detailedSummary?.keyPoints ?? []).map(() => genMessageId()),
+    );
 
     const handleSubmitQuestion = () => {
         if (query.trim()) {
@@ -315,7 +420,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         </div>
                                         <ul className="space-y-3">
                                             {meeting.detailedSummary.actionItems.map((item, i) => (
-                                                <li key={i} className="flex items-start gap-3 group">
+                                                <li key={actionItemKeys[i] ?? i} className="flex items-start gap-3 group">
                                                     <div className="mt-2 w-1.5 h-1.5 rounded-full bg-text-secondary group-hover:bg-blue-500 transition-colors shrink-0" />
                                                     <div className="flex-1">
                                                         <EditableTextBlock
@@ -327,6 +432,11 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             onEnter={() => {
                                                                 const newItems = [...(meeting.detailedSummary?.actionItems || [])];
                                                                 newItems.splice(i + 1, 0, "");
+                                                                setActionItemKeys(prev => {
+                                                                    const next = [...prev];
+                                                                    next.splice(i + 1, 0, genMessageId());
+                                                                    return next;
+                                                                });
                                                                 setMeeting(prev => ({
                                                                     ...prev,
                                                                     detailedSummary: { ...prev.detailedSummary!, actionItems: newItems }
@@ -360,7 +470,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         </div>
                                         <ul className="space-y-3">
                                             {meeting.detailedSummary.keyPoints.map((item, i) => (
-                                                <li key={i} className="flex items-start gap-3 group">
+                                                <li key={keyPointKeys[i] ?? i} className="flex items-start gap-3 group">
                                                     <div className="mt-2 w-1.5 h-1.5 rounded-full bg-text-secondary group-hover:bg-purple-500 transition-colors shrink-0" />
                                                     <div className="flex-1">
                                                         <EditableTextBlock
@@ -372,6 +482,11 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             onEnter={() => {
                                                                 const newItems = [...(meeting.detailedSummary?.keyPoints || [])];
                                                                 newItems.splice(i + 1, 0, "");
+                                                                setKeyPointKeys(prev => {
+                                                                    const next = [...prev];
+                                                                    next.splice(i + 1, 0, genMessageId());
+                                                                    return next;
+                                                                });
                                                                 setMeeting(prev => ({
                                                                     ...prev,
                                                                     detailedSummary: { ...prev.detailedSummary!, keyPoints: newItems }
@@ -562,7 +677,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                                             </div>
                                                                             <div className="bg-transparent">
                                                                                 <SyntaxHighlighter
-                                                                                    language={lang || 'text'}
+                                                                                    language={mapLanguageForPrism(lang, String(children))}
                                                                                     style={vscDarkPlus}
                                                                                     customStyle={{
                                                                                         margin: 0,

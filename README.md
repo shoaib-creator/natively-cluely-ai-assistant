@@ -45,7 +45,8 @@ If you’re looking for a hosted desktop recording API, consider checking out [R
 ![Repo Views](https://img.shields.io/badge/Views-341k-orange?style=flat-square)
 [![Stars](https://img.shields.io/github/stars/evinjohnn/natively-cluely-ai-assistant?style=flat-square&color=gold)](https://github.com/Natively-AI-assistant/natively-cluely-ai-assistant)
 ![Status](https://img.shields.io/badge/Status-active-success?style=flat-square)
-[![X Community](https://img.shields.io/badge/Community-black?style=flat-square&logo=x&logoColor=white)](https://x.com/i/communities/2031398735515693507)
+[![Telegram Chat](https://img.shields.io/badge/Telegram-Chat-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/nativelyaichat)
+[![LinkedIn Company](https://img.shields.io/badge/LinkedIn-Company-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/nativley-ai)
 
 > **Competitors charge $20–$149/month, store your data on their servers, and one already breached 83,000 users.** Natively costs $0, runs locally, and has never had a data breach. Your keys, your models, your machine.
 
@@ -103,13 +104,16 @@ Natively started as a pixel-perfect recreation of Cluely's interface — then ke
 While other tools act as simple API wrappers, Natively is a complete, native intelligence system designed specifically for high-stakes meetings and interviews.
 
 - **Native Audio Capture (<500ms):** Built with Rust and Zero-Copy ABI transfers, bypassing generic web-audio limitations for ultra-low latency.
+- **Local Whisper STT (On-Device):** 100% on-device speech-to-text using optimized ONNX models (Moonshine-tiny, Moonshine-base, Whisper-large-v3-turbo, distil-large-v3). Uses hardware acceleration (CoreML/Metal GPU on Apple Silicon, DirectML on Windows, quantized int8 on CPU) with zero cloud fees or data exposure.
 - **Dual-Channel Intelligence:** Distinct pipelines for system audio (what they say) and your microphone (what you dictate) ensuring perfect transcription without room noise.
 - **Battle-Tested Stealth Mode:** Completely undetectable. Hides from the dock, disables popups, and disguises the process during screen sharing.
+- **Modes Manager (7 Personas):** Toggle between 7 tailored personas (General, Technical Interview, Looking for Work, Sales, Recruiting, Team Meet, and Lecture) with custom system prompts and dynamic meeting-note templates.
+- **Custom Context & Notes:** A dedicated free-form notes area to paste instructions, crib sheets, or credentials (up to 8,000 characters), automatically injected into real-time LLM prompts.
 - **Rolling Context:** We don't just transcribe; we maintain a "memory window" of the conversation for smarter answers.
 - **Local RAG Memory:** We embed your meetings locally using SQLite vector search so you can ask, "What did John say about the API last week?"
-- **Custom Personas & Reference Docs:** Switch between tailored AI roles (Tech, Sales, HR) and inject specific PDFs to give the AI your exact context.
+- **Reference Files:** Deeply integrate PDFs, DOCX, and TXT files as real-time context.
 - **Rich Dashboard:** A full UI to manage, search, and export your history—not just a floating window.
-- **Fully Offline Capable:** Don't trust the cloud? Run Natively 100% offline using local Ollama models with limited anonymous telemetry.
+- **Fully Offline Capable:** Don't trust the cloud? Run Natively 100% offline using local Ollama models and local Whisper STT.
 
 ---
 
@@ -157,6 +161,7 @@ This demo shows **a complete live meeting scenario**:
 | **Local data / private**  | ✅ Yes                     | ❌ Cloud servers     | ✅ Yes     | ❌ Cloud servers | ❌ Cloud servers       |
 | **Any LLM (BYOK)**        | ✅ Yes                     | ❌ Vendor-locked     | ⚠️ Limited | ❌ Vendor-locked | ❌ Vendor-locked       |
 | **Local AI (Ollama)**     | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Local Whisper (On-Device)**| ✅ Yes                   | ❌                   | ❌         | ❌               | ❌                     |
 | **Real-time <500ms**      | ✅ Yes                     | ⚠️ 5–90s lag         | ✅ Yes     | ✅ ~116ms        | ⚠️ Slowest             |
 | **Dual audio channels**   | ✅ System + Mic            | ❌ Single stream     | ❌         | ❌               | ❌                     |
 | **Local RAG memory**      | ✅ SQLite + sqlite-vec     | ❌                   | ❌         | ❌               | ❌                     |
@@ -166,6 +171,12 @@ This demo shows **a complete live meeting scenario**:
 | **Process Disguise**      | ✅ Terminal, Settings, etc | ❌                   | ❌         | ❌               | ❌                     |
 | **Resume & context**      | ✅ Pro                     | ❌                   | ❌         | ✅ Yes           | ✅ Yes                 |
 | **Custom Personas/Modes** | ✅ Pro                     | ✅ Yes               | ❌         | ❌               | ⚠️ Limited             |
+| **Custom Context & Notes**| ✅ Pro                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Multi-Key API Pools**   | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Profile Intel Router**  | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Eager Code Expansion**  | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Live Follow-Up Resolver**| ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
+| **Real-Time Latency Trace**| ✅ Yes                    | ❌                   | ❌         | ❌               | ❌                     |
 | **Phone Link Companion**  | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
 | **Auto-Calendar Sync**    | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
 | **Smart Task Sync**       | ✅ Yes                     | ❌                   | ❌         | ❌               | ❌                     |
@@ -268,6 +279,12 @@ Natively works as a **free, undetectable AI coding interview assistant** for sta
 
 <div align="center">
 
+[![Natively Website](https://img.shields.io/badge/Natively_Website-natively.software-22C55E?style=flat-square&logo=vercel&logoColor=white)](https://natively.software)
+[![Telegram Chat](https://img.shields.io/badge/Telegram_Chat-nativelyaichat-229ED9?style=flat-square&logo=telegram&logoColor=white)](https://t.me/nativelyaichat)
+[![LinkedIn Company](https://img.shields.io/badge/LinkedIn_Company-nativley--ai-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/nativley-ai)
+
+<br/>
+
 [![Portfolio](https://img.shields.io/badge/Portfolio-evinjohn.vercel.app-blueviolet?style=flat-square&logo=vercel&logoColor=white)](https://evinjohn.vercel.app/)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/evinjohn/)
 [![X](https://img.shields.io/badge/X-@evinjohnn-black?style=flat-square&logo=x&logoColor=white)](https://x.com/evinjohnn)
@@ -349,7 +366,14 @@ We've launched the official **$NAT token** on Printr! Holders who maintain a spe
 | :-------------------------------------------------- | :-----------: | :----------: |
 | **Bring Your Own Key (BYOK) Models**                |      ✅       |      ✅      |
 | **Local AI Support (Ollama)**                       |      ✅       |      ✅      |
+| **Local Whisper STT (On-Device)**                   |      ✅       |      ✅      |
 | **Real-Time Speech-to-Text (<500ms)**               |      ✅       |      ✅      |
+| **Multi-Key API Pools & Key Rotation**              |      ✅       |      ✅      |
+| **Profile Intelligence Router (v2)**                |      ✅       |      ✅      |
+| **Eager Code UI Expansion**                         |      ✅       |      ✅      |
+| **Live Follow-Up Resolver**                         |      ✅       |      ✅      |
+| **Real-Time Latency Tracing**                       |      ✅       |      ✅      |
+| **Two New Meeting UI Styles (Liquid Glass/Modern)** |      ✅       |      ✅      |
 | **Live Contextual Assistant**                       |      ✅       |      ✅      |
 | **Screenshot & Slide OCR Analysis**                 |      ✅       |      ✅      |
 | **Undetectable & Stealth Modes**                    |      ✅       |      ✅      |
@@ -358,7 +382,8 @@ We've launched the official **$NAT token** on Printr! Holders who maintain a spe
 | **Automated Company Research & Dossiers**           |      ❌       |      ✅      |
 | **Live Salary & Offer Negotiation Copilot**         |      ❌       |      ✅      |
 | **Custom Persona Modes (Sales, Tech, etc.)**        |      ❌       |      ✅      |
-| **Custom Real-Time Context & Reference Files**      |      ❌       |      ✅      |
+| **Custom Context & Notes**                          |      ❌       |      ✅      |
+| **Reference Files (PDF/DOCX/TXT upload)**           |      ❌       |      ✅      |
 | **Phone Link Companion App**                        |      ❌       |      ✅      |
 | **Auto-Calendar & Task Sync**                       |      ❌       |      ✅      |
 | **Speaker Diarization**                             |      ❌       |      ✅      |
@@ -373,39 +398,16 @@ We've launched the official **$NAT token** on Printr! Holders who maintain a spe
   </a>
 </p>
 
----
+### What's New in v2.7.0 (Latest Release)
 
-### What's New in v2.6.0
+Version 2.7.0 introduces advanced Profile Intelligence Routing, Live Follow-up resolution, eager Code UI expansion, and robust latency tracing tools:
 
-Version 2.6.0 brings massive workflow and integration capabilities to make your AI assistant even more powerful:
-
-- **Phone Link Integration**: Connect your iOS or Android device to seamlessly use it as a wireless remote microphone or companion screen for your meeting notes.
-- **TinyPrompts™ Engine**: Highly optimized system prompts for local SLMs (Ollama, Qwen 2.5:4B, Llama 3.2), enabling premium intelligence on consumer-grade hardware.
-- **Codex CLI Integration**: Native support for the Codex automation system, allowing sandboxed code execution and local terminal tasks via `gpt-5.3-codex`.
-- **Auto-Calendar Sync**: Natively now securely connects to Google Calendar and Outlook to automatically pull context and prepare for your upcoming meetings.
-- **Smart Task Sync**: Action items are now auto-extracted with extreme precision and can be instantly exported to Jira, Linear, or Asana boards.
-- **Speaker Identification**: Advanced real-time speaker diarization automatically tags individual speakers by name throughout the meeting transcript.
-- **Expanded Offline Mode**: 100% offline transcription and intelligent note generation using specialized, lightning-fast on-device SLMs.
-- **Advanced Stealth Features**: Hardened undetectable stealth mode with Activity Monitor evasion, process name disguising, and strict timeout management to prevent accidental discovery during OS-level events.
-- **Scroll & Layout Enhancements**: Added scroll keybinds for seamless mouse-free navigation and optimized the horizontal layout for more stable code line rendering.
-
----
-
-### What's New in v2.5.0
-
-Version 2.5.0 introduces major feature upgrades, architectural overhauls, and robust stability fixes:
-
-- **Custom Persona Modes**: Completed Cluely-style Custom Modes (Technical Interview, Sales, Recruiting, Team Meet, Lecture, etc.) allowing tailored AI personas and behaviors.
-- **Dynamic Note Templates**: AI now dynamically generates highly structured meeting notes based on the active persona mode (e.g., Problem Statement, Follow-ups, Space & Time Complexity for tech interviews).
-- **Reference Files & Custom Context**: Deeply integrate PDFs, DOCX files, and custom text instructions into the AI's real-time prompt logic.
-- **10-Minute Free Trial**: A new free trial system lets you experience Natively API with built-in HWID+IP anti-abuse protections and seamless upgrade paths.
-- **Reliable Screenshot Capture**: Hardened and completely stable multi-screenshot capture with single-trigger `Cmd+Shift+Enter` analysis.
-- **Custom Provider Enhancements**: Custom cURL endpoints now completely support automatic meeting summaries and custom AI behaviors without breaking the prompt injection strategy.
-- **STT Connection Pools & Resilience**: Added round-robin connection pools for Deepgram and ElevenLabs with exponential backoff and shadow-probe failover, absolutely eliminating 1006 reconnect storms.
-- **Redesigned Premium UI**: Apple-tier designs applied across the Modes Pro Gate, Permissions Toaster, Free Trial Modals, and settings overlays using hardware-accelerated animations.
-- **Robust Webhook Billing**: Hardened API subscriptions webhook verifications and payment processing to properly coordinate Standard, Pro, Max, and Ultra API plans.
-
----
+- **Profile Intelligence Router (v2)**: Automatically parses user queries into target domains (Coding, System Design, Behavioral, Negotiation) and propagates custom answer-type constraints straight to the LLM streaming pipeline.
+- **Answer-Type Constraints & Follow-Up Resolver**: Retains deep conversation histories to resolve follow-up queries contextually, and enforces precise layout constraints (e.g. short, detailed, code-only, bulleted).
+- **Eager Code UI Expansion & Smooth Transitions**: Growth-holds CSS elements to eagerly size the overlay *before* React mounts raw code blocks, preventing annoying visual layout jumps with hardware-accelerated tweens.
+- **Audio Stack Deadlock Protections**: Hardened credentials management by eliminating racing set-provider IPCs to prevent native audio pipeline lockups on Windows and macOS after saving API keys.
+- **Evidence Validator & Live Deadlines**: Cross-validates claims made during meetings and handles real-time countdowns for strict, live coding assessment deadlines.
+- **PI Latency Tracer (PiLatencyTracer)**: Continuous latency profiling mapping exact durations of LLM reasoning, schema validation, and routing tasks to ensure sub-500ms responsiveness.
 
 ## Table of Contents
 
@@ -667,17 +669,23 @@ This runs: Vite build → TypeScript compile → native module build → electro
 
 - Works on **LeetCode, HackerRank, CoderPad, Codility, HackerEarth** and any browser-based coding environment
 - Capture a coding problem with one shortcut — get a full solution, explanation, and complexity analysis instantly
+- **Eager Code Expansion**: Overlay dynamically resizes to accommodate incoming code blocks *before* React mounts the markdown code rows, preventing visual layout jumps.
+- **Hardware-Accelerated Transitions**: Polished, custom cubic-bezier tweens handle UI growth smoothly, preserving candidate stealth and presentation quality.
 - Invisible overlay never appears on screen share or recordings
 - Multiple screenshot support for multi-part problems
 - Smart fallback to Groq Llama 4 Scout if primary vision model fails
 
 ### Premium Profile Intelligence
 
+- **Profile Intelligence Router (v2)**: Seamlessly categorizes user questions into distinct domains (Coding, System Design, Behavioral, Negotiation) to apply the most optimal reasoning path.
+- **Answer-Type Constraints & Follow-Up Resolver**: Contextually tracks conversations to answer subsequent queries, and enforces precise layout constraints (such as short, conversational, bulleted, or code-only responses).
 - **Custom Persona Modes**: Seamlessly switch between built-in personas (Technical Interview, Sales, Recruiting) or create your own custom modes tailored to any conversation.
 - **Reference Files & Custom Context**: Upload PDFs, DOCX files, or type custom instructions to give the AI real-time context on your specific situation.
 - **Job Description & Resume Context**: Natively understands your background and the role you're applying for to provide highly tailored, context-aware answers.
 - **Company Research**: Get instant intelligence and dossiers on the company you are interviewing with.
 - **Negotiation Assistance**: Real-time guidance and strategy during offer and salary negotiations.
+- **Evidence Validator & Live Deadlines**: Real-time validation of factual claims and interactive deadline alert tracker during live assessments.
+- **PI Latency Tracer**: Built-in granular latency profiling mapping exact time spent during the routing and LLM inference loop.
 
 ### Contextual Actions
 

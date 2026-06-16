@@ -121,9 +121,14 @@ export class LiveRAGIndexer {
 
             // 5. Embed each chunk (fire-and-forget per chunk, but sequential to avoid rate limits)
             if (this.embeddingPipeline.isReady()) {
+                // Foreground gate (manual regression 2026-06-12): yield to any
+                // in-flight manual/WTA answer between chunk embeds — storeEmbedding
+                // is a synchronous DB write that otherwise contends with answers.
+                const { ForegroundGate } = require('../services/ForegroundGate') as typeof import('../services/ForegroundGate');
                 let embeddedCount = 0;
                 for (let i = 0; i < chunkIds.length; i++) {
                     try {
+                        await ForegroundGate.waitUntilIdle();
                         const embedding = await this.embeddingPipeline.getEmbedding(indexedChunks[i].text);
                         this.vectorStore.storeEmbedding(chunkIds[i], embedding);
                         embeddedCount++;
@@ -134,6 +139,18 @@ export class LiveRAGIndexer {
                 }
                 this.indexedChunkCount += embeddedCount;
                 console.log(`[LiveRAGIndexer] Embedded ${embeddedCount}/${chunkIds.length} chunks (${this.indexedChunkCount} total with embeddings)`);
+
+                // Stamp the meeting's embedding space so these live chunks are (a) searchable
+                // in-session (search filters on embedding_space) and (b) NOT swept into the
+                // "unknown-space" re-index. Only stamps if currently NULL.
+                if (embeddedCount > 0) {
+                    const providerName = this.embeddingPipeline.getActiveProviderName();
+                    const space = this.embeddingPipeline.getActiveSpaceKey();
+                    const dims = this.embeddingPipeline.getActiveDimensions();
+                    if (providerName && space && dims) {
+                        this.vectorStore.stampMeetingSpaceIfUnset(meetingId, providerName, dims, space);
+                    }
+                }
             } else {
                 console.log('[LiveRAGIndexer] Embedding pipeline not ready, chunks saved without embeddings');
             }

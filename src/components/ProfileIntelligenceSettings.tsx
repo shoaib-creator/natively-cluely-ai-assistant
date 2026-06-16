@@ -129,21 +129,66 @@ const PI_CSS = `
     .pi-cta-group--trial .pi-cta-icon-ring { background: rgba(255,255,255,0.18); }
     .pi-cta-group--trial:hover { box-shadow: 0 8px 22px rgba(124,58,237,0.45); }
 
-    /* ── Yellow BETA pill ── */
-    .pi-beta-badge {
+    /* ── Jelly-clay pill base ── */
+    .pi-jelly-pill {
         display: inline-flex; align-items: center; justify-content: center;
         height: 22px;
         padding: 0 10px;
         border-radius: 999px;
-        background: #FACC15;
-        color: #0a0a0a;
         font-size: 9.5px;
         font-weight: 800;
         letter-spacing: 0.14em;
         text-transform: uppercase;
         line-height: 1;
-        box-shadow: 0 1px 0 rgba(255,255,255,0.4) inset,
-                    0 2px 6px rgba(250,204,21,0.35);
+        position: relative;
+        overflow: hidden;
+        /* Jelly gloss top strip */
+    }
+    .pi-jelly-pill::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        height: 45%;
+        background: linear-gradient(180deg, rgba(255,255,255,0.32) 0%, rgba(255,255,255,0) 100%);
+        border-radius: 999px 999px 0 0;
+        pointer-events: none;
+        z-index: 1;
+    }
+
+    /* ── Yellow BETA pill (jelly) ── */
+    .pi-beta-badge {
+        display: inline-flex; align-items: center; justify-content: center;
+        height: 22px;
+        padding: 0 10px;
+        border-radius: 999px;
+        position: relative;
+        overflow: hidden;
+        font-size: 9.5px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        line-height: 1;
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.30) 0%, rgba(255,255,255,0.04) 50%, rgba(0,0,0,0.14) 100%),
+            #FACC15;
+        color: #0a0a0a;
+        border: 1px solid rgba(253,224,71,0.70);
+        box-shadow:
+            inset 0 1.5px 0.5px rgba(255,255,255,0.80),
+            inset 0 -1.5px 2.5px rgba(0,0,0,0.30),
+            inset 0 0 0 1px rgba(255,255,255,0.15),
+            0 3px 10px rgba(250,204,21,0.40),
+            0 1px 3px rgba(0,0,0,0.18);
+    }
+    .pi-beta-badge::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        height: 45%;
+        background: linear-gradient(180deg, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0) 100%);
+        border-radius: 999px 999px 0 0;
+        pointer-events: none;
+        z-index: 1;
     }
 
     /* ── Subtle pill badges (plan / trial) ── */
@@ -157,18 +202,68 @@ const PI_CSS = `
         letter-spacing: 0.14em;
         text-transform: uppercase;
         line-height: 1;
+        position: relative;
+        overflow: hidden;
     }
+    .pi-meta-badge::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        height: 45%;
+        background: linear-gradient(180deg, rgba(255,255,255,0.24) 0%, rgba(255,255,255,0) 100%);
+        border-radius: 999px 999px 0 0;
+        pointer-events: none;
+        z-index: 1;
+    }
+    /* Plan badge — neutral slate jelly */
     .pi-meta-badge--plan {
-        background: var(--pi-shell-bg);
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0.04) 50%, rgba(0,0,0,0.10) 100%),
+            rgba(148,163,184,0.22);
         color: var(--pi-hero);
-        border: 1px solid var(--pi-shell-border);
+        border: 1px solid rgba(255,255,255,0.22);
+        box-shadow:
+            inset 0 1.5px 0.5px rgba(255,255,255,0.65),
+            inset 0 -1.5px 2.5px rgba(0,0,0,0.32),
+            inset 0 0 0 1px rgba(255,255,255,0.12),
+            0 2px 8px rgba(0,0,0,0.20);
     }
+    .pi-root[data-theme='light'] .pi-meta-badge--plan {
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.60) 0%, rgba(255,255,255,0.10) 50%, rgba(0,0,0,0.05) 100%),
+            rgba(100,116,139,0.18);
+        border: 1px solid rgba(0,0,0,0.12);
+        box-shadow:
+            inset 0 1.5px 0.5px rgba(255,255,255,0.90),
+            inset 0 -1.5px 2.5px rgba(0,0,0,0.12),
+            inset 0 0 0 1px rgba(255,255,255,0.40),
+            0 2px 8px rgba(0,0,0,0.10);
+    }
+    /* Trial badge — violet jelly */
     .pi-meta-badge--trial {
-        background: linear-gradient(135deg, rgba(139,92,246,0.18) 0%, rgba(124,58,237,0.14) 100%);
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.30) 0%, rgba(255,255,255,0.05) 50%, rgba(0,0,0,0.16) 100%),
+            rgba(139,92,246,0.30);
         color: #c4b5fd;
-        border: 1px solid rgba(139,92,246,0.32);
+        border: 1px solid rgba(196,181,253,0.42);
+        box-shadow:
+            inset 0 1.5px 0.5px rgba(255,255,255,0.72),
+            inset 0 -1.5px 2.5px rgba(0,0,0,0.40),
+            inset 0 0 0 1px rgba(255,255,255,0.14),
+            0 3px 10px rgba(139,92,246,0.35);
     }
-    .pi-root[data-theme='light'] .pi-meta-badge--trial { color: #6d28d9; }
+    .pi-root[data-theme='light'] .pi-meta-badge--trial {
+        color: #6d28d9;
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.10) 50%, rgba(0,0,0,0.06) 100%),
+            rgba(139,92,246,0.18);
+        border: 1px solid rgba(139,92,246,0.30);
+        box-shadow:
+            inset 0 1.5px 0.5px rgba(255,255,255,0.90),
+            inset 0 -1.5px 2.5px rgba(0,0,0,0.10),
+            inset 0 0 0 1px rgba(255,255,255,0.40),
+            0 3px 10px rgba(139,92,246,0.20);
+    }
 
     /* ── Long upload pill with internal indeterminate progress ── */
     .pi-upload-pill {
@@ -281,6 +376,55 @@ const PI_CSS = `
     }
     .pi-upload-spinner { animation: pi-spin 0.9s linear infinite; }
     @keyframes pi-spin { to { transform: rotate(360deg); } }
+
+    /* ── "Pro" badge shown next to upload card titles for Free Tier (jelly) ── */
+    .pi-upload-pill__pro-badge {
+        display: inline-flex; align-items: center;
+        height: 18px;
+        padding: 0 7px;
+        margin-left: 8px;
+        border-radius: 999px;
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        line-height: 1;
+        position: relative;
+        overflow: hidden;
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0.04) 50%, rgba(0,0,0,0.16) 100%),
+            rgba(139,92,246,0.28);
+        color: #c4b5fd;
+        border: 1px solid rgba(196,181,253,0.40);
+        box-shadow:
+            inset 0 1px 0.5px rgba(255,255,255,0.68),
+            inset 0 -1px 2px rgba(0,0,0,0.38),
+            inset 0 0 0 1px rgba(255,255,255,0.12),
+            0 2px 8px rgba(139,92,246,0.30);
+        vertical-align: middle;
+    }
+    .pi-upload-pill__pro-badge::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        height: 45%;
+        background: linear-gradient(180deg, rgba(255,255,255,0.26) 0%, rgba(255,255,255,0) 100%);
+        border-radius: 999px 999px 0 0;
+        pointer-events: none;
+        z-index: 1;
+    }
+    .pi-root[data-theme='light'] .pi-upload-pill__pro-badge {
+        color: #6d28d9;
+        background:
+            linear-gradient(180deg, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0.10) 50%, rgba(0,0,0,0.05) 100%),
+            rgba(139,92,246,0.16);
+        border: 1px solid rgba(139,92,246,0.28);
+        box-shadow:
+            inset 0 1px 0.5px rgba(255,255,255,0.90),
+            inset 0 -1px 2px rgba(0,0,0,0.08),
+            inset 0 0 0 1px rgba(255,255,255,0.40),
+            0 2px 8px rgba(139,92,246,0.18);
+    }
 
     /* ── Header close button (mirrors ModesSettings manager closeBtn — flat, no shadow) ── */
     .pi-close-btn {
@@ -403,12 +547,20 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
     const isLight = useResolvedTheme() === 'light';
 
     // Profile Engine State
+    // D3: the backend exposes explicit readiness flags. hasProfile reflects a
+    // saved resume (post-D2 ingest resilience, this is true even when the
+    // extraction LLM was down and the heuristic fallback ran). profileFactsReady
+    // is the stricter "usable facts present" signal; extractionMode hints whether
+    // a heuristic profile could be re-extracted for richer facts.
     const [profileStatus, setProfileStatus] = useState<{
         hasProfile: boolean;
         profileMode: boolean;
         name?: string;
         role?: string;
         totalExperienceYears?: number;
+        resume_profile_facts_ready?: boolean;
+        profileFactsReady?: boolean;
+        extractionMode?: 'llm' | 'heuristic' | 'none';
     }>({ hasProfile: false, profileMode: false });
     const [profileUploading, setProfileUploading] = useState(false);
     const [profileError, setProfileError] = useState('');
@@ -428,6 +580,9 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
     const [customNotes, setCustomNotes] = useState('');
     const [customNotesSaved, setCustomNotesSaved] = useState(false);
     const customNotesDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const [persona, setPersona] = useState('');
+    const [personaSaved, setPersonaSaved] = useState(false);
+    const personaDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     useEffect(() => {
         // Fetch premium details — canonical source of truth. Sync the
@@ -457,7 +612,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
         window.electronAPI?.profileGetNotes?.().then((res: any) => {
             if (res?.success) setCustomNotes(res.content ?? '');
         }).catch(() => { });
-        
+
         // Tavily key check
         window.electronAPI?.getStoredCredentials?.().then((creds: any) => {
             if (creds && creds.hasTavilyKey) {
@@ -465,6 +620,17 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
             }
         }).catch(() => {});
     }, []);
+
+    useEffect(() => {
+        if (!hasProfileAccess) {
+            setPersona('');
+            if (personaDebounceRef.current) clearTimeout(personaDebounceRef.current);
+            return;
+        }
+        window.electronAPI?.profileGetPersona?.().then((res: any) => {
+            if (res?.success) setPersona(res.content ?? '');
+        }).catch(() => { });
+    }, [hasProfileAccess]);
 
     const handleRemoveTavilyKey = async () => {
         if (!confirm('Are you sure you want to remove your Tavily API key?')) return;
@@ -644,20 +810,54 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                     </div>
                                                 </div>
 
-                                                {profileData?.skills && profileData.skills.length > 0 && (
-                                                    <div className="mt-5">
-                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">
-                                                            Top Skills
+                                                {(() => {
+                                                    // Skills are now sub-categorized {languages, frameworks, cloud,
+                                                    // databases, ml, devops, tools}. Render each non-empty category
+                                                    // as its own labeled group so the user can SEE the buckets and
+                                                    // spot a miscategorization. Falls back to a flat list for any
+                                                    // legacy/array shape.
+                                                    const raw = profileData?.skills;
+                                                    const CATS: { key: string; label: string }[] = [
+                                                        { key: 'languages', label: 'Languages' },
+                                                        { key: 'frameworks', label: 'Frameworks' },
+                                                        { key: 'cloud', label: 'Cloud' },
+                                                        { key: 'databases', label: 'Databases' },
+                                                        { key: 'ml', label: 'AI / ML' },
+                                                        { key: 'devops', label: 'DevOps' },
+                                                        { key: 'tools', label: 'Tools' },
+                                                    ];
+                                                    const chip = (skill: string, i: number) => (
+                                                        <span key={i} className="text-[10px] font-medium text-text-secondary px-2 py-1 rounded-md border border-border-subtle bg-bg-input">
+                                                            {skill}
+                                                        </span>
+                                                    );
+                                                    if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+                                                        const groups = CATS.filter(c => Array.isArray(raw[c.key]) && raw[c.key].length > 0);
+                                                        if (groups.length === 0) return null;
+                                                        return (
+                                                            <div className="mt-5 space-y-3">
+                                                                {groups.map(c => (
+                                                                    <div key={c.key}>
+                                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">{c.label}</div>
+                                                                        <div className="flex flex-wrap gap-1.5">
+                                                                            {raw[c.key].map((s: string, i: number) => chip(s, i))}
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        );
+                                                    }
+                                                    const flat = Array.isArray(raw) ? raw : (Array.isArray(profileData?.skillsFlat) ? profileData.skillsFlat : []);
+                                                    if (flat.length === 0) return null;
+                                                    return (
+                                                        <div className="mt-5">
+                                                            <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Top Skills</div>
+                                                            <div className="flex flex-wrap gap-1.5">
+                                                                {flat.slice(0, 15).map((s: string, i: number) => chip(s, i))}
+                                                            </div>
                                                         </div>
-                                                        <div className="flex flex-wrap gap-1.5">
-                                                            {profileData.skills.slice(0, 15).map((skill: string, i: number) => (
-                                                                <span key={i} className="text-[10px] font-medium text-text-secondary px-2 py-1 rounded-md border border-border-subtle bg-bg-input">
-                                                                    {skill}
-                                                                </span>
-                                                            ))}
-                                                        </div>
-                                                    </div>
-                                                )}
+                                                    );
+                                                })()}
                                             </div>
                                         </div>
                                     </BezelCard>
@@ -670,12 +870,17 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                     <div className="w-10 h-10 rounded-lg bg-bg-input border border-border-subtle flex items-center justify-center text-text-tertiary shrink-0 mt-0.5 shadow-sm">
                                                         <Upload size={20} />
                                                     </div>
-                                                    <div className="min-w-0">
-                                                        <h4 className="text-[15px] font-bold text-text-primary mb-1 tracking-tight">
-                                                            {profileStatus.hasProfile ? 'Overwrite Source Document' : 'Initialize Knowledge Base'}
+                                                    <div className="min-w-0 flex-1">
+                                                        <h4 className="text-[15px] font-bold text-text-primary mb-1 tracking-tight flex items-center flex-wrap gap-1.5">
+                                                            <span>{profileStatus.hasProfile ? 'Overwrite Source Document' : 'Initialize Knowledge Base'}</span>
+                                                            {!hasProfileAccess && (
+                                                                <span className="pi-upload-pill__pro-badge !ml-0" aria-label="Pro feature">Pro</span>
+                                                            )}
                                                         </h4>
                                                         <p className="text-xs text-text-secondary leading-relaxed pr-2">
-                                                            Provide a resume file to seed the intelligence engine.
+                                                            {!hasProfileAccess
+                                                                ? 'Resume ingestion is a Natively Pro feature. The Custom Context box below stays free.'
+                                                                : 'Provide a resume file to seed the intelligence engine.'}
                                                         </p>
                                                     </div>
                                                 </div>
@@ -683,6 +888,10 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                 <button
                                                     style={{ marginTop: 'auto' }}
                                                     onClick={async () => {
+                                                        if (!hasProfileAccess) {
+                                                            setIsPremiumModalOpen(true);
+                                                            return;
+                                                        }
                                                         setProfileError('');
                                                         try {
                                                             const fileResult = await window.electronAPI?.profileSelectFile?.();
@@ -744,8 +953,11 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                         <Briefcase size={20} />
                                                     </div>
                                                     <div className="min-w-0 flex-1">
-                                                        <h4 className="text-[15px] font-bold text-text-primary mb-1 tracking-tight">
-                                                            {profileData?.hasActiveJD ? `${profileData.activeJD?.title} @ ${profileData.activeJD?.company}` : 'Upload Job Description'}
+                                                        <h4 className="text-[15px] font-bold text-text-primary mb-1 tracking-tight flex items-center flex-wrap gap-1.5">
+                                                            <span>{profileData?.hasActiveJD ? `${profileData.activeJD?.title} @ ${profileData.activeJD?.company}` : 'Upload Job Description'}</span>
+                                                            {!hasProfileAccess && (
+                                                                <span className="pi-upload-pill__pro-badge !ml-0" aria-label="Pro feature">Pro</span>
+                                                            )}
                                                         </h4>
                                                         {profileData?.hasActiveJD ? (
                                                             <div className="flex items-center gap-3 mt-1 flex-wrap">
@@ -760,7 +972,9 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                             </div>
                                                         ) : (
                                                             <p className="text-xs text-text-secondary leading-relaxed pr-2">
-                                                                Upload a JD to enable persona tuning and company research.
+                                                                {!hasProfileAccess
+                                                                    ? 'Job description parsing is a Natively Pro feature. The Custom Context box below stays free.'
+                                                                    : 'Upload a JD to enable persona tuning and company research.'}
                                                             </p>
                                                         )}
                                                     </div>
@@ -783,6 +997,10 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                 <button
                                                     style={{ marginTop: 'auto' }}
                                                     onClick={async () => {
+                                                        if (!hasProfileAccess) {
+                                                            setIsPremiumModalOpen(true);
+                                                            return;
+                                                        }
                                                         setJdError('');
                                                         try {
                                                             const fileResult = await window.electronAPI?.profileSelectFile?.();
@@ -885,6 +1103,70 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                             {customNotes.length}/4000
                                                         </span>
                                                     </div>
+                                                </div>
+                                            </div>
+                                        </BezelCard>
+
+                                    <BezelCard delay={0.35}>
+                                            <div className="p-5">
+                                                <div className="flex items-center gap-4 mb-4">
+                                                    <div className="w-10 h-10 rounded-lg bg-bg-input border border-border-subtle flex items-center justify-center text-accent-primary shrink-0">
+                                                        <Sparkles size={20} />
+                                                    </div>
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="flex items-center gap-2">
+                                                            <h4 className="text-sm font-bold text-text-primary">AI Persona</h4>
+                                                            {personaSaved && hasProfileAccess && (
+                                                                <span className="text-[9px] font-bold text-emerald-500 px-1.5 py-0.5 bg-emerald-500/10 rounded-full border border-emerald-500/20 uppercase tracking-wide flex items-center gap-1">
+                                                                    <Check size={8} /> Updated
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        <p className="text-[11px] text-text-secondary mt-0.5">
+                                                            Set the AI's behavior, tone, and role across providers.
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                <textarea
+                                                    value={persona}
+                                                    onChange={(e) => {
+                                                        if (!hasProfileAccess) {
+                                                            setIsPremiumModalOpen(true);
+                                                            return;
+                                                        }
+                                                        const val = e.target.value;
+                                                        if (val.length > 4000) return;
+                                                        setPersona(val);
+                                                        setPersonaSaved(false);
+                                                        if (personaDebounceRef.current) clearTimeout(personaDebounceRef.current);
+                                                        personaDebounceRef.current = setTimeout(async () => {
+                                                            try {
+                                                                const res = await window.electronAPI?.profileSavePersona?.(val);
+                                                                if (res?.success) {
+                                                                    setPersonaSaved(true);
+                                                                    setTimeout(() => setPersonaSaved(false), 2000);
+                                                                } else if (res?.error === 'pro_required') {
+                                                                    setPersona('');
+                                                                    setIsPremiumModalOpen(true);
+                                                                }
+                                                            } catch (_) {}
+                                                        }, 800);
+                                                    }}
+                                                    onFocus={() => {
+                                                        if (!hasProfileAccess) setIsPremiumModalOpen(true);
+                                                    }}
+                                                    placeholder="Example: You are a senior hiring manager. Keep answers concise and ask one focused follow-up when needed."
+                                                    rows={5}
+                                                    disabled={!hasProfileAccess}
+                                                    className={`w-full bg-bg-input border border-border-subtle rounded-lg px-3 py-2.5 text-xs text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-primary/50 focus:ring-1 focus:ring-accent-primary/20 transition-all resize-none leading-relaxed ${!hasProfileAccess ? 'opacity-60 cursor-not-allowed' : ''}`}
+                                                />
+                                                <div className="flex items-center justify-between px-0.5 mt-3">
+                                                    <p className="text-[10px] text-text-tertiary">
+                                                        {hasProfileAccess ? 'Auto-saved · Treated as user-provided context' : 'Upgrade to Pro to personalize AI persona'}
+                                                    </p>
+                                                    <span className={`text-[10px] tabular-nums ${persona.length > 3600 ? 'text-amber-500' : 'text-text-tertiary'}`}>
+                                                        {persona.length}/4000
+                                                    </span>
                                                 </div>
                                             </div>
                                         </BezelCard>

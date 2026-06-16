@@ -19,7 +19,8 @@ export type { TranscriptSegment, SuggestionTrigger, ContextItem } from './Sessio
 export type { IntelligenceMode, IntelligenceModeEvents } from './IntelligenceEngine';
 export type { DynamicAction } from './services/dynamic-actions/DynamicAction';
 
-export const GEMINI_FLASH_MODEL = "gemini-3.1-flash-lite-preview";
+export const GEMINI_FLASH_MODEL = "gemini-3.5-flash";
+export const GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite";
 
 /**
  * IntelligenceManager - Facade for the intelligence layer.
@@ -50,7 +51,9 @@ export class IntelligenceManager extends EventEmitter {
      */
     private forwardEngineEvents(): void {
         const events = [
-            'assist_update', 'suggested_answer', 'suggested_answer_token',
+            'assist_update', 'suggested_answer', 'suggested_answer_token', 'suggested_answer_discard',
+            // Verified code execution (background): ✓ badge + corrected message.
+            'code_verified', 'code_correction',
             'refined_answer', 'refined_answer_token',
             'recap', 'recap_token', 'clarify', 'clarify_token',
             'follow_up_questions_update', 'follow_up_questions_token',
@@ -122,6 +125,11 @@ export class IntelligenceManager extends EventEmitter {
         return this.session.getLastInterviewerTurn();
     }
 
+    /** Current meeting's full finalized transcript (for in-meeting search, Phase 10). */
+    getCurrentMeetingTranscript(): Array<{ speaker: string; text: string; timestamp: number }> {
+        return this.session.getFullTranscript().map(s => ({ speaker: s.speaker, text: s.text, timestamp: s.timestamp }));
+    }
+
     logUsage(type: string, question: string, answer: string): void {
         this.session.logUsage(type, question, answer);
     }
@@ -146,7 +154,7 @@ export class IntelligenceManager extends EventEmitter {
         return this.engine.runAssistMode();
     }
 
-    async runWhatShouldISay(question?: string, confidence?: number, imagePaths?: string[], options?: { skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string }): Promise<string | null> {
+    async runWhatShouldISay(question?: string, confidence?: number, imagePaths?: string[], options?: { skipCooldown?: boolean; screenContext?: ScreenContext; promptInstruction?: string; activeSkill?: { id: string; name: string; promptBlock: string }; domContext?: string }): Promise<string | null> {
         return this.engine.runWhatShouldISay(question, confidence, imagePaths, options);
     }
 

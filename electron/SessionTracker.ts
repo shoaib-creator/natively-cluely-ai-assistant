@@ -231,10 +231,15 @@ export class SessionTracker {
 
         this.evictOldEntries();
 
-        // Filter out internal system prompts that might be passed via IPC
-        const isInternalPrompt = text.startsWith("You are a real-time interview assistant") ||
-            text.startsWith("You are a helper") ||
-            text.startsWith("CONTEXT:");
+        // Filter out only exact internal system prompts (not broad prefix match)
+        // These are injected internally and should not be treated as real transcript
+        const knownInternalPrompts = [
+            "You are a real-time interview assistant",
+            "You are a helper",
+        ];
+        const isExactInternalPrompt = knownInternalPrompts.some(p => text === p);
+        const isContextInjection = text.startsWith("CONTEXT:");
+        const isInternalPrompt = isExactInternalPrompt || isContextInjection;
 
         if (!isInternalPrompt) {
             // Add to session transcript
@@ -361,6 +366,45 @@ export class SessionTracker {
         return this.contextItems.filter(item => item.timestamp >= cutoff);
     }
 
+    /**
+     * DURABLE context window (Intelligence OS, 2026-06-12). Unlike `getContext()`,
+     * which reads `contextItems` — hard-evicted to `contextWindowDuration` (120s) on
+     * EVERY final segment by `evictOldEntries()` — this reads `fullTranscript`, the
+     * session's persisted store that survives the 120s eviction. It exists to make
+     * genuinely long-range recall possible: a project named at minute 1 is still
+     * present at minute 62.
+     *
+     * WHY THIS METHOD EXISTS: `IntelligenceEngine.LIVE_MEMORY_WINDOW_SECONDS = 7200`
+     * fed `getContext(7200)` into the long-range follow-up memory and assumed a 2h
+     * window. But `contextItems` can never hold more than ~120s, so that path
+     * silently saw at most the last two minutes — the long-range entity it was built
+     * to recall had already been evicted. Pointing it at the durable store fixes the
+     * bug for the common case (a multi-minute session under the compaction threshold).
+     *
+     * BOUND: after a >1800-segment session `compactTranscriptIfNeeded` summarizes and
+     * evicts the OLDEST 500 raw segments into an epoch summary, so this returns only
+     * the raw segments STILL RESIDENT — a minute-1 entity in a *very* long session can
+     * still age out of the raw store into a summary. That's a far higher bar than the
+     * 120s `contextItems` eviction this fixes; for the full summary-prefixed view see
+     * `getFullSessionContext()`.
+     *
+     * @param lastSeconds Window size in seconds (default 7200 = 2h). `Infinity`
+     *   returns the entire resident transcript.
+     */
+    getDurableContext(lastSeconds: number = 7200): ContextItem[] {
+        const cutoff = Number.isFinite(lastSeconds)
+            ? Date.now() - (lastSeconds * 1000)
+            : -Infinity;
+        const out: ContextItem[] = [];
+        for (const seg of this.fullTranscript) {
+            if (seg.timestamp < cutoff) continue;
+            const text = (seg.text || '').trim();
+            if (!text) continue;
+            out.push({ role: this.mapSpeakerToRole(seg.speaker), text, timestamp: seg.timestamp });
+        }
+        return out;
+    }
+
     getLastAssistantMessage(): string | null {
         return this.lastAssistantMessage;
     }
@@ -374,10 +418,47 @@ export class SessionTracker {
     }
 
     /**
+     * Context items for LLM prompts, including the latest interim interviewer
+     * partial when finals have not caught up yet (matches What to Answer path).
+     */
+    getContextWithInterim(lastSeconds: number = 120): ContextItem[] {
+        const contextItems = [...this.getContext(lastSeconds)];
+
+        const lastInterim = this.lastInterimInterviewer;
+        if (lastInterim && lastInterim.text.trim().length > 0) {
+            const lastItem = contextItems[contextItems.length - 1];
+            const isDuplicate = lastItem &&
+                lastItem.role === 'interviewer' &&
+                (lastItem.text === lastInterim.text ||
+                    Math.abs(lastItem.timestamp - lastInterim.timestamp) < 1000);
+
+            if (!isDuplicate) {
+                contextItems.push({
+                    role: 'interviewer',
+                    text: lastInterim.text,
+                    timestamp: lastInterim.timestamp,
+                });
+            }
+        }
+
+        return contextItems;
+    }
+
+    /**
      * Get formatted context string for LLM prompts
      */
     getFormattedContext(lastSeconds: number = 120): string {
-        const items = this.getContext(lastSeconds);
+        return this.formatContextItems(this.getContext(lastSeconds));
+    }
+
+    /**
+     * Formatted context including rolling interim interviewer speech.
+     */
+    getFormattedContextWithInterim(lastSeconds: number = 120): string {
+        return this.formatContextItems(this.getContextWithInterim(lastSeconds));
+    }
+
+    private formatContextItems(items: ContextItem[]): string {
         return items.map(item => {
             const label = item.role === 'interviewer' ? 'INTERVIEWER' :
                 item.role === 'user' ? 'ME' :
