@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
-import { ModeContextRetriever } from './ModeContextRetriever';
+import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
+import { ModeContextRetriever, type ModeRetrievalOptions } from './ModeContextRetriever';
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
 import { classifyCustomContext, selectCustomContextForAnswer } from '../llm/customContextClassifier';
@@ -30,6 +31,13 @@ import {
     SHARED_MODE_PREFIX_SHORT,
 } from '../llm/prompts';
 
+/**
+ * OKF Profile Intelligence (migration v23): the reserved mode profile OKF packs
+ * hang off. Never a user mode — filtered from getModes(), rejected by
+ * setActiveMode. Kept in sync with ProfilePackBuilder.PROFILE_OKF_MODE_ID.
+ */
+export const PROFILE_OKF_RESERVED_MODE_ID = '__profile_okf__';
+
 export type ModeTemplateType =
     | 'general'
     | 'looking-for-work'
@@ -54,6 +62,12 @@ export interface ModeReferenceFile {
     fileName: string;
     content: string;
     createdAt: string;
+    /** Real page count reported by the PDF parser (pdf-parse@2.x `data.total`).
+     *  Only set for `.pdf` uploads; undefined for txt/md/docx. */
+    pageCount?: number;
+    /** Number of pages from which text was actually extracted (a subset of
+     *  `pageCount` when some pages are image-only / blank). Only set for PDFs. */
+    extractedPageCount?: number;
 }
 
 export interface ModeNoteSection {
@@ -63,6 +77,8 @@ export interface ModeNoteSection {
     description: string;
     sortOrder: number;
     createdAt: string;
+    /** AI-compiled extraction instruction for this section (cached). Empty = use title+description. */
+    compiledPrompt?: string;
 }
 
 export const MODE_TEMPLATES: Array<{
@@ -82,51 +98,68 @@ export const MODE_TEMPLATES: Array<{
 // Default note sections seeded when a mode is created from a template
 export const TEMPLATE_NOTE_SECTIONS: Record<ModeTemplateType, Array<{ title: string; description: string }>> = {
     general: [
-        { title: 'Summary',      description: 'High-level summary of the conversation.' },
-        { title: 'Action items', description: 'Tasks and follow-ups identified.' },
-        { title: 'Key points',   description: 'Important points discussed.' },
-    ],
-    'looking-for-work': [
-        { title: 'Follow-up actions',      description: 'Next interview steps or additional materials I said I would send if applicable.' },
-        { title: 'Overview',               description: 'Overview of the interview, the company, and general structure.' },
-        { title: 'Questions and responses', description: 'All questions asked to me during the interview and answers that gave.' },
-        { title: 'Areas to improve',       description: 'What I could have done better during the interview.' },
-        { title: 'Role details',           description: 'Anything discussed about the position, salary expectations, etc.' },
-    ],
-    sales: [
-        { title: 'Action Items',         description: 'All action items that were said I would do after the meeting.' },
-        { title: 'Outcome',              description: 'Did I close the sale and what was the outcome of the conversation.' },
-        { title: 'Prospect background',  description: 'Background and context on who I was selling to.' },
-        { title: 'Discovery',            description: 'What the prospect said during discovery.' },
-        { title: 'Product',              description: "How I pitched the product and the prospect's reaction." },
-        { title: 'Objections',           description: 'Objections from the prospect if there were any.' },
-    ],
-    recruiting: [
-        { title: 'Action Items',          description: 'All action items that I have to do after the meeting.' },
-        { title: 'Experience and skills', description: "Candidate's previous work experience and skills discussed." },
-        { title: 'Quality of responses',  description: 'If there were questions asked, how well and how accurately the candidate answered each question.' },
-        { title: 'Interest in company',   description: 'What the candidate said about their interest in the company.' },
-        { title: 'Role expectations',     description: 'Anything discussed about the position, salary expectations, etc.' },
+        { title: 'What changed', description: 'Concrete outcomes, updates, or shifts from the meeting — not generic discussion.' },
+        { title: 'Decisions', description: 'Confirmed decisions only. Do not include options that were merely discussed.' },
+        { title: 'Action items', description: 'Follow-ups with owner/deadline when present. Mark unknown owner/deadline as absent.' },
+        { title: 'Open questions', description: 'Questions that remain unresolved, deferred, or need follow-up.' },
+        { title: 'Risks / blockers', description: 'Blockers, dependencies, privacy concerns, timeline risks, or unresolved constraints.' },
+        { title: 'Notes', description: 'Useful supporting context that does not fit a stronger outcome section.' },
     ],
     'team-meet': [
-        { title: 'Action Items',          description: 'All action items that were said I would do after the meeting.' },
-        { title: 'Announcements',         description: 'Any team-wide announcements from the meeting.' },
-        { title: 'Team updates',          description: "Each team member's progress, accomplishments, and current focus." },
-        { title: 'Challenges or blockers', description: 'Any issues or obstacles raised that may affect progress.' },
-        { title: 'Decisions made',        description: 'Key decisions or agreements reached during the meeting.' },
+        { title: 'Progress since last sync', description: 'Team member progress, shipped work, changed status, and notable updates.' },
+        { title: 'Decisions', description: 'Decisions and agreements reached by the team.' },
+        { title: 'Owners and next steps', description: 'Concrete next steps, owners, dependencies, and deadlines if stated.' },
+        { title: 'Blockers', description: 'Anything blocked, delayed, at risk, or requiring escalation.' },
+        { title: 'Dependencies', description: 'Cross-team handoffs, external dependencies, or sequencing constraints.' },
+        { title: 'Follow-up needed', description: 'Follow-ups that should happen after the meeting even if not assigned.' },
     ],
-    lecture: [
-        { title: 'Follow-up work',  description: 'Follow-up reading, assignments, or tasks to complete.' },
-        { title: 'Topic',           description: 'Main subject or theme of the lecture.' },
-        { title: 'Key concepts',    description: 'Core ideas or frameworks covered.' },
-        { title: 'Content',         description: 'All content from the lecture with incredibly detailed bullet notes.' },
+    sales: [
+        { title: 'Account context', description: 'Company, stakeholders, use case, team size, current workflow, and business context.' },
+        { title: 'Pain points', description: 'Customer pain, needs, current gaps, and why the problem matters.' },
+        { title: 'Buying signals', description: 'Positive intent, urgency, evaluation signals, pilot/trial interest, or expansion signals.' },
+        { title: 'Objections', description: 'Concerns about price, competitors, timing, security, procurement, or fit.' },
+        { title: 'Budget / timeline / authority', description: 'Budget, approval process, economic buyer, timeline, procurement, or decision criteria.' },
+        { title: 'Next steps', description: 'Specific sales follow-ups, owners, deadlines, and promised materials.' },
+        { title: 'Follow-up email', description: 'Facts that should be included in a concise customer follow-up email.' },
+    ],
+    recruiting: [
+        { title: 'Candidate profile', description: 'Candidate background, experience, current role, motivations, and logistics.' },
+        { title: 'Role fit', description: 'Evidence for or against fit with the role, team, and level.' },
+        { title: 'Strengths', description: 'Concrete strengths shown in answers or experience.' },
+        { title: 'Concerns', description: 'Risks, gaps, inconsistencies, or follow-up areas.' },
+        { title: 'Compensation / logistics', description: 'Compensation, notice period, availability, location, visa, timeline, or constraints.' },
+        { title: 'Next steps', description: 'Recruiting follow-ups, owners, deadlines, next interview stage, or materials.' },
+        { title: 'Follow-up draft', description: 'Information that should appear in the recruiter or candidate follow-up.' },
     ],
     'technical-interview': [
-        { title: 'Problems covered',  description: 'Each problem asked, the approach used, and the outcome.' },
-        { title: 'Concepts tested',   description: 'Key algorithms, data structures, or system design concepts that came up.' },
-        { title: 'What went well',    description: 'Approaches or explanations that landed well.' },
-        { title: 'Areas to study',    description: 'Topics or gaps identified that need more preparation.' },
-        { title: 'Action items',      description: 'Follow-up steps — e.g. send code, study specific topics, await next round.' },
+        { title: 'Problem discussed', description: 'Problem statement, constraints, clarifications, and target outcome.' },
+        { title: 'Approach', description: 'Candidate approach, algorithm, system design, alternatives, and tradeoffs.' },
+        { title: 'Correctness', description: 'Correctness reasoning, edge cases, bugs found, or unresolved correctness issues.' },
+        { title: 'Complexity', description: 'Time/space complexity, scaling assumptions, and performance tradeoffs.' },
+        { title: 'Code quality', description: 'Implementation quality, readability, structure, testing, and maintainability.' },
+        { title: 'Communication', description: 'How clearly the candidate explained reasoning and handled feedback.' },
+        { title: 'Strengths', description: 'Concrete positive signals from the interview.' },
+        { title: 'Weaknesses', description: 'Concrete gaps, missed cases, or areas to improve.' },
+        { title: 'Hiring signal', description: 'Overall hire/no-hire signal and evidence; avoid inventing a final decision.' },
+        { title: 'Follow-up', description: 'Next steps, additional questions, take-home, or interviewer follow-up.' },
+    ],
+    lecture: [
+        { title: 'Core concepts', description: 'Main concepts, frameworks, and claims from the lecture.' },
+        { title: 'Definitions', description: 'Terms, definitions, formulas, and distinctions introduced.' },
+        { title: 'Examples', description: 'Concrete examples, analogies, demonstrations, or case studies.' },
+        { title: 'Formulas / steps', description: 'Procedures, equations, workflows, or step-by-step methods.' },
+        { title: 'Things to memorize', description: 'Facts, definitions, formulas, or lists that should be memorized.' },
+        { title: 'Confusing points', description: 'Ambiguous or confusing ideas that need review.' },
+        { title: 'Questions to review', description: 'Open questions, exam prep prompts, or self-study questions.' },
+        { title: 'Study summary', description: 'Concise study-focused recap of what matters most.' },
+    ],
+    'looking-for-work': [
+        { title: 'Opportunity summary', description: 'Company, role, team, interview stage, and opportunity context.' },
+        { title: 'Company / role details', description: 'Role responsibilities, compensation, logistics, process, and requirements.' },
+        { title: 'Fit signals', description: 'Evidence that my experience or preferences fit the opportunity.' },
+        { title: 'Concerns', description: 'Risks, gaps, objections, or areas to prepare for.' },
+        { title: 'Referral / follow-up', description: 'Referral requests, thank-you notes, materials to send, or networking follow-up.' },
+        { title: 'Next steps', description: 'Concrete next steps, owners, dates, and preparation items.' },
     ],
 };
 
@@ -161,6 +194,44 @@ export function encodeModeContextPayload(value: unknown): string {
     return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
 }
 
+// OKF Phase 7: reference-file content length threshold above which
+// KnowledgeManager.generateForFile (deterministic extraction) is routed
+// through KnowledgeIndexQueue's background path instead of running
+// synchronously inline with addReferenceFile. 300k chars ≈ 150-200 pages of
+// dense text — well above the 66-page/128k-char benchmark thesis this
+// feature was tuned against (which stays comfortably on the synchronous
+// path, preserving existing test/smoke-script assumptions that the pack is
+// queryable immediately after addReferenceFile returns).
+const OKF_BACKGROUND_INDEX_THRESHOLD_CHARS = 300_000;
+
+const DOCUMENT_SOURCE_RE = /\b(uploaded|attached|provided|reference|source material|course material|seminar material|lecture material|presentation|slides?|deck|papers?|pdfs?|files?|documents?|docs?|notes?|attached material|uploaded content|provided material)\b/i;
+const DOCUMENT_CONSTRAINT_RE = /\b(source[-\s]?of[-\s]?truth|from the files?|from the documents?|from the uploaded|answer(?:s|ing)?\s+from\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?)|based on (?:uploaded|provided|attached|the\s+(?:uploaded|attached|provided|reference)|my\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation))|use only|only use|rely only|use\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation)|(?:stick to|restrict to|limit to|draw from)\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation|material)|do not use knowledge outside|(?:don['’]?t|do not)\s+(?:use|rely on|draw on)\s+(?:anything\s+)?(?:outside|beyond|other than)|ground(?:ed)? (?:your )?answers? in|ground(?:ed)? in)\b/i;
+
+export interface ActiveModeDocumentGroundingInfo {
+    isCustom: boolean;
+    hasReferenceFiles: boolean;
+    documentGrounded: boolean;
+    /**
+     * Authoritative runtime guard for user-created custom modes whose own prompt
+     * makes uploaded/reference files the source of truth. This is intentionally
+     * stricter than `documentGrounded` so callers can key source precedence and
+     * profile suppression off one flag instead of re-deriving the four conditions.
+     */
+    documentGroundedCustomModeActive: boolean;
+    modeId?: string;
+    modeName?: string;
+    hasCustomPrompt: boolean;
+}
+
+export function isCustomMode(mode: Pick<Mode, 'templateType' | 'name'> | null | undefined): boolean {
+    return !!mode && mode.templateType === 'general' && mode.name !== 'General';
+}
+
+export function detectCustomModeDocumentGrounding(customPrompt: string): boolean {
+    const prompt = customPrompt || '';
+    return DOCUMENT_SOURCE_RE.test(prompt) && DOCUMENT_CONSTRAINT_RE.test(prompt);
+}
+
 function rowToMode(row: any): Mode {
     return {
         id: row.id,
@@ -179,6 +250,11 @@ function rowToFile(row: any): ModeReferenceFile {
         fileName: row.file_name,
         content: row.content ?? '',
         createdAt: row.created_at,
+        // Round-trip PDF page counts (DB stores snake_case columns; the
+        // 2026-06-27 v18→v19 migration adds these columns and the
+        // IPC handler fills them in for .pdf uploads only).
+        pageCount: typeof row.page_count === 'number' ? row.page_count : undefined,
+        extractedPageCount: typeof row.extracted_page_count === 'number' ? row.extracted_page_count : undefined,
     };
 }
 
@@ -190,12 +266,17 @@ function rowToSection(row: any): ModeNoteSection {
         description: row.description ?? '',
         sortOrder: row.sort_order ?? 0,
         createdAt: row.created_at,
+        compiledPrompt: row.compiled_prompt || undefined,
     };
 }
 
 export class ModesManager {
     private static instance: ModesManager;
     private readonly modeContextRetriever = new ModeContextRetriever();
+    /** Normalized [0,1] top-score confidence from the most recent
+     *  buildRetrievedActiveModeContextBlock call. Read by the doc-grounded
+     *  false-refusal gate. See getLastRetrievalConfidence. */
+    private lastRetrievalConfidence = 0;
 
     private constructor() {}
 
@@ -209,7 +290,17 @@ export class ModesManager {
     // ── Modes ─────────────────────────────────────────────────────
 
     public getModes(): Mode[] {
-        const modes = DatabaseManager.getInstance().getModes().map(rowToMode);
+        const modes = DatabaseManager.getInstance().getModes()
+            // OKF Profile Intelligence (2026-07-02): the '__profile_okf__' reserved
+            // mode (template_type '__reserved__', migration v23) exists ONLY to
+            // satisfy the knowledge_packs.mode_id NOT NULL + FK constraint for profile
+            // OKF packs. It is not a user-facing mode and must never appear in the
+            // mode list, be pinnable/activatable, or be matched by document-grounded
+            // retrieval's getPacksByModeId — filter it out at the single read choke
+            // point so every downstream consumer (UI list, resolveMode, retrieval)
+            // is transparently protected.
+            .filter((row: any) => row.template_type !== '__reserved__')
+            .map(rowToMode);
 
         // Always enforce 'general' at the very top of the list.
         // L1: id is the secondary sort key for stable ordering when two modes
@@ -239,6 +330,23 @@ export class ModesManager {
         return row ? rowToMode(row) : null;
     }
 
+    // ── Pinned-mode resolution (audit finding #6) ─────────────────
+    // The live answer path captures the active mode ONCE at t0 (the
+    // WhatToAnswerRequestSnapshot) and the prompt builders below take an
+    // optional `pinnedModeId` so they read the SAME mode the answer contract was
+    // planned from — even if `modes:set-active` flips the active mode while the
+    // request is parked at an await. When no id is pinned (every existing
+    // caller) this returns the live active mode, so behavior is unchanged.
+    private resolveMode(pinnedModeId?: string): Mode | null {
+        if (pinnedModeId) {
+            const pinned = this.getModes().find(m => m.id === pinnedModeId);
+            // Fall back to the active mode only if the pinned mode was deleted
+            // mid-request (rare); otherwise the pinned mode wins.
+            if (pinned) return pinned;
+        }
+        return this.getActiveMode();
+    }
+
     // ── Active-mode info cache (PI v3, W1) ────────────────────────
     // The live answer path consults the active mode on EVERY turn (routing
     // prior, pinned instructions, retrieval). The mode itself changes only via
@@ -261,12 +369,21 @@ export class ModesManager {
     public getActiveModeInfo(): ActiveModeInfo | null {
         if (this._activeModeInfoCacheValid) return this._activeModeInfoCache;
         const mode = this.getActiveMode();
-        this._activeModeInfoCache = mode ? {
-            id: mode.id,
-            templateType: mode.templateType,
-            name: mode.name,
-            isCustom: mode.templateType === 'general' && mode.name !== 'General',
-        } : null;
+        if (mode) {
+            const grounding = this.getActiveModeDocumentGroundingInfo(mode.id);
+            this._activeModeInfoCache = {
+                id: mode.id,
+                templateType: mode.templateType,
+                name: mode.name,
+                isCustom: isCustomMode(mode),
+                hasReferenceFiles: grounding.hasReferenceFiles,
+                hasCustomPrompt: grounding.hasCustomPrompt,
+                documentGrounded: grounding.documentGrounded,
+                documentGroundedCustomModeActive: grounding.documentGroundedCustomModeActive,
+            };
+        } else {
+            this._activeModeInfoCache = null;
+        }
         this._activeModeInfoCacheValid = true;
         return this._activeModeInfoCache;
     }
@@ -320,6 +437,9 @@ export class ModesManager {
                 sortOrder: i,
             });
         });
+        // Compile extraction instructions for all seeded sections in parallel (fire-and-forget,
+        // bounded concurrency). Never blocks mode creation / UI.
+        this.compileAllSectionsAsync(id);
         return {
             id,
             name: params.name,
@@ -340,6 +460,22 @@ export class ModesManager {
         // persisted chunk vectors (mode_reference_chunks / index_state) have no
         // FK on purpose (the table is owned by the retriever) — drop them
         // explicitly BEFORE the cascade removes the file rows we enumerate.
+        //
+        // CORRECTION (OKF hardening pass, 2026-07-01): this codebase never
+        // runs `PRAGMA foreign_keys = ON` (confirmed zero references
+        // anywhere in electron/), so declared FK CASCADE clauses are
+        // actually inert — `DatabaseManager.deleteMode` below is a bare
+        // `DELETE FROM modes` that does NOT remove `mode_reference_files`
+        // rows either. That's a pre-existing gap outside OKF's scope to fix
+        // wholesale here; explicitly clean up the OKF knowledge_* rows for
+        // this mode's reference files, same reasoning as the chunk-vector
+        // cleanup right below.
+        try {
+            const { KnowledgeManager } = require('./knowledge/KnowledgeManager');
+            KnowledgeManager.getInstance().deleteForMode(id);
+        } catch (err: any) {
+            console.warn('[ModesManager] OKF knowledge cleanup on deleteMode skipped (non-fatal):', err?.message);
+        }
         try {
             for (const file of this.getReferenceFiles(id)) {
                 this.modeContextRetriever.removeReferenceFileIndex(file.id);
@@ -350,6 +486,18 @@ export class ModesManager {
     }
 
     public setActiveMode(id: string | null): void {
+        // OKF Profile Intelligence (2026-07-02): the reserved '__profile_okf__'
+        // mode (migration v23) exists ONLY to satisfy the knowledge_packs.mode_id
+        // FK for profile OKF packs. It is filtered out of getModes(), so a
+        // renderer's modes:set-active would look it up as `undefined` and skip the
+        // pro-gate — but the DB row still exists, so an UPDATE would activate a
+        // phantom mode that no longer appears in the list to switch away from.
+        // Reject it (and any future reserved mode) here at the single write choke
+        // point so it can never become active/pinned.
+        if (id === PROFILE_OKF_RESERVED_MODE_ID) {
+            console.warn('[ModesManager] setActiveMode: refusing to activate the reserved profile OKF mode');
+            return;
+        }
         DatabaseManager.getInstance().setActiveMode(id);
         this.invalidateActiveModeCache();
     }
@@ -360,27 +508,100 @@ export class ModesManager {
         return DatabaseManager.getInstance().getReferenceFiles(modeId).map(rowToFile);
     }
 
-    public addReferenceFile(params: { modeId: string; fileName: string; content: string }): ModeReferenceFile {
+    public addReferenceFile(params: {
+        modeId: string;
+        fileName: string;
+        content: string;
+        pageCount?: number;
+        extractedPageCount?: number;
+    }): ModeReferenceFile {
         const id = `ref_${crypto.randomUUID()}`;
+        // FIX 2026-07-01: forward pageCount + extractedPageCount to the DB.
+        // Previously these fields were accepted on the input params but dropped
+        // before the INSERT, leaving NULL page_count on every row written after
+        // the v18→v19 migration. Upstream consumers (ModeContextRetriever
+        // reportReferenceFilePageCounts telemetry) then triggered their
+        // 3000-char heuristic instead of using the real pdf-parse-extracted
+        // count. Round 1 — see also v22 backfill migration for existing rows.
         DatabaseManager.getInstance().addReferenceFile({
             id,
             modeId: params.modeId,
             fileName: params.fileName,
             content: params.content,
+            pageCount: params.pageCount,
+            extractedPageCount: params.extractedPageCount,
         });
+        this.invalidateActiveModeCache();
+        // OKF Phase 2/7 (2026-07-01): generate a Knowledge Pack alongside the
+        // existing chunk pipeline. Heuristic v1 extraction is pure string
+        // work — fast enough on typical documents (~2-5s on the 66-page
+        // benchmark thesis) to run synchronously without a perceptible
+        // upload-UI stall, but for a genuinely large document (the exact
+        // case KnowledgeIndexQueue's background path exists for — see its
+        // header comment) blocking would be user-visible. Route through
+        // KnowledgeIndexQueue.generateForFileInBackground for content over
+        // OKF_BACKGROUND_INDEX_THRESHOLD_CHARS; small/typical files stay
+        // synchronous so callers (including this method's own return value
+        // and the existing test/smoke-script suite) can rely on the pack
+        // being queryable immediately after addReferenceFile returns, same
+        // as before this change. A thrown error is caught and logged inside
+        // generateForFile itself (returns {status:'failed'}, never throws)
+        // and additionally guarded here. No-ops when okfKnowledgePacks is
+        // OFF (production default) — the flag is checked HERE, before the
+        // sync-vs-background routing, so a large-document upload with the
+        // feature off never even enqueues a background job (senior review
+        // MEDIUM, 2026-07-01: previously generateForFileInBackground was
+        // invoked unconditionally for >300k content and only generateForFile
+        // INSIDE checked the flag, so a flag-off large upload still spun up a
+        // queue promise + broadcast queued/running/done progress events for
+        // nothing). The synchronous branch was already safe — generateForFile
+        // short-circuits on the flag — but gating up front keeps the chunk
+        // path completely untouched when OKF is off.
+        try {
+            const { isOkfKnowledgePacksEnabled } = require('../intelligence/intelligenceFlags') as typeof import('../intelligence/intelligenceFlags');
+            if (isOkfKnowledgePacksEnabled()) {
+                const { KnowledgeManager } = require('./knowledge/KnowledgeManager') as typeof import('./knowledge/KnowledgeManager');
+                const fileInput = {
+                    id, modeId: params.modeId, fileName: params.fileName, content: params.content,
+                    pageCount: params.pageCount, extractedPageCount: params.extractedPageCount,
+                };
+                if (params.content.length > OKF_BACKGROUND_INDEX_THRESHOLD_CHARS) {
+                    void KnowledgeManager.getInstance().generateForFileInBackground(fileInput).catch((err: any) => {
+                        console.warn('[ModesManager] OKF background knowledge pack generation failed (non-fatal):', err?.message);
+                    });
+                } else {
+                    KnowledgeManager.getInstance().generateForFile(fileInput);
+                }
+            }
+        } catch (err: any) {
+            console.warn('[ModesManager] OKF knowledge pack generation skipped (non-fatal):', err?.message);
+        }
         return {
             id,
             modeId: params.modeId,
             fileName: params.fileName,
             content: params.content,
             createdAt: new Date().toISOString(),
+            pageCount: params.pageCount,
+            extractedPageCount: params.extractedPageCount,
         };
     }
 
     public deleteReferenceFile(id: string): void {
         DatabaseManager.getInstance().deleteReferenceFile(id);
+        this.invalidateActiveModeCache();
         // PI v3 (W3): drop the persisted chunk vectors + index state too.
         try { this.modeContextRetriever.removeReferenceFileIndex(id); } catch { /* non-fatal */ }
+        // OKF Phase 2: invalidate the file's Knowledge Pack (the knowledge_*
+        // tables also cascade-delete via FK on mode_reference_files deletion,
+        // but this explicit call makes the intent visible and works even if
+        // FK cascading is disabled in a given SQLite build).
+        try {
+            const { KnowledgeManager } = require('./knowledge/KnowledgeManager') as typeof import('./knowledge/KnowledgeManager');
+            KnowledgeManager.getInstance().deleteForFile(id);
+        } catch (err: any) {
+            console.warn('[ModesManager] OKF knowledge pack invalidation skipped (non-fatal):', err?.message);
+        }
     }
 
     // ── PI v3 (W3): upload-time reference-file indexing ───────────
@@ -393,6 +614,58 @@ export class ModesManager {
         await this.modeContextRetriever.indexReferenceFile(file);
     }
 
+    /** Wire the RAGManager EmbeddingPipeline into the mode hybrid retriever. */
+    public setSharedEmbeddingPipeline(pipeline: EmbeddingPipeline): void {
+        this.modeContextRetriever.setSharedEmbeddingPipeline(pipeline);
+    }
+
+    /** Re-index files that fell back before the embedding provider became ready,
+     *  OR whose stored vectors are in a now-stale embedding space (fallback
+     *  promotion flips the active space; getFileIndexStatus reports those 'ready'
+     *  files as 'pending', which retryLexicalOnlyFiles re-indexes — MEDIUM #3).
+     *
+     *  MEDIUM #2: only descend into a mode when at least one of its files is in a
+     *  retry-eligible state, so a user with many fully-indexed modes doesn't pay
+     *  an O(modes × files) re-scan + per-file indexFile entry on every kick. */
+    public async retryAllLexicalOnlyFiles(): Promise<void> {
+        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
+        for (const mode of this.getModes()) {
+            const files = this.getReferenceFiles(mode.id);
+            if (files.length === 0) continue;
+            // Cheap status read (no embedding work) gates the expensive retry.
+            const hasEligible = files.some(f => {
+                try {
+                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                } catch {
+                    return true; // status lookup failed → let the retry decide
+                }
+            });
+            if (!hasEligible) continue;
+            await this.modeContextRetriever.retryLexicalOnlyFiles(files).catch(() => { /* logged inside */ });
+        }
+    }
+
+    /** Modes that have at least one retry-eligible reference file. Used by the
+     *  main process to broadcast 'done' only for modes that were actually
+     *  re-indexed (LOW #8), instead of spamming every mode on every kick. */
+    public getModesWithRetryEligibleFiles(): string[] {
+        const RETRY_ELIGIBLE = new Set(['lexical_only', 'failed', 'pending']);
+        const out: string[] = [];
+        for (const mode of this.getModes()) {
+            const files = this.getReferenceFiles(mode.id);
+            if (files.length === 0) continue;
+            const hasEligible = files.some(f => {
+                try {
+                    return RETRY_ELIGIBLE.has(this.modeContextRetriever.getReferenceFileIndexStatus(f.id).status);
+                } catch {
+                    return true;
+                }
+            });
+            if (hasEligible) out.push(mode.id);
+        }
+        return out;
+    }
+
     /** Kick indexing for every not-yet-ready file of a mode (mode activation prewarm). */
     public async prewarmModeReferenceIndex(modeId: string): Promise<void> {
         const files = this.getReferenceFiles(modeId);
@@ -402,6 +675,19 @@ export class ModesManager {
                 await this.modeContextRetriever.indexReferenceFile(file).catch(() => { /* logged inside */ });
             }
         }
+        // Phase 3: warm the local cross-encoder reranker at activation so the
+        // first LIVE transcript turn never pays the cold-load cost inside its
+        // retrieval budget. Only when the reranker is actually enabled — never
+        // load a model nobody will use. Fire-and-forget, best-effort.
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { isRagLocalRerankEnabled } = require('../intelligence/intelligenceFlags');
+            if (files.length > 0 && isRagLocalRerankEnabled()) {
+                // eslint-disable-next-line @typescript-eslint/no-var-requires
+                const { getLocalReranker } = require('../rag/LocalReranker');
+                void getLocalReranker().prewarm?.();
+            }
+        } catch { /* non-fatal — prewarm is an optimization, not a requirement */ }
     }
 
     /** Per-file index status for the Modes Manager UI badges. */
@@ -411,6 +697,12 @@ export class ModesManager {
             fileName: file.fileName,
             ...this.modeContextRetriever.getReferenceFileIndexStatus(file.id),
         }));
+    }
+
+    /** Single-file index status lookup — used by IPC handlers to decide whether to
+     *  schedule a retry when a freshly-uploaded file lands in 'failed'/'lexical_only'. */
+    public getReferenceFileIndexStatus(fileId: string): { status: string; chunkCount: number } {
+        return this.modeContextRetriever.getReferenceFileIndexStatus(fileId);
     }
 
     // ── Note Sections ─────────────────────────────────────────────
@@ -430,6 +722,9 @@ export class ModesManager {
             description: params.description,
             sortOrder,
         });
+        // Fire-and-forget: compile a tailored extraction instruction for this section so
+        // future summaries fill it faithfully. Never blocks the caller / UI.
+        this.compileSectionPromptAsync(id, params.modeId, params.title, params.description);
         return {
             id,
             modeId: params.modeId,
@@ -440,12 +735,95 @@ export class ModesManager {
         };
     }
 
-    public updateNoteSection(id: string, updates: { title?: string; description?: string }): void {
+    public updateNoteSection(id: string, updates: { title?: string; description?: string; compiledPrompt?: string }): void {
         DatabaseManager.getInstance().updateNoteSection(id, updates);
+        // If the section's meaning changed (title/description), recompile its instruction.
+        // Skip when we are only writing the compiledPrompt itself (avoids a loop).
+        if ((updates.title !== undefined || updates.description !== undefined) && updates.compiledPrompt === undefined) {
+            const owner = DatabaseManager.getInstance().getNoteSectionOwnerMode(id);
+            if (owner) {
+                this.compileSectionPromptAsync(id, owner.modeId, updates.title ?? owner.title, updates.description ?? owner.description);
+            }
+        }
     }
 
     public deleteNoteSection(id: string): void {
         DatabaseManager.getInstance().deleteNoteSection(id);
+    }
+
+    /**
+     * Compile + cache the AI extraction instruction for a section. Fire-and-forget;
+     * resolves silently. Requires an LLMHelper (set via setLlmHelperForCompiler); if absent
+     * or scope-denied, leaves compiled_prompt empty so the extractor uses title+description.
+     */
+    private compileSectionPromptAsync(sectionId: string, modeId: string, title: string, description: string): void {
+        void (async () => {
+            try {
+                const llmHelper = ModesManager.llmHelperForCompiler;
+                if (!llmHelper) return; // compiler not available in this context
+                // Scope gate: never call a cloud LLM for prompt compilation when post_call_summary
+                // is denied (the deterministic fallback covers it at summary time).
+                try {
+                    const { SettingsManager } = require('./SettingsManager');
+                    const scope = SettingsManager.getInstance().get('providerDataScopes');
+                    if (scope?.post_call_summary === false) return;
+                } catch { /* default allow */ }
+                const mode = this.getModes().find(m => m.id === modeId);
+                const { SectionPromptCompiler } = require('./meeting/SectionPromptCompiler');
+                const { instruction, compiled } = await new SectionPromptCompiler(llmHelper).compile({
+                    sectionTitle: title,
+                    sectionDescription: description,
+                    meetingMode: mode?.templateType,
+                });
+                if (compiled && instruction) {
+                    DatabaseManager.getInstance().updateNoteSection(sectionId, { compiledPrompt: instruction });
+                }
+            } catch (e) {
+                console.warn('[ModesManager] section prompt compile skipped (non-fatal):', (e as any)?.message);
+            }
+        })();
+    }
+
+    /**
+     * Compile extraction instructions for EVERY section of a mode, in parallel with bounded
+     * concurrency. Used when a custom mode is created (many sections at once). Fire-and-forget.
+     */
+    public compileAllSectionsAsync(modeId: string): void {
+        void (async () => {
+            try {
+                const llmHelper = ModesManager.llmHelperForCompiler;
+                if (!llmHelper) return;
+                try {
+                    const { SettingsManager } = require('./SettingsManager');
+                    if (SettingsManager.getInstance().get('providerDataScopes')?.post_call_summary === false) return;
+                } catch { /* default allow */ }
+                const mode = this.getModes().find(m => m.id === modeId);
+                const sections = this.getNoteSections(modeId).filter(s => !s.compiledPrompt || !s.compiledPrompt.trim());
+                if (sections.length === 0) return;
+                const { SectionPromptCompiler } = require('./meeting/SectionPromptCompiler');
+                const compiler = new SectionPromptCompiler(llmHelper);
+                const CONCURRENCY = 3;
+                let next = 0;
+                await Promise.all(Array.from({ length: Math.min(CONCURRENCY, sections.length) }, async () => {
+                    while (next < sections.length) {
+                        const s = sections[next++];
+                        try {
+                            const { instruction, compiled } = await compiler.compile({ sectionTitle: s.title, sectionDescription: s.description, meetingMode: mode?.templateType });
+                            if (compiled && instruction) DatabaseManager.getInstance().updateNoteSection(s.id, { compiledPrompt: instruction });
+                        } catch { /* per-section non-fatal */ }
+                    }
+                }));
+            } catch (e) {
+                console.warn('[ModesManager] compileAllSections skipped (non-fatal):', (e as any)?.message);
+            }
+        })();
+    }
+
+    private static llmHelperForCompiler: import('../LLMHelper').LLMHelper | null = null;
+
+    /** Wire the LLMHelper used by the async section-prompt compiler (called at startup). */
+    public static setLlmHelperForCompiler(llmHelper: import('../LLMHelper').LLMHelper): void {
+        ModesManager.llmHelperForCompiler = llmHelper;
     }
 
     public removeAllNoteSections(modeId: string): void {
@@ -460,9 +838,10 @@ export class ModesManager {
      * and technical-interview's MODE_TECHNICAL_INTERVIEW_PROMPT). Empty string
      * only when no mode is active.
      */
-    public getActiveModeSystemPromptSuffix(): string {
-        const mode = this.getActiveMode();
+    public getActiveModeSystemPromptSuffix(pinnedModeId?: string): string {
+        const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
+        if (isCustomMode(mode)) return '';
         const full = TEMPLATE_SYSTEM_PROMPTS[mode.templateType] ?? '';
         // Strip the shared prefix that's already in HARD_SYSTEM_PROMPT, otherwise
         // CORE_IDENTITY + EXECUTION_CONTRACT + CONTEXT_INTELLIGENCE_LAYER (+
@@ -501,12 +880,13 @@ export class ModesManager {
      * (user-built) modes the mode NAME is prepended so the model knows whose
      * instructions these are.
      */
-    public getActiveModePinnedInstructions(answerType?: AnswerType): string {
-        const mode = this.getActiveMode();
+    public getActiveModePinnedInstructions(answerType?: AnswerType, pinnedModeId?: string): string {
+        const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
         const raw = (mode.customContext || '').trim();
         if (!raw) return '';
-        const scoped = answerType
+        const grounding = this.getActiveModeDocumentGroundingInfo(pinnedModeId);
+        const scoped = (answerType && !grounding.documentGroundedCustomModeActive)
             ? selectCustomContextForAnswer(classifyCustomContext(raw), answerType).included.map(c => c.text).join('\n')
             : raw;
         if (!scoped.trim()) return '';
@@ -514,8 +894,11 @@ export class ModesManager {
         if (text.length > ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) {
             text = text.slice(0, ModesManager.PINNED_INSTRUCTIONS_MAX_CHARS) + ' …[truncated]';
         }
-        const info = this.getActiveModeInfo();
-        return info?.isCustom ? `Mode: ${mode.name}\n${text}` : text;
+        // isCustom is a pure function of (templateType, name) on the resolved
+        // mode — derive it directly so a pinned mode reports correctly even when
+        // it differs from the (possibly switched) live active mode.
+        const custom = isCustomMode(mode);
+        return custom ? `Mode: ${mode.name}\n${text}` : text;
     }
 
     /**
@@ -528,8 +911,28 @@ export class ModesManager {
     private static readonly MAX_FILE_CHARS = 12_000;
     private static readonly MAX_TOTAL_CHARS = 40_000;
 
-    public buildRetrievedActiveModeContextBlock(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean): string {
-        const mode = this.getActiveMode();
+    public getActiveModeDocumentGroundingInfo(pinnedModeId?: string): ActiveModeDocumentGroundingInfo {
+        const mode = this.resolveMode(pinnedModeId);
+        if (!mode) return { isCustom: false, hasReferenceFiles: false, documentGrounded: false, documentGroundedCustomModeActive: false, hasCustomPrompt: false };
+        const files = this.getReferenceFiles(mode.id);
+        const custom = isCustomMode(mode);
+        const hasReferenceFiles = files.some(file => file.content.trim());
+        const hasCustomPrompt = mode.customContext.trim().length > 0;
+        const documentGrounded = custom && hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
+        const documentGroundedCustomModeActive = custom && hasCustomPrompt && documentGrounded && hasReferenceFiles;
+        return {
+            isCustom: custom,
+            hasReferenceFiles,
+            documentGrounded,
+            documentGroundedCustomModeActive,
+            modeId: mode.id,
+            modeName: mode.name,
+            hasCustomPrompt,
+        };
+    }
+
+    public buildRetrievedActiveModeContextBlock(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean, pinnedModeId?: string, retrievalOptions?: ModeRetrievalOptions): string {
+        const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
 
         const result = this.modeContextRetriever.retrieve(mode, this.getReferenceFiles(mode.id), {
@@ -538,9 +941,29 @@ export class ModesManager {
             tokenBudget,
             answerType,
             excludeCustomContext,
+            ...retrievalOptions,
         });
 
+        // Side-channel the normalized top-score CONFIDENCE for this call
+        // (2026-07-02) for DIAGNOSTICS only (surfaced by the debug
+        // modes:build-retrieved-context IPC). NOTE: the document-grounded
+        // false-refusal gate deliberately does NOT use this — retrieval score
+        // proved unreliable there because the forced-doc-grounding section
+        // boost inflates off-topic queries (an off-topic "FIFA World Cup?"
+        // out-scored a genuine "research questions?" on the real thesis). The
+        // gate uses OKF entity/title overlap instead (see ipcHandlers). Kept
+        // because it's honest, cheap diagnostic data. Overwritten on every
+        // call; synchronous write (no await), so no cross-question clobber.
+        this.lastRetrievalConfidence = result.topScoreConfidence ?? 0;
+
         return result.formattedContext;
+    }
+
+    /** Normalized [0,1] retrieval confidence from the most recent
+     *  buildRetrievedActiveModeContextBlock call (0 if it retrieved nothing).
+     *  DIAGNOSTICS only — NOT used by the false-refusal gate (see setter). */
+    public getLastRetrievalConfidence(): number {
+        return this.lastRetrievalConfidence;
     }
 
     /**
@@ -550,10 +973,48 @@ export class ModesManager {
      * we fall back to the existing sync lexical path so the answer flow
      * never breaks. Telemetry distinguishes hybrid hits from lexical fallback.
      */
-    public async buildRetrievedActiveModeContextBlockHybrid(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean): Promise<string> {
-        const mode = this.getActiveMode();
+    public async buildRetrievedActiveModeContextBlockHybrid(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean, pinnedModeId?: string, allowRerank?: boolean, retrievalOptions?: ModeRetrievalOptions): Promise<string> {
+        const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
         const files = this.getReferenceFiles(mode.id);
+
+        // Forced document grounding (audit 2026-06-27): run HYBRID retrieval
+        // first (semantic + lexical with cross-encoder rerank), and if the
+        // hybrid path returns nothing usable (no embedder, no chunks, used
+        // fallback), merge the lexical document-identity block on top. This
+        // gives document-grounded custom modes the precision of semantic
+        // retrieval while preserving the compact identity block for broad
+        // questions like "what is this about?" — the previous code
+        // unconditionally routed to the sync path here, missing the entire
+        // semantic ranking benefit.
+        if (retrievalOptions?.forceDocumentGrounding) {
+            try {
+                const hybridResult = await this.modeContextRetriever.retrieveHybrid(
+                    mode, files, {
+                        query,
+                        transcript,
+                        tokenBudget,
+                        answerType,
+                        excludeCustomContext,
+                        allowRerank,
+                        forceDocumentGrounding: true,
+                    },
+                );
+                if (hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext) {
+                    return hybridResult.formattedContext;
+                }
+                // Hybrid unavailable — fall back to lexical + identity block.
+                return this.buildRetrievedActiveModeContextBlock(
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                );
+            } catch (err) {
+                // Don't let a hybrid outage block a document-grounded answer.
+                console.warn('[ModesManager] hybrid forceDocumentGrounding failed, falling back to lexical:', err?.message);
+                return this.buildRetrievedActiveModeContextBlock(
+                    query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
+                );
+            }
+        }
 
         // Telemetry: rag_query / rag_hit / rag_miss / rag_lexical_fallback.
         let usedHybrid = false;
@@ -574,6 +1035,8 @@ export class ModesManager {
                 transcript,
                 tokenBudget,
                 answerType,
+                allowRerank,
+                ...retrievalOptions,
             });
             usedHybrid = result.usedHybrid;
             usedFallback = result.usedFallback;
@@ -594,7 +1057,7 @@ export class ModesManager {
             console.warn('[ModesManager] hybrid retrieval failed, falling back to lexical:', (err as Error)?.message);
         }
 
-        const lexical = this.buildRetrievedActiveModeContextBlock(query, transcript, tokenBudget, answerType, excludeCustomContext);
+        const lexical = this.buildRetrievedActiveModeContextBlock(query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions);
         try {
             const { telemetryService } = require('./telemetry/TelemetryService');
             telemetryService.track({

@@ -5,8 +5,9 @@ readable content** to your local Natively desktop app, **once, on demand**. It
 never runs in the background, never auto-captures, and only ever talks to your
 own machine over loopback.
 
-It is part of the [Natively](../) monorepo and is licensed **AGPL-3.0-only**,
-same as the desktop app. Source lives in this directory (`natively-browser/`).
+It is part of the [Natively](../) monorepo and is licensed under the
+**Natively Personal Use Source License v1.0**, same as the desktop app. Source
+lives in this directory (`natively-browser/`).
 
 ## How it works
 
@@ -118,12 +119,16 @@ consumes it on the next "What to say".
 
 ## Deterministic extension ID (the `key` field)
 
-The manifest pins a public `key`, which gives the extension a **stable ID across
-dev-load and Web Store publish**: `macjecgdfliikhplbbdbpljomcigjnjg`. The desktop
-**exact-pins this ID** for both `/dom` and `/pair` (CORS responses are only
-readable by this exact origin — a different extension, even one that obtained the
-token, can't read replies cross-origin). Contributors building from source with a
-different unpacked ID can override it via the `NATIVELY_DOM_EXTENSION_ID` env var.
+The manifest pins a public `key`, which gives the **unpacked dev build** a stable
+ID: `macjecgdfliikhplbbdbpljomcigjnjg`. NOTE: the **Chrome Web Store re-signs the
+published extension with Google's own key**, so the store build has a DIFFERENT,
+also-stable ID: `lmhgnkbjnelmciecjkleaomjpejcgaln`. The desktop `/pair` endpoint
+**exact-pins BOTH** (the store ID for normal users, the dev ID for contributors);
+`/dom` uses the looser structural `[a-p]{32}` origin check. CORS responses are only
+readable by the exact requesting origin — a different extension, even one that
+obtained the token, can't read replies cross-origin. Contributors building from
+source with yet another unpacked ID can override via the `NATIVELY_DOM_EXTENSION_ID`
+env var.
 
 The `key` was generated from a 2048-bit RSA keypair:
 
@@ -147,6 +152,7 @@ Store / self-hosted distribution. Regenerate it and update the manifest `key`
 
 ## License
 
-AGPL-3.0-only. Bundles [Mozilla Readability](https://github.com/mozilla/readability)
-(MIT, AGPL-compatible); its license attribution is emitted to
-`dist/content-script.js.LEGAL.txt` by the build.
+Licensed under the [Natively Personal Use Source License v1.0](../LICENSE).
+Bundles [Mozilla Readability](https://github.com/mozilla/readability) (MIT); its
+license attribution is emitted to `dist/content-script.js.LEGAL.txt` by the
+build.

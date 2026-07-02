@@ -18,7 +18,11 @@ export interface AppSettings {
     codexCliTimeoutMs?: number;
     codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
     codexCliServiceTier?: 'default' | 'fast' | 'flex';
-    codexCliModelReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+    // Valid values mirror CodexCliService.resolveCodexReasoningEffort — the union
+    // is permissive (the per-model VALID set is enforced at runtime so e.g.
+    // xhigh on gpt-5.3-codex is silently downgraded). 'none' means "don't pass
+    // -c model_reasoning_effort at all" — distinct from omitting the setting.
+    codexCliModelReasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh';
     // Hindsight long-term memory server (optional, user-provisioned sidecar — Cloud OR
     // local). baseUrl empty by default → feature off. Env (HINDSIGHT_BASE_URL) overrides
     // these for dev. apiKey only for Hindsight Cloud. autoStart/serverCommand reserved for
@@ -28,9 +32,49 @@ export interface AppSettings {
     hindsightAutoStart?: boolean;
     hindsightServerCommand?: string;
     hindsightLlmProvider?: string;
+    // Explicit opt-out sentinel for "I do not want Hindsight at all". Distinct from
+    // "hindsightBaseUrl is empty" — that condition means "user hasn't configured yet"
+    // (synthetic default applies). `true` here means "user has actively disabled Hindsight"
+    // and getHindsightConfig() must return null. Set via the `hindsight:disable` IPC; the
+    // renderer offers a "Don't use Hindsight" link in the setup card.
+    hindsightExplicitlyDisabled?: boolean;
+    // Persisted override for the `hindsightMemory` intelligence flag (see
+    // electron/intelligence/intelligenceFlags.ts). HindsightManager.start() flips this ON
+    // when the user has a baseUrl configured + autoStart on, so the `memoryFlagOn()` gate
+    // inside start() doesn't early-return on the flag's default-OFF registry value. The
+    // flag's setting key in the registry is `hindsightMemoryEnabled` — keep them aligned.
+    hindsightMemoryEnabled?: boolean;
+    // True when the user has explicitly set the hindsightMemory flag to a non-default
+    // value. Distinguishes "default OFF, user hasn't touched it" from "user explicitly
+    // set OFF" — without this, the auto-flip on every Settings save would silently
+    // re-enable a flag the user intentionally disabled. Written by `setIntelligenceFlag`
+    // whenever value !== registry default. NAME MUST MATCH the runtime key: the registry
+    // setting is `hindsightMemoryEnabled`, so the explicit sibling is
+    // `<setting>Explicit` = `hindsightMemoryEnabledExplicit` (read by
+    // HindsightManager.hindsightMemoryExplicitlyOff()).
+    hindsightMemoryEnabledExplicit?: boolean;
     knowledgeMode?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
+    // ── Smart Browser Context v2 ───────────────────────────────────────────
+    // Manual browser capture is always available (no flag). These control the
+    // AUTOMATIC behaviour. Defaults (read at the use sites): coding auto-detect
+    // and auto-attach default ON (high-confidence coding only); the AI metadata
+    // classifier is OFF (opt-in); job-desc/dev-docs auto-detect OFF. Sensitive
+    // categories (email/chat/banking/auth) are ALWAYS blocked — there is no
+    // setting to disable that floor.
+    browserAutoDetectCoding?: boolean;        // default true
+    browserAutoAttachCoding?: boolean;        // default true
+    browserAskBeforeUnknown?: boolean;        // default true
+    browserAiClassifierEnabled?: boolean;     // default false (opt-in)
+    browserAutoDetectJobDescriptions?: boolean; // default false
+    browserAutoDetectDeveloperDocs?: boolean; // default false
+    // EXPERIMENTAL: when true, the auto-capture path attaches the FULL page
+    // content (readable text) for ANY non-sensitive page — not just coding — and
+    // lets the answer model pick what it needs. Default false. Sensitive pages
+    // (email/chat/banking/auth) are STILL hard-blocked; this only relaxes the
+    // coding-only / high-confidence-only gate, never the sensitive floor.
+    browserExperimentalFullPageCapture?: boolean; // default false (experimental)
     localWhisperModel?: string;
     // Per-channel model overrides for local Whisper. When
     // localWhisperPerChannelEnabled is true, the two LocalWhisperSTT instances
@@ -187,6 +231,31 @@ export class SettingsManager {
 
     public getTechnicalInterviewVisionFirst(): boolean {
         return this.settings.technicalInterviewVisionFirst !== false;
+    }
+
+    // ── Smart Browser Context v2 — resolved settings (single default source) ──
+    // Manual capture is always on (not represented here). These resolve the
+    // documented defaults so callers never repeat them. Sensitive blocking is a
+    // hard floor in the policy engine and is intentionally NOT a setting.
+    public getBrowserContextSettings(): {
+        autoDetectCoding: boolean;
+        autoAttachCoding: boolean;
+        askBeforeUnknown: boolean;
+        aiClassifierEnabled: boolean;
+        autoDetectJobDescriptions: boolean;
+        autoDetectDeveloperDocs: boolean;
+        experimentalFullPageCapture: boolean;
+    } {
+        const s = this.settings;
+        return {
+            autoDetectCoding: s.browserAutoDetectCoding !== false, // default true
+            autoAttachCoding: s.browserAutoAttachCoding !== false, // default true
+            askBeforeUnknown: s.browserAskBeforeUnknown !== false, // default true
+            aiClassifierEnabled: s.browserAiClassifierEnabled === true, // default false (opt-in)
+            autoDetectJobDescriptions: s.browserAutoDetectJobDescriptions === true, // default false
+            autoDetectDeveloperDocs: s.browserAutoDetectDeveloperDocs === true, // default false
+            experimentalFullPageCapture: s.browserExperimentalFullPageCapture === true, // default false (experimental)
+        };
     }
 
     // ── Regional STT relay (Phase 7/8) typed accessors ─────────────────────

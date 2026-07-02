@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from "react" // forcing refre
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { ToastProvider, ToastViewport } from "./components/ui/toast"
 import NativelyInterface from "./components/NativelyInterface"
+import HindsightStatusBanner from "./components/HindsightStatusBanner"
 import SettingsPopup from "./components/SettingsPopup" // Keeping for legacy/specific window support if needed
 import Launcher from "./components/Launcher"
 import ModelSelectorWindow from "./components/ModelSelectorWindow"
@@ -10,11 +11,13 @@ import StartupSequence from "./components/StartupSequence"
 import { AnimatePresence, motion } from "framer-motion"
 import UpdateBanner from "./components/UpdateBanner"
 import { SupportToaster } from "./components/SupportToaster"
+import ReviewPromptHost from "./components/ReviewPromptHost"
 import { NativelyQuotaBanner } from "./components/NativelyQuotaBanner"
 import { FreeTrialBanner }      from "./components/trial/FreeTrialBanner"
 import { FreeTrialModal }       from "./components/trial/FreeTrialModal"
 import { TrialPromoToaster }    from "./components/trial/TrialPromoToaster"
 import { PermissionsToaster }   from "./components/onboarding/PermissionsToaster"
+import { BrowserExtensionToaster } from "./components/onboarding/BrowserExtensionToaster"
 import { AlertCircle, RefreshCw } from "lucide-react"
 import { clampOverlayOpacity, OVERLAY_OPACITY_DEFAULT, getDefaultOverlayOpacity } from "./lib/overlayAppearance"
 import { getMeetingInterfaceTheme, type MeetingInterfaceTheme } from './lib/meetingInterfaceTheme'
@@ -36,6 +39,7 @@ import ModesSettings from "./components/settings/ModesSettings"
 import { ProfileIntelligenceSettings } from "./components/ProfileIntelligenceSettings"
 
 const queryClient = new QueryClient()
+const CropperWindow = React.lazy(() => import('./components/Cropper'))
 
 const App: React.FC = () => {
   const isSettingsWindow = new URLSearchParams(window.location.search).get('window') === 'settings';
@@ -46,15 +50,6 @@ const App: React.FC = () => {
 
   // Default to launcher if not specified (dev mode safety)
   const isDefault = !isSettingsWindow && !isOverlayWindow && !isModelSelectorWindow && !isCropperWindow;
-
-  if (isCropperWindow) {
-    const Cropper = React.lazy(() => import('./components/Cropper'));
-    return (
-      <React.Suspense fallback={<div className="w-screen h-screen bg-transparent" />}>
-        <Cropper />
-      </React.Suspense>
-    );
-  }
 
   // Initialize Analytics
   useEffect(() => {
@@ -584,6 +579,14 @@ const App: React.FC = () => {
   const interfaceThemeAttribute = meetingInterfaceTheme === 'default' ? undefined : meetingInterfaceTheme;
 
   // Render Logic
+  if (isCropperWindow) {
+    return (
+      <React.Suspense fallback={<div className="w-screen h-screen bg-transparent" />}>
+        <CropperWindow />
+      </React.Suspense>
+    );
+  }
+
   if (isSettingsWindow) {
     return (
       <ErrorBoundary context="SettingsPopup">
@@ -630,6 +633,7 @@ const App: React.FC = () => {
                   transition: 'background-color 75ms ease, border-color 75ms ease, box-shadow 75ms ease'
                 } as React.CSSProperties}
               >
+                <HindsightStatusBanner />
                 <NativelyInterface
                   onEndMeeting={handleEndMeeting}
                   overlayOpacity={overlayOpacity}
@@ -649,6 +653,7 @@ const App: React.FC = () => {
   return (
     <ErrorBoundary context="Launcher">
     <div className="h-full min-h-0 w-full relative bg-transparent">
+      <HindsightStatusBanner />
       <AnimatePresence>
         {showStartup ? (
           <motion.div
@@ -691,6 +696,8 @@ const App: React.FC = () => {
                     setIsSettingsOpen(false);
                   }}
                   initialTab={settingsInitialTab}
+                  initialIsPremium={hasLoadedLicense ? isPremiumActive : null}
+                  initialHasNativelyKey={hasNativelyApi}
                 />
                 <AnimatePresence>
                   {isModesOpen && (
@@ -845,6 +852,7 @@ const App: React.FC = () => {
       <UpdateBanner />
       <SupportToaster />
       <NativelyQuotaBanner />
+      <ReviewPromptHost />
 
 
 
@@ -910,6 +918,11 @@ const App: React.FC = () => {
           }}
         />
       )}
+      {/* Browser extension onboarding toaster — 12s after launch, only on v2.8.0+ when not connected (self-gates) */}
+      {(isLauncherWindow || isDefault) && (
+        <BrowserExtensionToaster />
+      )}
+
       {/* Ad toasters */}
       {isLauncherMainView && !isSettingsOpen && (
         <NativelyApiPromoToaster

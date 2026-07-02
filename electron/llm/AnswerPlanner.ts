@@ -1,7 +1,8 @@
 import type { IntentResult } from './IntentClassifier';
 import type { ExtractedQuestion } from './transcriptQuestionExtractor';
-import { CODING_CONTRACT, CODING_VERIFICATION_INSTRUCTION } from './codingContract';
+import { CODING_CONTRACT, CODING_CONTRACT_IMPL, CODING_VERIFICATION_INSTRUCTION } from './codingContract';
 import { detectAnswerStyle, type AnswerStyle } from './answerStyle';
+import { classifyTargetSpeakability, classifyShortBand, shortBandTargetWords } from './speakability';
 import { applyModeFallback, type ActiveModeInfo } from './modeProfiles';
 
 export type AnswerType =
@@ -29,7 +30,7 @@ export type AnswerType =
   | 'general_meeting_answer'
   // Release 2026-06-06b (real manual-chat log fixes):
   // A request for a project's public link / repo / website. Shares a loaded URL
-  // (open-source/public/user-provided), or says the link isn't loaded — NEVER
+  // (source-available/public/user-provided), or says the link isn't loaded — NEVER
   // refuses with "I can't share that" and NEVER invents a URL.
   | 'project_link_answer'
   // A request for the ACTUAL source code of a loaded project ("a snippet you used
@@ -127,6 +128,8 @@ export interface AnswerPlan {
   answerStyle: AnswerStyle;
   /** Soft spoken-length target in seconds (0 = no explicit constraint). */
   answerStyleTargetSeconds: number;
+  /** True when a user-created custom mode requires uploaded/reference files as source of truth. */
+  documentGroundedCustomModeActive?: boolean;
 }
 
 export interface PlanAnswerInput {
@@ -162,6 +165,18 @@ ${CODING_CONTRACT}
 Additional rules:
 - Do not include resume, JD, salary, negotiation, or unrelated profile context unless explicitly asked.
 - NEVER mention "Natively", the assistant, the product, or the candidate's profile/projects anywhere in the answer — not in the explanation, not in a closing remark, not in an example. This is a pure technical answer about the algorithm only.`;
+
+// General implementation tasks (React components, scripts, utilities) get the
+// IMPL contract: code-first with the correct fence tag, short explanation, NO
+// DSA interview walkthrough. dsa_question_answer keeps CODING_TEMPLATE — named
+// algorithm problems ("reverse a linked list") still want the six sections.
+const CODING_IMPL_TEMPLATE = `You are generating a complete implementation for a coding task.
+
+${CODING_CONTRACT_IMPL}
+
+Additional rules:
+- Do not include resume, JD, salary, negotiation, or unrelated profile context.
+- NEVER mention "Natively", the assistant, the product, or the candidate's profile anywhere in the answer.`;
 
 const BEHAVIORAL_TEMPLATE = `Use exactly these sections:
 
@@ -310,6 +325,28 @@ const DIRECT_SHORT_TEMPLATE = `Answer directly in 1-2 sentences. Do not include 
 const SKILL_RATING_TEMPLATE = `Answer in 1-2 sentences as the candidate. If asked to rate a skill (e.g. "out of 10"), GIVE a concrete number grounded in the loaded experience and add one phrase of justification. Never refuse, never say you are an AI or that you "cannot assign ratings". Do not mention the profile/context explicitly — just answer confidently.`;
 const GENERAL_TEMPLATE = `Answer naturally and directly. Use only relevant context. Keep it predictable and concise.`;
 
+// Generic technical-concept answers (what is Redis / JWT / CORS / caching / REST) were
+// coming back as long beginner TUTORIALS. In an interview the user needs a short, confident
+// spoken answer, not a classroom lesson (spoken-answer-quality sprint 2026-06-15).
+const TECHNICAL_CONCEPT_TEMPLATE = `You are the candidate SPEAKING this answer aloud to an interviewer. Give the exact words you'd SAY — a short, plain spoken answer, NOT documentation.
+
+THIS IS A SPOKEN ANSWER. Output MUST be ONE short paragraph of plain sentences. It is WRONG if it contains ANY of these:
+- a markdown heading (## or **Heading**)
+- a bullet list or a numbered list
+- a "Key Concepts" / "How it works" / "Common use cases" / "Performance" section
+- a code block or a code example
+- a table
+
+Shape:
+- 2 to 4 sentences, usually 40 to 80 words. If a single sentence answers it, stop there.
+- Sentence 1 is a plain one-line definition. Then at most one or two sentences with the single most relevant tradeoff or use, woven into prose.
+- No analogy unless the user asked for simple terms / "explain like I'm 5".
+
+Example of the RIGHT shape (for "what is Redis?"):
+"Redis is an in-memory key-value store, so reads and writes are extremely fast. People mostly use it for caching, sessions, and rate limiting, and the main tradeoff is that it lives in memory, so you watch cost and what data really belongs there."
+
+Sound like a competent engineer answering quickly in conversation — calm, specific, done in about 20 seconds.`;
+
 // SALES voice (manual regression 2026-06-12): real sales-mode sessions answered
 // "why is your product expensive?" with "I'm Natively, an AI assistant. I don't
 // have a product or pricing model" — the model fell back to its system identity
@@ -360,7 +397,7 @@ Be honest about what is and isn't available.`;
 // Release 2026-06-06b — questions ABOUT the product/project itself.
 const PRODUCT_ABOUT_TEMPLATE = `The user is asking about the product/project itself (what kind of app it is, its backend, architecture, or tech).
 
-Ground every concrete claim in the provided project/profile metadata. If the metadata describes it (e.g. "privacy-first, open-source, local RAG, Electron + Rust core, Ollama, SQLite"), you may state those. If a detail is NOT in the loaded context, do not invent it — say "from the loaded project description…" and stay within what's described, or note that a specific detail isn't in your loaded context. Distinguish the desktop app core from any local services and any separately-loaded cloud/API path. Keep it concise and concrete.`;
+Ground every concrete claim in the provided project/profile metadata. If the metadata describes it (e.g. "privacy-first, source-available, local RAG, Electron + Rust core, Ollama, SQLite"), you may state those. If a detail is NOT in the loaded context, do not invent it — say "from the loaded project description…" and stay within what's described, or note that a specific detail isn't in your loaded context. Distinguish the desktop app core from any local services and any separately-loaded cloud/API path. Keep it concise and concrete.`;
 
 const includesAny = (text: string, patterns: RegExp[]): boolean => patterns.some(pattern => pattern.test(text));
 
@@ -608,7 +645,7 @@ const SAFE_PRODUCT_PRIVACY_PATTERNS = [
 
 // ── PROJECT LINK / repo / public URL (release 2026-06-06b) ──
 // "can you give me the link", "share the github repo", "show the website",
-// "it's open source right, share the link". Routes to `project_link_answer`: share
+// "it's source available right, share the link". Routes to `project_link_answer`: share
 // a LOADED url, else say the link isn't loaded — never refuse, never invent.
 const PROJECT_LINK_PATTERNS = [
   /\b(give|share|send|show|drop|paste|provide|get) (me )?(the |a |your )?(git ?hub|gitlab|bitbucket|repo|repository|link|url|website|site|demo link|project link|source link|public link)\b/i,
@@ -620,16 +657,16 @@ const PROJECT_LINK_PATTERNS = [
   // "see the code ON GITHUB" / "find the source ON GITHUB" is asking for the repo.
   /\b(can|could|where) (i|we) (find|see|get|access) (the |your )?(link|repo|repository|github|gitlab|website|site|demo)\b/i,
   /\b(see|find|view|access) (the )?(code|source|repo|project)\b.{0,20}\b(on|at|in|via)\s+(git ?hub|gitlab|the repo)\b/i,
-  // "where can I find the source/repo" — an open-source PROJECT locator → link.
+  // "where can I find the source/repo" — a source-available PROJECT locator → link.
   // EXCLUDES "source code FOR <algorithm>" (a coding ask) via the negative
   // lookahead, and "the code" alone (that's coding). Only bare "the source"/"repo".
   /\bwhere(?:'?s| is| can i (?:find|see)) (the )?(source|repo|repository)\b(?!\s*code\s+(for|of|to))/i,
   /\bopen[- ]?source\b.{0,30}\b(link|repo|github|share|url)\b|\b(link|repo|github|url)\b.{0,30}\bopen[- ]?source\b/i,
-  // "it's an open-source project right [share it]" — the user is angling for the
-  // link. A BARE "is it open source" (no share/link cue) is a product-about
+  // "it's a source-available project right [share it]" — the user is angling for the
+  // link. A BARE "is it source available" (no share/link cue) is a product-about
   // yes/no and is handled by PRODUCT_ABOUT instead, so require a share/right cue.
   /\b(its|it'?s|so its|so it'?s)\s+an?\s+open[- ]?source\b|\bopensource (porject|project)\b|\bopen[- ]?source\b.{0,20}\bright\b/i,
-  /\bwhy (can'?t|cant|wont|won'?t) (you )?share\b/i,    // "why can't you share, it's open source"
+  /\bwhy (can'?t|cant|wont|won'?t) (you )?share\b/i,    // "why can't you share, it's source available"
 ];
 
 // ── ACTUAL SOURCE CODE evidence requests (release 2026-06-06b) ──
@@ -855,12 +892,24 @@ const SKILLS_PATTERNS = [
   /\bwhat(?:'s| is) (your|my) strongest (skill|area|tech|language|domain)\b/i,
   /\bwhere do (you|i) special/i,
 ];
+// A PEOPLE / leadership / conflict OBJECT after a lead/manage/handle verb marks a behavioral
+// STORY (not a skill probe). This ONE source is interpolated into the behavioral matcher AND
+// its two skill-side guards so the guard is always a superset of the matcher and the three lists
+// can never drift apart (code-review 2026-06-16). A tech/tool object ("a database", "Python")
+// is deliberately NOT here — those stay skill_experience.
+const PEOPLE_OR_CONFLICT_OBJECT =
+  '(?:team|teams|people|person|peers?|reports?|engineers?|developers?|juniors?|staff|direct\\s+reports?|group|anyone|someone|somebody|anybody|conflict|disagreement|crisis|escalation|difficult|tough)';
+
 // Spec Case F exception: "have you used / worked with / do you know <tech>" is a
 // SKILL-EXPERIENCE question about the USER (profile YES, first person) — NOT a
 // generic technical concept. This must be checked BEFORE coding/DSA patterns so
 // "have you used a hashmap?" routes to skills, not to the coding contract.
 const SKILL_EXPERIENCE_PATTERNS = [
-  /\bhave you (ever )?(used|worked with|worked on|built|built with|written|coded in|programmed in|implemented|done|created|handled|analy[sz]ed|normali[sz]ed|deployed|designed|managed)\b/i,
+  // "have you used/built/managed <tech>" is a skill probe. But "have you managed/handled/led
+  // PEOPLE / a TEAM" is a behavioral STORY, not a skill — the negative lookahead lets those
+  // fall through to BEHAVIORAL_PATTERNS (code-review caveat 2026-06-16). A tech object after
+  // managed/handled (e.g. "have you managed a database/cluster") still routes to skills.
+  new RegExp(`\\bhave you (ever )?(?:(?:managed|handled|led)\\b(?!\\s+(?:a\\s+|an\\s+|the\\s+|your\\s+|some\\s+|any\\s+)?${PEOPLE_OR_CONFLICT_OBJECT}\\b)|(?:used|worked with|worked on|built|built with|written|coded in|programmed in|implemented|done|created|analy[sz]ed|normali[sz]ed|deployed|designed))\\b`, 'i'),
   /\bdo you (know|have experience (with|in)|use)\b/i,
   /\bare you (familiar|comfortable|proficient|experienced) (with|in)\b/i,
   // "Are you good/strong/skilled at X?", "are you any good with React?" — a
@@ -887,8 +936,12 @@ const SKILL_EXPERIENCE_PATTERNS = [
   /\bhow (much |many years )?(experience|familiar).*\b(with|in|using)\b/i,
   /\bever (used|worked with|built)\b/i,
   // "Did you actually use X / use X or just know it", "did you work with X" —
-  // past-experience probes (benchmark 2026-06-05 would-vs-have, honest-evidence).
-  /\bdid you (actually |really |ever )?(use|work with|work on|build|implement|write|do|handle|analy[sz]e|deal with)\b/i,
+  // past-experience probes (benchmark 2026-06-05 would-vs-have, honest-evidence). The
+  // handle/deal-with verbs are split out with a people/conflict-object negative lookahead so
+  // "did you handle a crisis" / "did you deal with a difficult teammate" fall through to a
+  // behavioral STORY instead of a skill probe (code-review 2026-06-16).
+  /\bdid you (actually |really |ever )?(use|work with|work on|build|implement|write|analy[sz]e)\b/i,
+  new RegExp(`\\bdid you (actually |really |ever )?(do|handle|deal with|manage)\\b(?!\\s+(?:a\\s+|an\\s+|the\\s+|your\\s+|some\\s+|any\\s+)?${PEOPLE_OR_CONFLICT_OBJECT}\\b)`, 'i'),
   /\b(used|worked with) [\w ]+ or just (know|knew|theoretical|theory)\b/i,
   /\bexperienced or just theoretical\b/i,
   // "How HAVE you used X", "where HAVE you used X" — explicit past usage (vs the
@@ -1053,6 +1106,16 @@ const BEHAVIORAL_PATTERNS = [
   /\bdescribe (a time|a situation|an? (?:experience|instance))\b|\bdescribe a time (you|i)\b/i,
   /\b(time|example|instance) (you|i|when (?:you|i))\s+(took|showed|demonstrated|led|handled|overcame|failed|learned|built|shipped|resolved|managed)\b/i,
   /\bwhat (do|would) you do (when|if)\b.{0,40}\b(stuck|fail|wrong|conflict|disagree|pressure|deadline)\b/i,
+  // "Did/Have you ever <lead/manage/mentor/handle> <people/team/conflict>" or "...deliver under
+  // pressure" — a past-experience yes/no that really wants a STAR story ("Did you ever lead a
+  // team?", "Have you managed people?", "Have you handled a conflict?", "Have you mentored
+  // anyone?"). The PEOPLE/leadership/conflict OBJECT is the discriminator (shared
+  // PEOPLE_OR_CONFLICT_OBJECT): a tool/task object ("have you built a REST API", "what projects
+  // have you built", "did you finish the migration") is NOT a story and is deliberately excluded
+  // (code-review caveat 2026-06-16). The object list here is identical to the one the two
+  // skill-side guards exclude, so they can never drift.
+  new RegExp(`\\b(?:did|have|has)\\s+(?:you|u)\\s+(?:ever\\s+)?(?:led|lead|manage[d]?|mentor(?:ed)?|coach(?:ed)?|supervis(?:e|ed)|handle[d]?|resolv(?:e|ed)|navigat(?:e|ed)|deal[t]?\\s+with)\\s+(?:a\\s+|an\\s+|the\\s+|your\\s+|some\\s+|any\\s+)?${PEOPLE_OR_CONFLICT_OBJECT}\\w*\\b`, 'i'),
+  /\b(?:did|have|has)\s+(?:you|u)\s+(?:ever\s+)?(?:deliver(?:ed)?|shipped?|launched?|worked|performed)\b.{0,30}\b(?:under\s+(?:pressure|a\s+(?:tight\s+)?deadline)|tight\s+deadline|crunch|high[- ]pressure)\b/i,
   /\b(can you )?talk (more )?about your (project )?coordination\b/i,
   /\bproject coordinati(on|vely)\b/i,
   /\bproof of\b|\bprove[sd]? (your|my|analytical|that you|i)\b|\bthat proves?\b/i,
@@ -1303,9 +1366,10 @@ const classifyStandaloneFragment = (text: string): AnswerType | null => {
 
 const templateFor = (answerType: AnswerType): string => {
   switch (answerType) {
-    case 'coding_question_answer':
     case 'dsa_question_answer':
       return CODING_TEMPLATE;
+    case 'coding_question_answer':
+      return CODING_IMPL_TEMPLATE;
     case 'behavioral_interview_answer':
     case 'experience_answer':
       return BEHAVIORAL_TEMPLATE;
@@ -1326,9 +1390,9 @@ const templateFor = (answerType: AnswerType): string => {
     case 'debugging_question_answer':
       return DEBUGGING_TEMPLATE;
     case 'technical_concept_answer':
-      // Generic technical explanation — no profile, no persona. Same shape as
-      // general but explicitly free of candidate framing.
-      return GENERAL_TEMPLATE;
+      // Generic technical explanation — no profile, no persona, and a SHORT spoken
+      // interview answer (not a tutorial). spoken-answer-quality sprint 2026-06-15.
+      return TECHNICAL_CONCEPT_TEMPLATE;
     case 'identity_answer':
     case 'profile_fact_answer':
     case 'skills_answer':
@@ -1352,7 +1416,7 @@ const templateFor = (answerType: AnswerType): string => {
   }
 };
 
-const requiredLayersFor = (answerType: AnswerType): ContextLayer[] => {
+const requiredLayersFor = (answerType: AnswerType, documentGroundedCustomModeActive = false): ContextLayer[] => {
   switch (answerType) {
     case 'identity_answer':
       return ['stable_identity', 'resume'];
@@ -1387,6 +1451,17 @@ const requiredLayersFor = (answerType: AnswerType): ContextLayer[] => {
     case 'lecture_answer':
       return ['live_transcript', 'screen_context', 'reference_files', 'active_mode'];
     case 'follow_up_answer':
+      // Document-grounded custom mode (audit 2026-06-27): drop
+      // `prior_assistant_responses` from the follow-up layer. A wrong prior
+      // assistant answer about the uploaded material would otherwise become
+      // truth on the next follow-up via `live_transcript`. The transcript
+      // layer is preserved so pronoun resolution ("that", "it") still works,
+      // but factual claims must come from the document, not from a
+      // previously-emitted answer. Non-document-grounded follow-ups keep
+      // the original layer set so chat-style continuity is preserved.
+      if (documentGroundedCustomModeActive) {
+        return ['live_transcript', 'active_mode'];
+      }
       return ['live_transcript', 'prior_assistant_responses', 'active_mode'];
     case 'project_about_answer':
       // Grounded in the loaded project metadata (résumé projects) + custom context
@@ -1680,6 +1755,9 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     .replace(/\b(tech|technology|technical)\s+stack\b/g, 'techstack')
     .replace(/\bfull[- ]?stack\b/g, 'fullstack');
   const extractedType = input.extractedQuestion?.questionType;
+  const documentGroundedCustomModeActive = input.activeMode?.documentGroundedCustomModeActive === true;
+  const explicitDocumentModeCodingAsk = /\b(write|implement|code|coding interview|dsa|dry run|time complexity|space complexity|big[-\s]?o|algorithm(?:ic)?|solution code|source code)\b/i.test(text);
+  const explicitDocumentModeProfileAsk = /\b(resume|cv|profile|job description|\bjd\b|career|work experience|candidate profile|my background|your background|my projects?|your projects?|my skills?|your skills?)\b/i.test(text);
 
   let answerType: AnswerType = 'general_meeting_answer';
 
@@ -1774,7 +1852,11 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
   const isProjectDrillIn = includesAny(text, PROJECT_FOLLOWUP_PATTERNS)
     || /\b(there|in it|on it|in that|in the project|build it|built it)\b/i.test(text)
     || /\b(tech|technology|technical)\s+stack\b/i.test(text);
-  const isExplicitExperienceProbe = !hasWriteCodeVerb && !asksAboutNatively && !asksAboutProjectsList && !isProjectDrillIn && (
+  // A PEOPLE/team/leadership object after managed/handled/led marks a behavioral STORY, not a
+  // skill probe — exclude it so it falls through to BEHAVIORAL_PATTERNS (code-review caveat
+  // 2026-06-16). "have you managed a database/cluster" (a tech object) stays a skill probe.
+  const hasPeopleObject = new RegExp(`\\b(?:manage[d]?|handle[d]?|led|lead|mentor(?:ed)?|coach(?:ed)?|supervis(?:e|ed)|resolv(?:e|ed)|navigat(?:e|ed)|deal[t]?\\s+with)\\s+(?:a\\s+|an\\s+|the\\s+|your\\s+|some\\s+|any\\s+)?${PEOPLE_OR_CONFLICT_OBJECT}\\b`, 'i').test(text);
+  const isExplicitExperienceProbe = !hasWriteCodeVerb && !asksAboutNatively && !asksAboutProjectsList && !isProjectDrillIn && !hasPeopleObject && (
     /\bhave (you|u) (ever )?(used|worked with|worked on|built|implemented|written|coded|deployed|designed|done|handled|managed)\b/i.test(text)
     || /\bdid (you|u) (actually |really |ever )?(use|work with|build|implement|write|deploy|design|do|handle)\b/i.test(text)
     || /\bwhere have (you|i) (used|worked|applied|built|implemented)\b/i.test(text)
@@ -1981,7 +2063,31 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     // Named DSA problem ("two sum", "reverse a linked list", "solve two sum").
     // Kept BEFORE generic CODING so the specific DSA label/template wins.
     answerType = 'dsa_question_answer';
-  } else if (includesAny(text, CODING_PATTERNS) || input.intentResult?.intent === 'coding') {
+  } else if (
+    (includesAny(text, CODING_PATTERNS) || input.intentResult?.intent === 'coding')
+    // Guard: a very short addend phrase like "with code?", "show code?", "include code?",
+    // "add code?", "can you give code?" is a conversational follow-up requesting a code
+    // example from the prior context — NOT a new standalone coding problem. Only suppress
+    // the coding route when ALL three conditions hold:
+    //   (1) the message is short (≤5 words, punctuation stripped)
+    //   (2) the only coding signal is the bare noun "code" (no stronger cue:
+    //       write/implement/program/function/class/method/solve/algorithm/debug/snippet)
+    //   (3) the message starts with a modifier/preposition typical of addends
+    //       (with, show, include, add, give, can you, using, just)
+    // A genuine coding ask like "write code for bubble sort" fails condition (2) and
+    // passes through normally. This guard does NOT touch the DSA_PATTERNS path above.
+    && !((() => {
+      const wordCount = text.replace(/[?.!,]/g, '').split(/\s+/).filter(Boolean).length;
+      if (wordCount > 5) return false; // not short enough to be an addend
+      const hasStrongCodingCue = /\b(write|implement|program|function|class|method|solve|algorithm|debug|snippet|script)\b/i.test(text)
+        || includesAny(text, COMMON_CODING_PROBLEM_PATTERNS)
+        || includesAny(textNoTechStack, DSA_PATTERNS);
+      if (hasStrongCodingCue) return false; // real coding ask — don't suppress
+      // Only the bare word "code" triggered the match. Check for addend preposition.
+      const isAddend = /^(?:with|show|include|add|give|can\s+you|using|just|also|and)\b/i.test(text.trim());
+      return isAddend;
+    })())
+  ) {
     answerType = 'coding_question_answer';
   } else if (includesAny(text, GAP_PATTERNS)) {
     // Honest gap + mitigation for the role (checked BEFORE jd_fit so a gap ask isn't
@@ -2035,6 +2141,13 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     // or any explicitly-matched type above is never touched, so every leak
     // invariant (coding/identity/negotiation routing) is preserved.
     answerType = applyModeFallback(answerType, true, input.source, input.activeMode);
+  }
+
+  if (documentGroundedCustomModeActive && !explicitDocumentModeCodingAsk && !explicitDocumentModeProfileAsk) {
+    // A user-created document-grounded custom mode makes uploaded/reference files
+    // the primary source. Do not let generic coding/profile heuristics steal normal
+    // seminar/thesis questions into contracts that forbid reference_files.
+    answerType = 'lecture_answer';
   }
 
   const speakerPerspective = input.speakerPerspective
@@ -2115,7 +2228,7 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     voicePerspective,
     profileContextPolicy,
     resolvedEntity,
-    requiredContextLayers: requiredLayersFor(answerType),
+    requiredContextLayers: requiredLayersFor(answerType, documentGroundedCustomModeActive),
     forbiddenContextLayers: forbiddenLayersFor(answerType),
     responseTemplate: templateFor(answerType),
     maxFirstUsefulTokenMs: latencyMs,
@@ -2127,6 +2240,7 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     confidence: Math.max(input.intentResult?.confidence || input.extractedQuestion?.confidence || 0.7, 0),
     answerStyle: detectAnswerStyle(question).style,
     answerStyleTargetSeconds: detectAnswerStyle(question).targetSeconds,
+    documentGroundedCustomModeActive,
   };
 };
 
@@ -2166,6 +2280,15 @@ export const shouldScaffold = (answerType: AnswerType): boolean =>
 const SCAFFOLDED_PROFILE_TYPES: ReadonlySet<AnswerType> = new Set<AnswerType>([
   'behavioral_interview_answer', 'project_answer', 'jd_fit_answer',
   'gap_analysis_answer', 'negotiation_answer',
+  // Audit 2026-06-16 (H6): simple factual profile questions — "what companies have
+  // you worked at", "how many years of experience", "introduce yourself", "what is
+  // your current role" — were shipping their full template scaffold (STAR / Direct
+  // Answer / Why It Matters …) because they were absent here, so isSpeakableOnlyPlan
+  // returned false and the scaffold rendered verbatim. A factual question must answer
+  // in natural spoken prose, not a story scaffold. Adding them flips on the speakable
+  // rendering directive (headings suppressed; explicit "detailed/bullets/STAR" style
+  // still keeps structure via STRUCTURE_REQUESTING_STYLES below).
+  'experience_answer', 'skill_experience_answer', 'profile_fact_answer', 'identity_answer',
 ]);
 
 // Styles that explicitly request visible structure — sections/bullets stay.
@@ -2209,11 +2332,13 @@ export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationS
         // sales sessions (manual regression 2026-06-12).
         ? 'Speak in the FIRST PERSON as the product\'s seller/representative ("our product", "we"). Never identify as an AI assistant.'
         : 'Answer in a neutral, explanatory voice. Do not roleplay as the candidate.';
-  const policyLine = plan.profileContextPolicy === 'required'
-    ? 'Ground every concrete claim in the provided profile facts. Never invent names, numbers, metrics, companies, or technologies that are not in those facts.'
-    : plan.profileContextPolicy === 'forbidden'
-      ? 'Do NOT use or reference the resume, JD, projects, or any personal profile context. Answer from general knowledge only.'
-      : 'Use profile facts only where directly relevant; never fabricate.';
+  const policyLine = plan.documentGroundedCustomModeActive
+    ? 'Ground every concrete claim in the uploaded/reference files for this custom mode. If the answer is not supported by the uploaded material, say plainly that the requested information is not in the uploaded material. Do not reconstruct it from general knowledge, prior assistant answers, profile, resume, JD, or persona context.'
+    : plan.profileContextPolicy === 'required'
+      ? 'Ground every concrete claim in the provided profile facts. Never invent names, numbers, metrics, companies, or technologies that are not in those facts.'
+      : plan.profileContextPolicy === 'forbidden'
+        ? 'Do NOT use or reference the resume, JD, projects, or any personal profile context. Answer from general knowledge only.'
+        : 'Use profile facts only where directly relevant; never fabricate.';
   const entityLine = plan.resolvedEntity
     ? `\nresolvedEntity: ${plan.resolvedEntity} (answer about THIS project; stay on it)`
     : '';
@@ -2222,6 +2347,21 @@ export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationS
   const styleDirective = plan.answerStyle && plan.answerStyle !== 'default'
     ? `\n\n${detectAnswerStyle(plan.question).directive}`
     : '';
+  // Adaptive LENGTH directive (2026-06-16): for a default-style SPOKEN_SHORT answer, inject a
+  // CONCRETE per-answer word/second target so the model lands in the 15-30s band by question
+  // intent instead of always running ~30s. Only fires for SPOKEN_SHORT with no explicit style
+  // cue — SPOKEN_FULL / STRUCTURED_FULL and explicit styles own their own length, so emit
+  // nothing for them (additive, non-conflicting). Prompt-guidance only; the deterministic
+  // trimmer is unchanged.
+  let lengthDirective = '';
+  if (!plan.answerStyle || plan.answerStyle === 'default') {
+    const tier = classifyTargetSpeakability(plan.answerType, plan.answerStyle, plan.question);
+    if (tier === 'SPOKEN_SHORT') {
+      const band = classifyShortBand(plan.answerType, plan.answerStyle, plan.question);
+      const t = shortBandTargetWords(band);
+      lengthDirective = `\n\nLENGTH: aim for about ${t.seconds}s spoken — roughly ${t.min} to ${t.max} words (${t.guidance}). Use fewer if the question is fully answered in fewer; never pad to reach the number.`;
+    }
+  }
   // Speakable-by-default (manual regression 2026-06-12): scaffolded profile
   // templates become internal thinking structure; the rendered answer is
   // natural prose unless the user explicitly asked for structure.
@@ -2242,6 +2382,6 @@ VOICE: ${voiceLine}
 GROUNDING: ${policyLine}
 
 STRICT RESPONSE TEMPLATE:
-${plan.responseTemplate}${renderingDirective}${styleDirective}${verificationBlock}
+${plan.responseTemplate}${renderingDirective}${styleDirective}${lengthDirective}${verificationBlock}
 </answer_contract>`;
 };

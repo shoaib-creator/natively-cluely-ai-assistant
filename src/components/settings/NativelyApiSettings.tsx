@@ -53,6 +53,7 @@ const PLAN_STANDARD_URL = 'https://checkout.dodopayments.com/buy/pdt_0NbFixGmD8C
 const PLAN_PRO_URL = 'https://checkout.dodopayments.com/buy/pdt_0NcM6Aw0IWdspbsgUeCLA';
 const PLAN_MAX_URL = 'https://checkout.dodopayments.com/buy/pdt_0NcM7JElX4Af6LNVFS1Yf';
 const PLAN_ULTRA_URL = 'https://checkout.dodopayments.com/buy/pdt_0NcM7rC2kAb69TFKsZnUU';
+const MASKED_NATIVELY_KEY = '•'.repeat(24);
 
 const PLANS = [
   {
@@ -370,10 +371,14 @@ function Card({ children, className = '' }: { children: React.ReactNode; classNa
 }
 
 // ─── Component ───────────────────────────────────────────────
-export const NativelyApiSettings: React.FC = () => {
-  const [apiKey, setApiKey] = useState('');
-  const [isSaved, setIsSaved] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+interface NativelyApiSettingsProps {
+  initialIsSaved?: boolean;
+}
+
+export const NativelyApiSettings: React.FC<NativelyApiSettingsProps> = ({ initialIsSaved = false }) => {
+  const [apiKey, setApiKey] = useState(() => (initialIsSaved ? MASKED_NATIVELY_KEY : ''));
+  const [isSaved, setIsSaved] = useState(initialIsSaved);
+  const [isLoading, setIsLoading] = useState(!initialIsSaved);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [justSaved, setJustSaved] = useState(false);
@@ -458,8 +463,13 @@ export const NativelyApiSettings: React.FC = () => {
       try {
         const creds = await window.electronAPI.getStoredCredentials();
         if (creds.hasNativelyKey) {
-          setApiKey('•'.repeat(24));
+          setApiKey(MASKED_NATIVELY_KEY);
           setIsSaved(true);
+        } else {
+          setApiKey('');
+          setIsSaved(false);
+          setUsageData(null);
+          setUsageError(null);
         }
       } catch (e) {
         console.error('[NativelyApi]', e);
@@ -960,14 +970,12 @@ export const NativelyApiSettings: React.FC = () => {
   );
 
   return (
-    <div className="space-y-4 animated fadeIn" data-interface-theme={interfaceTheme}>
+    <div className="space-y-6 animated fadeIn" data-interface-theme={interfaceTheme}>
       {/* ── Page title ───────────────────────────────────── */}
-      <div className="flex items-center justify-between">
+      <header className="flex items-center justify-between">
         <div>
-          <h3 className="text-[15px] font-semibold text-text-primary tracking-[-0.01em]">
-            Natively API
-          </h3>
-          <p className="text-[12px] text-text-tertiary mt-0.5 leading-snug">
+          <h3 className="text-lg font-bold text-text-primary mb-1">Natively API</h3>
+          <p className="text-xs text-text-secondary mb-5">
             Managed transcription, AI &amp; search
           </p>
         </div>
@@ -979,7 +987,7 @@ export const NativelyApiSettings: React.FC = () => {
             </span>
           </div>
         )}
-      </div>
+      </header>
 
       {/* ── Free Trial Modal (post-trial) ─────────────── */}
       {showTrialModal && trialState && (

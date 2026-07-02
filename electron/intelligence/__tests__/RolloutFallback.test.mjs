@@ -10,6 +10,20 @@ import {
 } from '../../../dist-electron/electron/intelligence/intelligenceFlags.js';
 import { LongTermMemoryService } from '../../../dist-electron/electron/intelligence/memory/LongTermMemoryService.js';
 
+const DEFAULT_ON_KEYS = new Set([
+  'meetingSummaryV3',
+  'meetingModeAutoDetect',
+  'followUpDraftV2',
+  'speakerLabelsV1',
+  'meetingSummaryLlmPolish',
+  // Safety isolation gates default ON. okf*/okfProfile* dev/test-default flags
+  // resolve to isInternalDevTestContext() = FALSE under this bare node harness.
+  'docGroundedStrictIsolation',
+  'docGroundedFalseRefusalRepair',
+]);
+
+const expectedDefault = (key) => DEFAULT_ON_KEYS.has(key) ? true : false;
+
 const FLAG_ENV = {
   intelligenceOsEnabled: 'NATIVELY_INTELLIGENCE_OS',
   profileTreeV2: 'NATIVELY_PROFILE_TREE_V2',
@@ -29,8 +43,24 @@ const FLAG_ENV = {
   durableMemoryWindow: 'NATIVELY_DURABLE_MEMORY_WINDOW',
 };
 
+const EXTRA_FLAG_ENV = [
+  'NATIVELY_MEETING_SUMMARY_V3',
+  'NATIVELY_MEETING_MODE_AUTODETECT',
+  'NATIVELY_FOLLOWUP_DRAFT_V2',
+  'NATIVELY_SPEAKER_LABELS_V1',
+  'NATIVELY_MEETING_NOTES_STRUCTURED_OUTPUT',
+  'NATIVELY_MEETING_SUMMARY_LLM_POLISH',
+  'NATIVELY_SPEAKER_DIARIZATION_V1',
+  'NATIVELY_RAG_CONFIDENCE_GATE', 'NATIVELY_RAG_LOCAL_RERANK', 'NATIVELY_RAG_RRF_FUSION', 'NATIVELY_RAG_SPECULATIVE_RERANK',
+  'NATIVELY_OKF_KNOWLEDGE_PACKS', 'NATIVELY_OKF_MARKDOWN_EXPORT', 'NATIVELY_OKF_HYBRID_RETRIEVAL',
+  'NATIVELY_OKF_GRAPH_EXPANSION', 'NATIVELY_OKF_KNOWLEDGE_UI', 'NATIVELY_OKF_USER_EDITABLE_CARDS',
+  'NATIVELY_OKF_PROFILE_PACKS', 'NATIVELY_OKF_PROFILE_HYBRID_RETRIEVAL', 'NATIVELY_OKF_PROFILE_MARKDOWN_EXPORT',
+  'NATIVELY_OKF_PROFILE_GRAPH_EXPANSION', 'NATIVELY_OKF_PROFILE_KNOWLEDGE_UI',
+  'NATIVELY_DOC_GROUNDED_STRICT_ISOLATION', 'NATIVELY_DOC_GROUNDED_FALSE_REFUSAL_REPAIR',
+];
+
 function clearAll() {
-  for (const env of Object.values(FLAG_ENV)) delete process.env[env];
+  for (const env of [...Object.values(FLAG_ENV), ...EXTRA_FLAG_ENV]) delete process.env[env];
   __resetIntelligenceFlagsCache();
 }
 
@@ -38,10 +68,10 @@ describe('Rollout — disabled mode (default = old behavior)', () => {
   beforeEach(clearAll);
   afterEach(clearAll);
 
-  test('ALL Intelligence OS flags default OFF', () => {
+  test('all rollout flags resolve to their documented defaults', () => {
     const snap = intelligenceFlagSnapshot();
     for (const [key, val] of Object.entries(snap)) {
-      assert.equal(val, false, `flag ${key} must default OFF for safe rollout`);
+      assert.equal(val, expectedDefault(key), `flag ${key} default mismatch`);
     }
   });
 

@@ -8,6 +8,10 @@ import { isVerboseLogging } from './verboseLog';
 export interface TranscriptSegment {
     marker?: string;
     speaker: string;
+    // Optional canonical speaker id from provider diarization (e.g. "speaker_2"). Only set on
+    // the remote/system channel when diarization is enabled; the mic channel is always "me".
+    // Additive — summary normalization reads it when present, everything else ignores it.
+    speakerId?: string;
     text: string;
     timestamp: number;
     final: boolean;
@@ -512,6 +516,27 @@ export class SessionTracker {
         return this.fullUsage;
     }
 
+    getRecentManualTurn(maxAgeMs: number = 5 * 60 * 1000): { question: string; answer: string; timestamp: number } | null {
+        // Usage entries are appended chronologically by current callers; if a future
+        // restore/replay path pushes out-of-order entries, sort by timestamp here.
+        const cutoff = Date.now() - maxAgeMs;
+        for (let i = this.fullUsage.length - 1; i >= 0; i--) {
+            const entry = this.fullUsage[i];
+            if (!entry || entry.timestamp < cutoff) continue;
+            if (entry.type !== 'chat') continue;
+            if (entry.source !== 'manual_chat') continue;
+            if (entry.synthetic === true) continue;
+
+            const question = typeof entry.question === 'string' ? entry.question.trim() : '';
+            const answer = typeof entry.answer === 'string' ? entry.answer.trim() : '';
+            if (!question || !answer) continue;
+            if (question === 'Clarify Question' || question === 'Recap Meeting') continue;
+
+            return { question, answer, timestamp: entry.timestamp };
+        }
+        return null;
+    }
+
     getSessionStartTime(): number {
         return this.sessionStartTime;
     }
@@ -537,8 +562,10 @@ export class SessionTracker {
             type,
             timestamp: Date.now(),
             question,
-            answer
+            answer,
+            source: type === 'chat' ? 'manual_chat' : 'external',
         });
+        this.capUsageArray();
     }
 
     pushUsage(entry: any): void {

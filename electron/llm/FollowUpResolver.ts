@@ -50,6 +50,18 @@ const NONE: ResolvedFollowUp = { resolvedQuestion: '', confidence: 0, reason: 'n
 /** Pure bare-follow-up fragments that carry no standalone meaning. */
 const BARE_FOLLOWUP_RE = /^(?:ok(?:ay)?,?\s*|so,?\s*|hmm,?\s*|right,?\s*|well,?\s*|and,?\s*|but,?\s*)*(?:why|why not|how so|how come|how|and|and\?|so|that|this|it|what about (?:it|that|this)|what about|continue|go on|carry on|keep going|tell me more|more|explain|expand|elaborate|can you (?:expand|elaborate|explain|go on)|go deeper|in more detail|then\??)[\s?.!]*$/i;
 
+/**
+ * Short "addend" phrases that request an enhancement to the prior answer — a code
+ * example, a diagram, an analogy — rather than asking a new standalone question.
+ * E.g. "with code?", "with a code example?", "with an example?", "show code?",
+ * "include code?", "can you add code?", "with code please". These carry zero
+ * standalone meaning and MUST be resolved against the prior answer in context.
+ *
+ * Guard: no stronger standalone cue ("write", "implement", "solve", etc.) so a
+ * genuine "write code for X" does not accidentally match.
+ */
+const ADDEND_RE = /^(?:with|show|include|add|using|also\s+(?:show|add|include))\b[^.?!]{0,40}?\b(?:code(?:\s+(?:example|snippet|sample|for\s+that|for\s+it|please|too))?|example|snippet|an?\s+example|a\s+(?:code\s+)?(?:example|snippet))\s*[?.!]?\s*$/i;
+
 export type FollowUpSurface = 'manual' | 'what_to_answer' | 'meeting' | 'lecture' | 'interview' | 'sales' | 'coding';
 
 /**
@@ -62,7 +74,68 @@ export function isBareFollowUp(question: string): boolean {
   if (!q) return false;
   const words = q.replace(/[?.!,]/g, '').split(/\s+/).filter(Boolean);
   if (words.length > 6) return false; // a real, self-contained question
-  return BARE_FOLLOWUP_RE.test(q);
+  return BARE_FOLLOWUP_RE.test(q) || ADDEND_RE.test(q);
+}
+
+// ── Refinement / editing follow-ups (task Phase 8, bug #3) ──────────────────────
+// "make that shorter", "make it more confident", "remove the exaggeration", "give me
+// the final spoken version", "shorten it", "rewrite that", "say it differently". These
+// carry CONTENT WORDS (so they are NOT bare) but they OPERATE ON the prior answer — they
+// make no sense without it. The manual path previously only injected conversation memory
+// for BARE follow-ups, so these refinements dumped a fresh full answer (the real bug:
+// "make that shorter" re-listed the whole profile). This detector lets the caller pull
+// the prior turn for them too.
+//
+// Two shapes:
+//  (a) "<edit verb> it/that/this …"  — operate on the referenced prior answer.
+//  (b) a known standalone refinement ("shorten it", "the final version", "more confident").
+const EDIT_VERB = '(?:make|keep|shorten|lengthen|expand|trim|cut|condense|tighten|rewrite|reword|rephrase|redo|simplify|soften|punch up|polish|clean up|fix|improve|remove|drop|delete|add|emphasi[sz]e|change|adjust|tweak|reduce|summari[sz]e|say|phrase|give me|turn (?:it|that|this) into)';
+const REFINEMENT_RE = new RegExp(
+  // (a) edit verb anywhere, with an "it/that/this/the <noun>" object or a comparative.
+  `^(?:ok(?:ay)?,?\\s*|so,?\\s*|and,?\\s*|now,?\\s*|also,?\\s*)*${EDIT_VERB}\\b`,
+  'i',
+);
+// Comparative/qualitative refinements that imply "than the prior answer".
+const REFINEMENT_COMPARATIVE_RE = /\b(shorter|longer|briefer|tighter|punchier|simpler|clearer|more\s+\w+|less\s+\w+|the\s+(?:final|spoken|short|long|concise|polished|natural)\s+version|in\s+(?:one|two|three)\s+(?:line|lines|sentence|sentences)|as\s+bullets?|spoken version|final version)\b/i;
+// Must reference the PRIOR ANSWER — a demonstrative pronoun, OR "the <answer-noun>" from a
+// small allowlist of things an answer IS (NOT a generic "the <any noun>", which would treat
+// a brand-new imperative like "add caching to the payment service" or "fix the bug in the
+// auth handler" as a refinement — code-review HIGH 2026-06-15). A comparative edit also
+// qualifies (it inherently means "vs the previous answer").
+const PRIOR_PRONOUN_RE = /\b(it|that|this|those|them)\b/i;
+const PRIOR_NOUN_RE = /\bthe\s+(answer|response|reply|intro|introduction|version|wording|phrasing|tone|exaggeration|claim|sentence|paragraph|opening|closing|ending|last\s+(?:line|part|bit|sentence)|first\s+(?:line|part|bit|sentence)|part|bit|pitch|summary|bullet|bullets|list|story|hook|point|points|wording)\b/i;
+const refersPrior = (q: string): boolean => PRIOR_PRONOUN_RE.test(q) || PRIOR_NOUN_RE.test(q);
+
+/**
+ * Is `question` a REFINEMENT/editing follow-up that operates on the prior answer
+ * ("make that shorter", "remove the exaggeration", "give me the final spoken version")?
+ * SHAPE test only (the caller confirms a prior turn exists). Bounded to short messages
+ * so a long, self-contained instruction is never mistaken for a refinement.
+ */
+export function isRefinementFollowUp(question: string): boolean {
+  const q = lc(question);
+  if (!q) return false;
+  const words = q.replace(/[?.!,]/g, '').split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 9) return false;
+  const hasEditVerb = REFINEMENT_RE.test(q);
+  const hasComparative = REFINEMENT_COMPARATIVE_RE.test(q);
+  // A refinement is: an edit verb that refers to the prior answer, OR a comparative/
+  // version request (which inherently means "vs the previous answer").
+  if (hasEditVerb && (refersPrior(q) || hasComparative)) return true;
+  if (hasComparative && refersPrior(q)) return true;
+  // Standalone comparative with no object but clearly relative ("shorter please",
+  // "more confident", "the final version").
+  if (hasComparative && words.length <= 5) return true;
+  return false;
+}
+
+/**
+ * A follow-up that should resolve against this session's prior turn — either a bare
+ * fragment ("why?", "continue") OR a refinement/edit ("make that shorter"). Convenience
+ * union for the manual conversation-memory gate.
+ */
+export function isSameSessionFollowUp(question: string): boolean {
+  return isBareFollowUp(question) || isRefinementFollowUp(question);
 }
 
 /**

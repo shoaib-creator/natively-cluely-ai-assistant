@@ -360,5 +360,31 @@ benchmarks/
 _external_research/
 
 # Filled-in credentials intake (never commit real values)
-docs/CREDENTIALS-INTAKE.local.md
 CREDENTIALS-INTAKE.local.md
+
+# Local sprint reports / scratch notes / leaked-prompt reference (not vendored)
+NATIVELY_*_REPORT.md
+CORE_PIPELINE_AUDIT_REPORT.md
+reportforgpt.md
+PHASE_STATUS.md
+meetily.md
+testengineer.prompt
+cluely/
+docs/
+
+# Large model binary files
+*.onnx
+*.onnx_data
+
+# Round-7 cleanup (2026-07-01, hardened after senior review): large
+# reference PDFs and debug artifacts should NEVER be committed. Keep
+# patterns narrow — broad patterns like `Sample*.pdf` and `*thesis*.pdf`
+# would silently ignore legitimate PDFs (invoices, resumes, etc.). Use
+# the exact filename + the debug-artifacts directory + a single specific
+# pattern for the `Sample thesis for testing.pdf` filename family.
+debug-artifacts/
+Sample thesis for testing.pdf
+"Sample thesis for testing.pdf"
+
+# Live-smoke harness scratch dir (created at runtime by scripts/smoke-document-grounded.js)
+/.smoke-sandbox/
