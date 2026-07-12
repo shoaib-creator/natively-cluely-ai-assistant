@@ -372,20 +372,87 @@ export class WindowHelper {
 
     this.launcherWindow.setContentProtection(this.contentProtection);
 
+    // TEMPORARY LEAK-DIAGNOSIS (2026-07-10): NATIVELY_NOFX=1 appends ?nofx=1 to
+    // the launcher URL, which disables all backdrop-filter/blur effects (see
+    // src/App.tsx + src/index.css). Used to test whether the Windows native-RSS
+    // leak is the CPU-composited blur raster-tile path. Remove after fix.
+    const nofxSuffix = process.env.NATIVELY_NOFX === '1' ? '&nofx=1' : '';
+    if (nofxSuffix) console.warn('[LeakTest] NATIVELY_NOFX=1 → loading launcher with ?nofx=1 (blur effects OFF)');
+
+    // A/B KILL-SWITCH (2026-07-10): NATIVELY_DISABLE_ONBOARDING_ORCH=1 appends
+    // ?noorch=1, which makes App.tsx skip orch.start() entirely (no drain loop,
+    // no onboarding toasters). The onboarding orchestrator's drain loop was
+    // bisected to the 2026-07-04 native-memory-leak regression; this switch lets
+    // the same build be run with the orchestrator ON vs OFF to confirm the leak
+    // source in the field. The loop is now setTimeout-based (fixed), so this is
+    // a confirmation/rollback lever, not the fix itself.
+    const noOrchSuffix = process.env.NATIVELY_DISABLE_ONBOARDING_ORCH === '1' ? '&noorch=1' : '';
+    if (noOrchSuffix) console.warn('[LeakTest] NATIVELY_DISABLE_ONBOARDING_ORCH=1 → launcher with ?noorch=1 (onboarding orchestrator OFF)');
+
+    const launcherUrl = `${startUrl}?window=launcher${nofxSuffix}${noOrchSuffix}`;
+
     this.launcherWindow
-      .loadURL(`${startUrl}?window=launcher`)
+      .loadURL(launcherUrl)
       .then(() => console.log('[WindowHelper] loadURL success'))
       .catch((e) => {
         console.error('[WindowHelper] Failed to load URL:', e);
       });
 
-    this.launcherWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    let launcherLoadRetries = 0;
+    const MAX_LAUNCHER_LOAD_RETRIES = 10;
+    this.launcherWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
       console.error(`[WindowHelper] did-fail-load: ${errorCode} ${errorDescription}`);
+      // DEV SELF-HEAL (2026-07-10): in dev, the renderer loads from the Vite
+      // server at http://localhost:5180. If that server is momentarily
+      // unavailable (a slow first `npm start`, an HMR reconnect, or a stale
+      // server from a prior run being replaced), the load fails and — with no
+      // retry — the window stays permanently black (its native backgroundColor).
+      // That is the "loads fine the first time, then stuck at the logo/black
+      // screen on subsequent launches" symptom on Windows dev. A bounded retry
+      // converts "permanent black" into "black for ~1s, then loads."
+      //
+      // errorCode -3 = ERR_ABORTED (a superseded/intentional nav — do NOT retry).
+      if (isDev && errorCode !== -3 && launcherLoadRetries < MAX_LAUNCHER_LOAD_RETRIES) {
+        launcherLoadRetries += 1;
+        console.warn(`[WindowHelper] dev: retrying launcher load (${launcherLoadRetries}/${MAX_LAUNCHER_LOAD_RETRIES}) in 1s…`);
+        setTimeout(() => {
+          if (this.launcherWindow && !this.launcherWindow.isDestroyed()) {
+            this.launcherWindow.loadURL(launcherUrl).catch(() => { /* next did-fail-load retries */ });
+          }
+        }, 1000);
+      }
     });
 
-    // if (isDev) {
-    //   this.launcherWindow.webContents.openDevTools({ mode: 'detach' }); // DEBUG: Open DevTools
-    // }
+    // Reset the retry counter once a load actually succeeds, so a LATER
+    // transient failure (e.g. an HMR blip mid-session) gets its own fresh
+    // retry budget instead of being starved by earlier retries.
+    this.launcherWindow.webContents.on('did-finish-load', () => {
+      launcherLoadRetries = 0;
+    });
+
+    // Pipe renderer-side diagnostics into the main-process log file. Without
+    // this, a "stuck at logo" hang or a renderer crash leaves NO trace in
+    // ~/Documents/natively_debug.log — the renderer's console, uncaught JS
+    // errors, crashes, and hangs are otherwise invisible to us. This is the
+    // difference between "the app is stuck and we can't tell why" and a log
+    // line naming the exact failing module/line on the user's machine.
+    this.attachRendererDiagnostics(this.launcherWindow, 'launcher');
+
+    // DIAGNOSTIC (2026-07-11): NATIVELY_OPEN_DEVTOOLS=1 force-opens the launcher
+    // DevTools DETACHED (survives a renderer hang, unlike an in-window panel).
+    // For debugging the "window appears then freezes / renderer not responsive"
+    // report: open the Performance tab and record during the freeze — a single
+    // long yellow Scripting block = a JS main-thread loop; a flat gap with no JS
+    // = a compositor/GPU stall (the software-compositing blur path). Detached so
+    // it stays usable even when the launcher renderer stops pumping its loop.
+    if (process.env.NATIVELY_OPEN_DEVTOOLS === '1') {
+      try {
+        this.launcherWindow.webContents.openDevTools({ mode: 'detach' });
+        console.warn('[Diag] NATIVELY_OPEN_DEVTOOLS=1 → launcher DevTools opened (detached)');
+      } catch (e: any) {
+        console.warn('[Diag] openDevTools failed:', e?.message || e);
+      }
+    }
 
     // --- 2. Create Overlay Window (Hidden initially) ---
     // Always start centered on the primary display so the OS (macOS NSUserDefaults /
@@ -503,6 +570,8 @@ export class WindowHelper {
       console.error('[WindowHelper] Failed to load Overlay URL:', e);
     });
 
+    this.attachRendererDiagnostics(this.overlayWindow, 'overlay');
+
     // --- 3. Startup Sequence ---
     this.launcherWindow.once('ready-to-show', () => {
       this.switchToLauncher();
@@ -510,6 +579,76 @@ export class WindowHelper {
     });
 
     this.setupWindowListeners();
+  }
+
+  /**
+   * Route a window's renderer-side diagnostics into the main-process log so a
+   * "stuck at logo" hang or a renderer crash is diagnosable from
+   * ~/Documents/natively_debug.log alone — no DevTools, no remote debugging.
+   *
+   * Captures, per window:
+   *   - console-message      → renderer console output (React errors, warnings,
+   *                            our own console.error from ErrorBoundary etc.).
+   *                            Levels: 0=verbose 1=info 2=warning 3=error; we
+   *                            only forward warning+error to keep the log lean.
+   *   - render-process-gone  → the actual CRASH signal (SIGSEGV/OOM/killed).
+   *                            Names the reason + exitCode — this is what tells
+   *                            us "the renderer died" vs "the renderer hung".
+   *   - unresponsive         → the HANG signal ("stuck at logo"): the renderer
+   *                            stopped pumping its event loop. Paired with
+   *                            'responsive' so we can see if it recovered.
+   *   - did-finish-load / dom-ready → positive proof the React bundle actually
+   *                            evaluated (the log previously had no such marker,
+   *                            so we couldn't tell mount-failure from hang).
+   *   - preload-error        → a throw inside preload.js (would leave the
+   *                            renderer with no window.electronAPI → white/stuck
+   *                            screen with no other trace).
+   */
+  private attachRendererDiagnostics(win: BrowserWindow, tag: string): void {
+    try {
+      const wc = win.webContents;
+
+      wc.on('did-finish-load', () => {
+        console.log(`[Renderer:${tag}] did-finish-load (bundle evaluated)`);
+      });
+
+      wc.on('dom-ready', () => {
+        console.log(`[Renderer:${tag}] dom-ready`);
+      });
+
+      wc.on('console-message', (_event, level, message, line, sourceId) => {
+        // 0=verbose 1=info 2=warning 3=error. Only surface warning+ to avoid
+        // flooding the log with routine info/verbose renderer chatter.
+        if (level < 2) return;
+        const label = level === 3 ? 'ERROR' : 'WARN';
+        // sourceId can be a long file:// path; keep only the tail for readability.
+        const src = typeof sourceId === 'string' ? sourceId.split('/').pop() : sourceId;
+        console.error(`[Renderer:${tag}] console.${label} ${message} (${src}:${line})`);
+      });
+
+      wc.on('render-process-gone', (_event, details) => {
+        console.error(
+          `[Renderer:${tag}] RENDER-PROCESS-GONE reason=${details?.reason} exitCode=${details?.exitCode}`,
+        );
+      });
+
+      wc.on('preload-error', (_event, preloadPath, error) => {
+        console.error(
+          `[Renderer:${tag}] PRELOAD-ERROR in ${preloadPath}: ${error?.stack || error?.message || String(error)}`,
+        );
+      });
+
+      win.on('unresponsive', () => {
+        console.error(`[Renderer:${tag}] UNRESPONSIVE — renderer stopped pumping its event loop (hang / "stuck at logo")`);
+      });
+
+      win.on('responsive', () => {
+        console.log(`[Renderer:${tag}] responsive again (recovered from hang)`);
+      });
+    } catch (e) {
+      // Diagnostics attachment must never break window creation.
+      console.warn(`[WindowHelper] attachRendererDiagnostics(${tag}) failed (non-fatal):`, e);
+    }
   }
 
   private setupWindowListeners(): void {
@@ -541,8 +680,22 @@ export class WindowHelper {
 
     // On Windows/Linux: intercept close and hide to tray instead of quitting,
     // unless the app is actually quitting (e.g. from tray "Quit" menu).
+    //
+    // DEV EXCEPTION (2026-07-10): in dev, hide-to-tray leaves a headless
+    // electron process alive after you close the window. When you then Ctrl+C
+    // the `npm start` terminal, Windows does not reliably deliver SIGINT/SIGTERM
+    // to that GUI process, so it survives as a ZOMBIE holding the single-instance
+    // lock, port 5180, and open natively.db-wal/-shm handles. The NEXT `npm start`
+    // then either self-exits on the lost lock or loads a dead dev server →
+    // "loads once, then stuck at logo/black forever." In dev we therefore let a
+    // window close actually quit the app, so no zombie survives between runs.
     if (process.platform !== 'darwin') {
       this.launcherWindow.on('close', (e) => {
+        if (isDev) {
+          // Let the close proceed and quit — no hide-to-tray in dev.
+          this.appState.setQuitting(true);
+          return;
+        }
         if (!this.appState.isQuitting()) {
           e.preventDefault();
           this.launcherWindow?.hide();
@@ -949,6 +1102,28 @@ export class WindowHelper {
     // Hide Overlay SECOND
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
       this.overlayWindow.hide();
+    }
+
+    // ─── RE-ASSERT STEALTH AFTER THE ACTIVATING SHOW ───────────────────────
+    // The launcher is a REGULAR macOS window (no `type: 'panel'`, no
+    // skipTaskbar). show()+focus() above re-activates the app as a foreground
+    // app, which on macOS re-registers it and REVEALS the dock tile that
+    // app.dock.hide() had suppressed — silently breaking undetectable mode.
+    // This is the root cause of "the Natively icon appears in the dock after
+    // Stop meeting" (endMeeting swaps overlay→launcher via this method). It is
+    // intermittent because macOS coalesces/drops activation-policy changes.
+    //
+    // Fix it HERE — at the single choke point every launcher show funnels
+    // through (Stop meeting, screenshot restore, cold-start convergence) — so no
+    // caller can leak the tile. reassertUndetectableStealth() no-ops unless we
+    // are on darwin AND currently undetectable, and drives the dock back to
+    // hidden through the self-verifying _enforceDockState() loop (polls the OS
+    // ground truth app.dock.isVisible() and retries until it sticks), so a
+    // dropped or late dock op cannot defeat it. `inactive` shows (showInactive,
+    // no focus) don't foreground the app, but we re-assert anyway: it's cheap,
+    // idempotent, and guards against macOS revealing the tile on a bare show.
+    if (process.platform === 'darwin' && this.appState.getUndetectable()) {
+      this.appState.reassertUndetectableStealth();
     }
   }
 

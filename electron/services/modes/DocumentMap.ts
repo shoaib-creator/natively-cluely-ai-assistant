@@ -233,6 +233,94 @@ export function buildDocumentMap(content: string): DocumentMap {
  * exact bug that let production keep serving ToC fragments while the lexical
  * path was fixed.
  */
+/**
+ * Detect delimited tabular data (CSV/TSV) and chunk it BY ROWS with the header
+ * repeated on every chunk. Prose chunkers destroy tables: a CSV has no sentence
+ * punctuation, so it collapses into a couple of giant blobs where rows lose their
+ * column meaning (the header is only in the first chunk), and the model fabricates
+ * values instead of reading them. Row-aware chunks keep whole rows intact and give
+ * each chunk its own `header + N rows`, so a query for one entity retrieves that
+ * entity's row with its columns labelled. Returns null when the text is not a
+ * consistent delimited table.
+ */
+export function tabularChunks(content: string, rowsPerChunk?: number): string[] | null {
+    const lines = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    if (lines.length < 3) return null; // need a header + at least a couple rows
+    // Pick the delimiter from the header: comma or tab, whichever splits into >=2
+    // columns consistently across the sampled rows.
+    const header = lines[0];
+    const delim = header.includes('\t') && !header.includes(',') ? '\t' : ',';
+    const cols = header.split(delim).length;
+    if (cols < 2) return null;
+    // Require the majority of sampled rows to have the same column count — this
+    // distinguishes a real table from prose that happens to contain commas.
+    const sample = lines.slice(1, Math.min(lines.length, 60));
+    const consistent = sample.filter((l) => Math.abs(l.split(delim).length - cols) <= 1).length;
+    if (consistent < sample.length * 0.8) return null;
+
+    const headerLine = header.trim();
+    const rows = lines.slice(1);
+    // ADAPTIVE granularity: small tables get SMALL chunks (finer granularity → each
+    // chunk's embedding is specific to a few entities, so a query for one entity —
+    // "United States population" — ranks that entity's chunk highly). Large tables
+    // grow rows-per-chunk to stay under MAX_TABLE_CHUNKS (index memory/OOM bound).
+    // Every chunk repeats the header so rows stay labelled + findable.
+    const MAX_TABLE_CHUNKS = Number(process.env.NATIVELY_MAX_TABLE_CHUNKS) || 120;
+    const MIN_ROWS = Number(process.env.NATIVELY_TABLE_MIN_ROWS_PER_CHUNK) || 10;
+    // Base target: ~10 rows/chunk for finer specific-entity recall; but never so many
+    // chunks that a large table blows the cap.
+    const base = rowsPerChunk ?? MIN_ROWS;
+    const effRows = Math.max(base, Math.ceil(rows.length / MAX_TABLE_CHUNKS));
+    const chunks: string[] = [];
+    for (let i = 0; i < rows.length; i += effRows) {
+        const slice = rows.slice(i, i + effRows);
+        // Repeat the header on every chunk so column semantics travel with the rows.
+        chunks.push(`[Table rows ${i + 1}-${i + slice.length}]\n${headerLine}\n${slice.join('\n')}`);
+    }
+    return chunks.length > 0 ? chunks : null;
+}
+
+/**
+ * Split text into sentences, then pack WHOLE sentences into ~targetWords windows
+ * with a sentence-boundary overlap. Guarantees a clause — e.g. "Implementations
+ * MUST NOT add a byte order mark…" — is never cut across a chunk boundary (which
+ * dropped "MUST NOT" from the chunk carrying "byte order mark"). A single sentence
+ * longer than targetWords is emitted whole. Progress is always forced (no
+ * re-evaluation loop) so it can't infinite-loop when overlap >= target.
+ */
+export function sentenceAwareWindows(text: string, targetWords: number, overlapWords: number): string[] {
+    const clean = text.replace(/\s+/g, ' ').trim();
+    if (!clean) return [];
+    const wordCount = (s: string) => (s.match(/\S+/g) || []).length;
+    if (wordCount(clean) <= targetWords) return [clean];
+    const sentences: string[] = [];
+    for (const part of clean.split(/(?<=[.!?][")\]]?)\s+(?=[A-Z0-9"[(])/)) {
+        const p = part.trim();
+        if (p) sentences.push(p);
+    }
+    if (sentences.length <= 1) return [clean];
+    const windows: string[] = [];
+    let cur: string[] = [];
+    let curWords = 0;
+    for (let i = 0; i < sentences.length; i++) {
+        const s = sentences[i];
+        const sw = wordCount(s);
+        if (cur.length > 0 && curWords + sw > targetWords) {
+            windows.push(cur.join(' '));
+            const overlap: string[] = [];
+            let ow = 0;
+            for (let j = cur.length - 1; j >= 0 && ow < overlapWords; j--) { overlap.unshift(cur[j]); ow += wordCount(cur[j]); }
+            cur = overlap;
+            curWords = ow;
+        }
+        cur.push(s);
+        curWords += sw;
+        if (curWords >= targetWords) { windows.push(cur.join(' ')); cur = []; curWords = 0; }
+    }
+    if (cur.length > 0) windows.push(cur.join(' '));
+    return windows.filter((w, idx) => idx === 0 || w !== windows[idx - 1]);
+}
+
 export function sectionAwareChunksFromMap(
     map: DocumentMap,
     chunkWords: number,
@@ -254,12 +342,8 @@ export function sectionAwareChunksFromMap(
             chunks.push(`${headingLine}\n${body}`);
             continue;
         }
-        const step = Math.max(1, chunkWords - chunkOverlap);
-        for (let i = 0; i < words.length; i += step) {
-            const window = words.slice(i, i + chunkWords);
-            if (window.length === 0) break;
-            chunks.push(`${headingLine}\n${window.join(' ')}`);
-            if (i + chunkWords >= words.length) break;
+        for (const window of sentenceAwareWindows(body, chunkWords, chunkOverlap)) {
+            chunks.push(`${headingLine}\n${window}`);
         }
     }
     return chunks.length > 0 ? chunks : null;

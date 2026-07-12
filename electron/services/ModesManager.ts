@@ -5,6 +5,7 @@ import { ModeContextRetriever, type ModeRetrievalOptions } from './ModeContextRe
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
 import { classifyCustomContext, selectCustomContextForAnswer } from '../llm/customContextClassifier';
+import { diagLog } from '../llm/documentGroundedPrompt';
 
 /**
  * Drop sensitive (salary/pricing/strategy) chunks from a raw customContext blob
@@ -205,7 +206,17 @@ export function encodeModeContextPayload(value: unknown): string {
 const OKF_BACKGROUND_INDEX_THRESHOLD_CHARS = 300_000;
 
 const DOCUMENT_SOURCE_RE = /\b(uploaded|attached|provided|reference|source material|course material|seminar material|lecture material|presentation|slides?|deck|papers?|pdfs?|files?|documents?|docs?|notes?|attached material|uploaded content|provided material)\b/i;
-const DOCUMENT_CONSTRAINT_RE = /\b(source[-\s]?of[-\s]?truth|from the files?|from the documents?|from the uploaded|answer(?:s|ing)?\s+from\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?)|based on (?:uploaded|provided|attached|the\s+(?:uploaded|attached|provided|reference)|my\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation))|use only|only use|rely only|use\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation)|(?:stick to|restrict to|limit to|draw from)\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation|material)|do not use knowledge outside|(?:don['’]?t|do not)\s+(?:use|rely on|draw on)\s+(?:anything\s+)?(?:outside|beyond|other than)|ground(?:ed)? (?:your )?answers? in|ground(?:ed)? in)\b/i;
+// Broadened 2026-07-05 (code-review audit) after confirming false negatives on
+// realistic, clearly-grounded user phrasings: "Please only answer based on the
+// PDF I uploaded" (based-on...I-uploaded word order), "Stick strictly to the
+// material in the file" ("stick to" not immediately adjacent to "the X"),
+// "Only reference what is in the notes, do not add anything not written there"
+// (no exact-phrase match), "always check the file first before answering" (a
+// very common plain-English grounding instruction with no prior alternative
+// at all). Each addition below is anchored to an explicit source noun so it
+// still requires unambiguous document-grounding intent, not just any
+// restrictive-sounding sentence.
+const DOCUMENT_CONSTRAINT_RE = /\b(source[-\s]?of[-\s]?truth|from the files?|from the documents?|from the uploaded|answer(?:s|ing)?\s+from\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?)|based on (?:uploaded|provided|attached|the\s+(?:uploaded|attached|provided|reference)|my\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation))|based on the [a-z]+ i(?:'ve| have)?\s+(?:uploaded|attached|provided|shared|given)|use only|only use|only reference|only rely|rely only|use\s+the\s+(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation)|(?:stick to|restrict to|limit to|draw from)(?:\s+\w+){0,2}\s+(?:the\s+)?(?:uploaded|attached|provided|reference|files?|documents?|docs?|notes?|papers?|slides?|presentation|material)|(?:material|content|info(?:rmation)?)\s+in\s+the\s+(?:file|document|pdf|notes?|slides?|presentation)|do not use knowledge outside|(?:don['’]?t|do not)\s+(?:use|rely on|draw on|add)\s+(?:anything\s+)?(?:outside|beyond|other than|not\s+(?:written|mentioned|present|found)\s+(?:there|in))|ground(?:ed)? (?:your )?answers? in|ground(?:ed)? in|(?:check|read|refer to|consult|verify|look at)\s+the\s+(?:file|document|pdf|notes?|slides?|presentation|material)\s+(?:first|before))\b/i;
 
 export interface ActiveModeDocumentGroundingInfo {
     isCustom: boolean;
@@ -679,13 +690,50 @@ export class ModesManager {
         // first LIVE transcript turn never pays the cold-load cost inside its
         // retrieval budget. Only when the reranker is actually enabled — never
         // load a model nobody will use. Fire-and-forget, best-effort.
+        //
+        // Lazy download (2026-07-06): if the model isn't on disk yet, trigger
+        // a background download via LocalModelDownloadService. The download is
+        // idempotent — a parallel request from another mode activation just
+        // attaches to the same in-flight download. When it completes,
+        // prewarm() is fired so the reranker activates without the user
+        // having to reload the mode.
         try {
             // eslint-disable-next-line @typescript-eslint/no-var-requires
             const { isRagLocalRerankEnabled } = require('../intelligence/intelligenceFlags');
             if (files.length > 0 && isRagLocalRerankEnabled()) {
                 // eslint-disable-next-line @typescript-eslint/no-var-requires
                 const { getLocalReranker } = require('../rag/LocalReranker');
-                void getLocalReranker().prewarm?.();
+                const reranker = getLocalReranker();
+                void (async () => {
+                    try {
+                        const cached = await reranker.isCached();
+                        if (cached) {
+                            void reranker.prewarm?.();
+                            return;
+                        }
+                        // Not cached — kick off a background download. The
+                        // download service handles progress + persistence; we
+                        // just attach a one-shot prewarm on completion.
+                        try {
+                            // eslint-disable-next-line @typescript-eslint/no-var-requires
+                            const { LocalModelDownloadService } = require('./LocalModelDownloadService');
+                            // eslint-disable-next-line @typescript-eslint/no-var-requires
+                            const { RERANKER_PROVIDER_NAME } = require('../rag/rerankerDownloadProvider');
+                            // eslint-disable-next-line @typescript-eslint/no-var-requires
+                            const { RERANKER_MODEL_ID, RERANKER_DTYPE } = require('../rag/rerankerDownloadProvider');
+                            void LocalModelDownloadService.getInstance().start(
+                                RERANKER_PROVIDER_NAME,
+                                `${RERANKER_MODEL_ID}#${RERANKER_DTYPE}`,
+                            );
+                        } catch {
+                            // Service unavailable or download failed — fall
+                            // back to the old prewarm path. If the model is
+                            // not on disk, prewarm will fail silently and the
+                            // reranker will return null on first query.
+                            void reranker.prewarm?.();
+                        }
+                    } catch { /* prewarm-or-download both non-fatal */ }
+                })();
             }
         } catch { /* non-fatal — prewarm is an optimization, not a requirement */ }
     }
@@ -918,8 +966,38 @@ export class ModesManager {
         const custom = isCustomMode(mode);
         const hasReferenceFiles = files.some(file => file.content.trim());
         const hasCustomPrompt = mode.customContext.trim().length > 0;
-        const documentGrounded = custom && hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
-        const documentGroundedCustomModeActive = custom && hasCustomPrompt && documentGrounded && hasReferenceFiles;
+        // A mode is "document-grounded" if it has reference files AND a custom
+        // prompt that declares source-of-truth on the uploaded material. We
+        // intentionally do NOT gate this on `custom` (= templateType === 'general'
+        // && name !== 'General') because users legitimately create deeply
+        // document-grounded prompts for built-in templates (e.g. a Seminar
+        // mode that explicitly says "answer only from the uploaded seminar file"
+        // — see live repro: a team-meet mode with 2k chars of doc-grounded
+        // customContext + 1 PDF, but documentGrounded=false because custom=false
+        // → retrieval never fires → model says "please upload your document").
+        const documentGrounded = hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
+        // CRITICAL (code-review audit 2026-07-05, following the fix above):
+        // `documentGroundedCustomModeActive` — NOT `documentGrounded` — is the
+        // flag every production retrieval/prompt-shaping call site actually
+        // reads (WhatToAnswerLLM.ts forceDocumentGrounding, both LLMHelper.ts
+        // active-mode-injection sites, IntelligenceEngine.ts's context
+        // suppression + profile bypass, ipcHandlers.ts's Hindsight/OKF
+        // isolation gates and phone-chat). `documentGrounded` alone is
+        // essentially write-only (only 2 diagnostic console.log fields read
+        // it) — broadening ONLY `documentGrounded` (as an earlier, incomplete
+        // fix did) left every real behavior still gated on the unbroadened
+        // `custom` requirement below, so the original "please upload your
+        // document" bug persisted for built-in-template modes even after
+        // that fix landed. The name retains "CustomMode" for historical/API
+        // -compat reasons (~65 call sites reference this exact field name)
+        // but it no longer requires `isCustomMode` — any mode (built-in
+        // template or user-created) with reference files + a document-
+        // grounded prompt now activates the full doc-grounded behavior.
+        // `hasCustomPrompt` and `hasReferenceFiles` are both already implied
+        // by `documentGrounded` (empty customContext can't match either
+        // regex; documentGrounded requires hasReferenceFiles) — kept as
+        // explicit conjuncts only for readability/defense-in-depth.
+        const documentGroundedCustomModeActive = hasCustomPrompt && documentGrounded && hasReferenceFiles;
         return {
             isCustom: custom,
             hasReferenceFiles,
@@ -998,8 +1076,17 @@ export class ModesManager {
                         excludeCustomContext,
                         allowRerank,
                         forceDocumentGrounding: true,
+                        followUpReferentHint: retrievalOptions?.followUpReferentHint,
+                        ...(retrievalOptions?.relaxed ? { topK: retrievalOptions.topK, tokenBudget: tokenBudget ?? 5200 } : {}),
                     },
                 );
+                diagLog('ModesManager hybrid-first branch', {
+                    query,
+                    usedFallback: hybridResult?.usedFallback,
+                    usedHybrid: hybridResult?.usedHybrid,
+                    hasContext: !!hybridResult?.formattedContext,
+                    tookHybrid: !!(hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext),
+                });
                 if (hybridResult && !hybridResult.usedFallback && hybridResult.formattedContext) {
                     return hybridResult.formattedContext;
                 }
@@ -1067,6 +1154,73 @@ export class ModesManager {
             });
         } catch { /* non-fatal */ }
         return lexical;
+    }
+
+    /**
+     * Phase 5 — OKF-augmented mode context block.
+     *
+     * Wraps `modeContextBlock` (already produced by `buildRetrievedActiveModeContextBlock*`)
+     * with OKF Knowledge Cards + graph hints when:
+     *   1. `okfHybridRetrieval` flag is on, AND
+     *   2. the active mode has at least one reference file with a generated OKF pack.
+     *
+     * Returns the raw `modeContextBlock` unchanged when any condition fails — additive,
+     * never destructive. Used by both the manual `gemini-chat-stream` path and the WTA
+     * path (`WhatToAnswerLLM.generateStream`) so synthesis-question recovery reaches
+     * every caller, not just the manual path.
+     *
+     * Mirrors the block in `LLMHelper.ts:4640-4704` so the behaviour stays in lockstep;
+     * this is the canonical home for the logic.
+     */
+    public buildOkfAugmentedContextBlock(modeContextBlock: string, query: string, pinnedModeId?: string): string {
+        if (!modeContextBlock || !query) return modeContextBlock;
+        try {
+            const { isOkfHybridRetrievalEnabled, isOkfGraphExpansionEnabled } = require('../intelligence/intelligenceFlags');
+            if (!isOkfHybridRetrievalEnabled()) return modeContextBlock;
+            const { classifyQuestion } = require('./knowledge/QuestionClassifier');
+            const { queryOkfCards } = require('./knowledge/OkfRetriever');
+            const { formatCardsForPrompt, buildOkfEvidenceBlock } = require('./knowledge/OkfPromptFormatter');
+            const mode = this.resolveMode(pinnedModeId);
+            if (!mode) return modeContextBlock;
+            const files = this.getReferenceFiles(mode.id) || [];
+            if (files.length === 0) return modeContextBlock;
+            const { KnowledgeManager } = require('./knowledge/KnowledgeManager');
+            const km = KnowledgeManager.getInstance();
+            const classification = classifyQuestion(query);
+            const allScoredCards: any[] = [];
+            const packsForGraphExpansion: any[] = [];
+            for (const file of files) {
+                const pack = km.getPackForFile(file.id);
+                if (!pack || pack.cards.length === 0) continue;
+                const scored = queryOkfCards(pack, query, classification, { topN: 6, fileId: file.id });
+                allScoredCards.push(...scored);
+                packsForGraphExpansion.push(pack);
+            }
+            if (allScoredCards.length === 0) return modeContextBlock;
+            allScoredCards.sort((a: any, b: any) => b.score - a.score);
+            const topCards = allScoredCards.slice(0, 6);
+            const cardsBlock = formatCardsForPrompt(topCards);
+            let graphHints = '';
+            try {
+                if (isOkfGraphExpansionEnabled() && classification.targetEntities && classification.targetEntities.length > 0) {
+                    const { resolveStartNodeIds, expandGraph, formatGraphHintsForPrompt } = require('./knowledge/GraphRetriever');
+                    const allHints: any[] = [];
+                    for (const pack of packsForGraphExpansion) {
+                        const startIds = resolveStartNodeIds(pack, classification.targetEntities);
+                        if (startIds.length === 0) continue;
+                        allHints.push(...expandGraph(pack, startIds, 2));
+                    }
+                    graphHints = formatGraphHintsForPrompt(allHints);
+                }
+            } catch (_graphErr: any) {
+                console.warn('[ModesManager] OKF graph expansion skipped (non-fatal):', _graphErr?.message);
+            }
+            const combinedCardsBlock = graphHints ? `${cardsBlock}\n\n${graphHints}` : cardsBlock;
+            return buildOkfEvidenceBlock({ cardsBlock: combinedCardsBlock, rawChunkText: modeContextBlock });
+        } catch (_okfErr: any) {
+            console.warn('[ModesManager] OKF augmentation skipped (non-fatal):', _okfErr?.message);
+            return modeContextBlock;
+        }
     }
 
     /**
