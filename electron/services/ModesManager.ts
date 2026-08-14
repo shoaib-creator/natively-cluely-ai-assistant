@@ -1,11 +1,25 @@
 import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
 import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
-import { ModeContextRetriever, type ModeRetrievalOptions } from './ModeContextRetriever';
+import { ModeContextRetriever, type ModeRetrievalOptions, type RetrieveOptions } from './ModeContextRetriever';
+import type { ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
 import type { AnswerType } from '../llm/AnswerPlanner';
 import type { ActiveModeInfo } from '../llm/modeProfiles';
 import { classifyCustomContext, selectCustomContextForAnswer } from '../llm/customContextClassifier';
 import { diagLog } from '../llm/documentGroundedPrompt';
+import { planBuiltinAdoption, BUILTIN_MODE_LABELS } from './builtinModes';
+import {
+    type ModeSourceContract,
+    type ModeSourceOwner,
+    CURRENT_MIGRATION_REVISION,
+    defaultSourceContractForNewMode,
+    migrateSourceContractFromPrompt,
+    parseModeSourceContract,
+    serializeModeSourceContract,
+    documentGroundedFromContract,
+    strictDocumentGroundedFromContract,
+    buildUserSelectedSourceContract,
+} from './modeSourceContract';
 
 /**
  * Drop sensitive (salary/pricing/strategy) chunks from a raw customContext blob
@@ -28,6 +42,8 @@ import {
     MODE_TEAM_MEET_PROMPT,
     MODE_LECTURE_PROMPT,
     MODE_TECHNICAL_INTERVIEW_PROMPT,
+    // Campaign-3 (2026-07-19): 8th built-in mode prompt.
+    MODE_SEMINAR_PROMPT,
     SHARED_MODE_PREFIX,
     SHARED_MODE_PREFIX_SHORT,
 } from '../llm/prompts';
@@ -39,6 +55,14 @@ import {
  */
 export const PROFILE_OKF_RESERVED_MODE_ID = '__profile_okf__';
 
+/**
+ * Where the active-mode snapshot lives so that every inlined copy of this
+ * module shares ONE cache. See ModesManager._cache for why that is required
+ * rather than merely tidy. Exported so a test can assert the shared slot
+ * exists — a per-instance regression would still pass any single-bundle test.
+ */
+export const ACTIVE_MODE_CACHE_KEY = '__nativelyActiveModeInfoCacheV1__';
+
 export type ModeTemplateType =
     | 'general'
     | 'looking-for-work'
@@ -46,7 +70,11 @@ export type ModeTemplateType =
     | 'recruiting'
     | 'team-meet'
     | 'lecture'
-    | 'technical-interview';
+    | 'technical-interview'
+    // Campaign-3 (fix/answer-policy-engine, 2026-07-19): 8th built-in mode.
+    // Strict: evidence required, off-document Qs answered general-labeled
+    // with a visible "not from your reference files" preamble.
+    | 'seminar';
 
 export interface Mode {
     id: string;
@@ -55,6 +83,21 @@ export interface Mode {
     customContext: string;
     isActive: boolean;
     createdAt: string;
+    /**
+     * An app DEFAULT (migration v26, 2026-08-09). Its `templateType` is FIXED —
+     * everything else (name, custom context, reference files, Answer policy)
+     * stays editable. Locking the template is what stops a mode being named one
+     * thing and behaving as another; locking more would remove choices users
+     * have already made.
+     */
+    isBuiltin: boolean;
+    /**
+     * Persisted, explicit, typed source policy (real-custom-mode-repair,
+     * 2026-07-11). `null` for a mode that has never been migrated/set — callers
+     * should treat null as "not yet resolved" and call
+     * ModesManager.getOrMigrateSourceContract(id) rather than assume a default.
+     */
+    sourceContract: ModeSourceContract | null;
 }
 
 export interface ModeReferenceFile {
@@ -94,6 +137,12 @@ export const MODE_TEMPLATES: Array<{
     { type: 'looking-for-work',     label: 'Looking for work',     description: 'Answer interview questions with confidence and clarity.' },
     { type: 'technical-interview',  label: 'Technical Interview',  description: 'Whiteboard-style coding and system design support.' },
     { type: 'lecture',              label: 'Lecture',              description: 'Capture key concepts and content from lectures.' },
+    // Campaign-3 (2026-07-19, fix/answer-policy-engine): 8th built-in mode.
+    // "Seminar Mode" — strict file-grounded Q&A for presentations, thesis
+    // defenses, paper walkthroughs. Off-document questions are answered
+    // general-labeled with a visible "not from your reference files" preamble
+    // (NEVER a refusal — even strict profiles answer; they just label honestly).
+    { type: 'seminar',              label: 'Seminar',              description: 'Strict file-grounded Q&A: answer from your reference files; off-file questions get a visible "general knowledge" label, never a refusal.' },
 ];
 
 // Default note sections seeded when a mode is created from a template
@@ -162,9 +211,19 @@ export const TEMPLATE_NOTE_SECTIONS: Record<ModeTemplateType, Array<{ title: str
         { title: 'Referral / follow-up', description: 'Referral requests, thank-you notes, materials to send, or networking follow-up.' },
         { title: 'Next steps', description: 'Concrete next steps, owners, dates, and preparation items.' },
     ],
+    // Campaign-3 (2026-07-19): 8th built-in mode — file-grounded Q&A.
+    seminar: [
+        { title: 'Question', description: 'The question asked (verbatim or paraphrased).' },
+        { title: 'Answer from your files', description: 'The answer grounded in your reference files / slides / paper. Direct quote or close paraphrase.' },
+        { title: 'Source', description: 'Which file + section the answer came from. Cite the filename and section/heading.' },
+        { title: 'If not in your files', description: 'A short, labeled "not from your reference files" note from general knowledge — never fabricated as if from the files.' },
+        { title: 'Follow-up you might be asked', description: 'Likely follow-up questions on the same topic the audience or panel could ask next.' },
+    ],
 };
 
-const TEMPLATE_SYSTEM_PROMPTS: Record<ModeTemplateType, string> = {
+// Campaign-3 (2026-07-19): exported (was `const`) so tests + future UI
+// debugging can verify which prompt each templateType resolves to.
+export const TEMPLATE_SYSTEM_PROMPTS: Record<ModeTemplateType, string> = {
     // General = universal adaptive copilot (own prompt, not technical interview)
     general: MODE_GENERAL_PROMPT,
     'technical-interview': MODE_TECHNICAL_INTERVIEW_PROMPT,
@@ -174,6 +233,8 @@ const TEMPLATE_SYSTEM_PROMPTS: Record<ModeTemplateType, string> = {
     recruiting: MODE_RECRUITING_PROMPT,
     'team-meet': MODE_TEAM_MEET_PROMPT,
     lecture: MODE_LECTURE_PROMPT,
+    // Campaign-3 (2026-07-19): 8th built-in mode — file-grounded Q&A.
+    seminar: MODE_SEMINAR_PROMPT,
 };
 
 // Startup invariant: every MODE_*_PROMPT must begin with one of the two shared
@@ -229,9 +290,34 @@ export interface ActiveModeDocumentGroundingInfo {
      * profile suppression off one flag instead of re-deriving the four conditions.
      */
     documentGroundedCustomModeActive: boolean;
+    /**
+     * EXPLICIT strictness only (Defect C fix, 2026-08-01).
+     *
+     * `documentGroundedCustomModeActive` does double duty at ~65 call sites:
+     * source ISOLATION (keep Hindsight/OKF/profile out of document modes — the
+     * 2026-07-15 fix, correct even for a fresh default mode) and STRICT
+     * knowledge suppression (disable the generic bypass, force retrieval,
+     * block general-knowledge fallback). The template seed gives EVERY
+     * non-interview mode `reference_files_primary`, so a stock Team Meet or
+     * Lecture session — zero files, zero custom prompt — was logging
+     * "Generic bypass disabled: document-grounded custom mode active" and
+     * running the strict pipeline.
+     *
+     * This flag is TRUE only when strictness was actually chosen:
+     *   - the contract authority is `reference_files_only` (only reachable by
+     *     explicit selection or prompt migration, never by template seed), or
+     *   - a reference-files-first authority whose contract origin is NOT the
+     *     template default, with at least one real reference file attached.
+     * Attaching a file to a default mode does not flip it; changing a policy
+     * does. Knowledge-suppression call sites read THIS; isolation call sites
+     * keep the broad flag.
+     */
+    strictDocumentGroundedActive: boolean;
     modeId?: string;
     modeName?: string;
     hasCustomPrompt: boolean;
+    /** The mode's persisted, explicit source policy (real-custom-mode-repair). */
+    sourceContract: ModeSourceContract;
 }
 
 export function isCustomMode(mode: Pick<Mode, 'templateType' | 'name'> | null | undefined): boolean {
@@ -251,6 +337,8 @@ function rowToMode(row: any): Mode {
         customContext: row.custom_context ?? '',
         isActive: row.is_active === 1,
         createdAt: row.created_at,
+        isBuiltin: row.is_builtin === 1,
+        sourceContract: parseModeSourceContract(row.source_contract_json),
     };
 }
 
@@ -294,9 +382,28 @@ export class ModesManager {
     public static getInstance(): ModesManager {
         if (!ModesManager.instance) {
             ModesManager.instance = new ModesManager();
+            // Establish the app defaults ONCE, here rather than at a startup
+            // hook: the database opens lazily, and every entry point that can
+            // read a mode goes through this accessor. Doing it anywhere else
+            // risks a caller observing modes before they exist. Guarded so a
+            // re-entrant getInstance() during seeding cannot recurse.
+        }
+        // Retried on a LATER getInstance() when a previous run was incomplete —
+        // a partial seed used to persist for the whole session because the latch
+        // was set before the work. Bounded so a permanently broken database
+        // cannot spin on every accessor call.
+        if (!ModesManager.builtinsEnsured && ModesManager.builtinAttempts < ModesManager.MAX_BUILTIN_ATTEMPTS) {
+            ModesManager.builtinAttempts += 1;
+            // Latch BEFORE the call so a re-entrant getInstance() cannot recurse;
+            // unlatch only if the run reported itself incomplete.
+            ModesManager.builtinsEnsured = true;
+            if (!ModesManager.instance.ensureBuiltinModes()) ModesManager.builtinsEnsured = false;
         }
         return ModesManager.instance;
     }
+    private static builtinsEnsured = false;
+    private static builtinAttempts = 0;
+    private static readonly MAX_BUILTIN_ATTEMPTS = 3;
 
     // ── Modes ─────────────────────────────────────────────────────
 
@@ -362,13 +469,45 @@ export class ModesManager {
     // The live answer path consults the active mode on EVERY turn (routing
     // prior, pinned instructions, retrieval). The mode itself changes only via
     // setActiveMode/updateMode/deleteMode, so a tiny invalidate-on-write cache
-    // removes the per-question SQLite read without any staleness risk.
-    private _activeModeInfoCache: ActiveModeInfo | null = null;
-    private _activeModeInfoCacheValid = false;
+    // removes the per-question SQLite read.
+    //
+    // The cache is stored on globalThis, NOT on the instance, and that is
+    // load-bearing rather than defensive.
+    //
+    // esbuild inlines this module into every main-process entry bundle that
+    // imports it — 14 dist files, including ipcHandlers, IntelligenceEngine and
+    // IntelligenceManager. Each inlined copy is its own module scope with its
+    // own `ModesManager.instance`, so `getInstance()` returns a DIFFERENT
+    // object per bundle. The RUNNING app loads only main.js (everything inlined
+    // once), but every harness/eval/test process that requires two or more
+    // dist-electron bundles into one heap gets split singletons — and those
+    // runtimes are where this repo's benchmark numbers come from. With the
+    // cache on the instance, a `setActiveMode` through one copy left every
+    // other copy's snapshot stale for the life of the process, and
+    // `getReferenceFiles(modeInfo.id)` keys the whole retrieval set off that
+    // snapshot. Cross-mode source isolation is exactly what this system exists
+    // to guarantee, so the cache lives where every copy can see it: globalThis
+    // is per-PROCESS however many times the module is inlined.
+    //
+    // (The 2026-07-31 LIVE contamination incident had a different, single-
+    // process mechanism — a renderer optimistic-update bug on `pro_required`
+    // rejection, plus a raw db.setActiveMode bypass in the license-loss path;
+    // both fixed the same day. This slot keeps the harness runtimes truthful
+    // and makes the class impossible if multi-bundle loading ever arrives.)
+    private static get _cache(): { info: ActiveModeInfo | null; valid: boolean } {
+        const g = globalThis as unknown as Record<string, unknown>;
+        let store = g[ACTIVE_MODE_CACHE_KEY] as { info: ActiveModeInfo | null; valid: boolean } | undefined;
+        if (!store) {
+            store = { info: null, valid: false };
+            g[ACTIVE_MODE_CACHE_KEY] = store;
+        }
+        return store;
+    }
 
     private invalidateActiveModeCache(): void {
-        this._activeModeInfoCache = null;
-        this._activeModeInfoCacheValid = false;
+        const store = ModesManager._cache;
+        store.info = null;
+        store.valid = false;
     }
 
     /**
@@ -378,11 +517,12 @@ export class ModesManager {
      * user-authored and surfaced to prompt builders.
      */
     public getActiveModeInfo(): ActiveModeInfo | null {
-        if (this._activeModeInfoCacheValid) return this._activeModeInfoCache;
+        const store = ModesManager._cache;
+        if (store.valid) return store.info;
         const mode = this.getActiveMode();
         if (mode) {
             const grounding = this.getActiveModeDocumentGroundingInfo(mode.id);
-            this._activeModeInfoCache = {
+            store.info = {
                 id: mode.id,
                 templateType: mode.templateType,
                 name: mode.name,
@@ -391,12 +531,14 @@ export class ModesManager {
                 hasCustomPrompt: grounding.hasCustomPrompt,
                 documentGrounded: grounding.documentGrounded,
                 documentGroundedCustomModeActive: grounding.documentGroundedCustomModeActive,
+                strictDocumentGroundedActive: grounding.strictDocumentGroundedActive,
+                sourceContract: grounding.sourceContract,
             };
         } else {
-            this._activeModeInfoCache = null;
+            store.info = null;
         }
-        this._activeModeInfoCacheValid = true;
-        return this._activeModeInfoCache;
+        store.valid = true;
+        return store.info;
     }
 
     // Modes where the premium knowledge intercept (negotiation coaching, intro
@@ -413,6 +555,7 @@ export class ModesManager {
         'technical-interview',
         'team-meet',
         'lecture',
+        'seminar',
     ]);
 
     /**
@@ -428,13 +571,109 @@ export class ModesManager {
         return !ModesManager.PREMIUM_INTERCEPT_INCOMPATIBLE_TEMPLATES.has(mode.templateType);
     }
 
+    /**
+     * Is this a template the app actually ships?
+     *
+     * Derived from MODE_TEMPLATES so the list cannot drift from the one the UI
+     * offers. Added 2026-08-09: `template_type` was persisted unvalidated, so an
+     * unrecognised value only surfaced at READ time as a silent fallback to
+     * `general` — the one mode with no profile sources. Rejecting on WRITE keeps
+     * the bad value out of the row in the first place.
+     */
+    public static isKnownTemplateType(v: unknown): v is ModeTemplateType {
+        return typeof v === 'string' && MODE_TEMPLATES.some((t) => t.type === v);
+    }
+
+    /**
+     * Establish the app's DEFAULT modes, once (migration v26, 2026-08-09).
+     *
+     * Adoption reclassifies user data, so the decision lives in
+     * services/builtinModes.ts as a pure, tested function and this method only
+     * APPLIES it. Seeding goes through createMode so a seeded default gets the
+     * same note sections and source contract any mode would.
+     *
+     * Idempotent and non-destructive: nothing is renamed, retyped or deleted.
+     * A row is only ever marked, and only when its name is already exactly the
+     * canonical label for its own template.
+     */
+    public ensureBuiltinModes(): boolean {
+        let complete = true;
+        try {
+            const db = DatabaseManager.getInstance();
+            const rows = db.getModes().map((r: any) => ({
+                id: r.id,
+                name: r.name,
+                templateType: r.template_type,
+                createdAt: r.created_at,
+                isBuiltin: r.is_builtin === 1,
+            }));
+            const plan = planBuiltinAdoption(rows);
+
+            // Ambiguity is the one thing adoption can get wrong (see AdoptionPlan
+            // .ambiguous). No provenance column exists to break the tie, so it is
+            // LOGGED rather than guessed at — a wrong pick stays diagnosable.
+            for (const a of plan.ambiguous) {
+                console.warn(`[ModesManager] ${a.templateType}: ${a.skipped.length + 1} rows qualified as the `
+                    + `built-in; adopted the oldest (${a.chosen}), left custom: ${a.skipped.join(', ')}. `
+                    + `If the wrong one was adopted, duplicate it as a custom mode to change its template.`);
+            }
+
+            for (const id of plan.adopt) {
+                // Per-row, so one bad write cannot cost the rest of the adoption.
+                try { db.setModeBuiltin(id, true); } catch (e) {
+                    complete = false;
+                    console.error(`[ModesManager] adopt ${id} failed:`, e);
+                }
+            }
+
+            for (const t of plan.seed) {
+                // Per-seed for the same reason. A disk error on one template used
+                // to abort every remaining one and leave the session with a
+                // partial set until the next launch.
+                try {
+                    const created = this.createMode({ name: BUILTIN_MODE_LABELS[t], templateType: t });
+                    db.setModeBuiltin(created.id, true);
+                } catch (e) {
+                    complete = false;
+                    console.error(`[ModesManager] seed ${t} failed:`, e);
+                }
+            }
+
+            if (plan.adopt.length || plan.seed.length) {
+                console.log(`[ModesManager] built-ins established: adopted ${plan.adopt.length}, `
+                    + `seeded ${plan.seed.length}${plan.seed.length ? ` (${plan.seed.join(', ')})` : ''}`
+                    + `${complete ? '' : ' — INCOMPLETE, will retry'}`);
+                this.invalidateActiveModeCache();
+            }
+        } catch (e) {
+            // Never fatal: a failure here leaves every mode custom, which is the
+            // pre-v26 behaviour, not a broken app.
+            complete = false;
+            console.error('[ModesManager] ensureBuiltinModes failed:', e);
+        }
+        return complete;
+    }
+
+    /** Test seam: clear the once-per-process latch so a run can be repeated. */
+    public static _resetBuiltinLatchForTest(): void {
+        ModesManager.builtinsEnsured = false;
+        ModesManager.builtinAttempts = 0;
+    }
+
+
+
     public createMode(params: { name: string; templateType: ModeTemplateType }): Mode {
+        if (!ModesManager.isKnownTemplateType(params.templateType)) {
+            throw new Error(`createMode: unknown templateType ${JSON.stringify(params.templateType)}`);
+        }
         const id = `mode_${crypto.randomUUID()}`;
+        const initialContract = defaultSourceContractForNewMode(params.templateType);
         DatabaseManager.getInstance().createMode({
             id,
             name: params.name,
             templateType: params.templateType,
             customContext: '',
+            sourceContractJson: serializeModeSourceContract(initialContract),
         });
         // Seed default note sections for this template type
         const defaultSections = TEMPLATE_NOTE_SECTIONS[params.templateType] ?? [];
@@ -458,12 +697,209 @@ export class ModesManager {
             customContext: '',
             isActive: false,
             createdAt: new Date().toISOString(),
+            // createMode always produces a CUSTOM mode. ensureBuiltinModes marks
+            // a seeded default afterwards via setModeBuiltin, so the built-in
+            // flag has exactly one writer.
+            isBuiltin: false,
+            sourceContract: initialContract,
         };
     }
 
-    public updateMode(id: string, updates: { name?: string; templateType?: ModeTemplateType; customContext?: string }): void {
-        DatabaseManager.getInstance().updateMode(id, updates);
+    public updateMode(id: string, updates: { name?: string; templateType?: ModeTemplateType; customContext?: string; sourceContract?: ModeSourceContract }): void {
+        // Reject an unusable template BEFORE it reaches the row (2026-08-09).
+        // Persisting one is not a harmless typo: read-time resolution silently
+        // degrades it to `general`, which has NO profile sources, so the mode
+        // quietly loses résumé access with nothing logged at write time.
+        if (updates.templateType !== undefined && !ModesManager.isKnownTemplateType(updates.templateType)) {
+            throw new Error(`updateMode: unknown templateType ${JSON.stringify(updates.templateType)}`);
+        }
+        // A built-in's template is FIXED (v26). This is the guard that makes
+        // "Technical Interview" unable to become `general`. A no-op assignment
+        // of the SAME template is allowed so ordinary saves from the editor do
+        // not have to special-case built-ins.
+        if (updates.templateType !== undefined) {
+            const current = this.resolveMode(id);
+            if (current?.isBuiltin && current.templateType !== updates.templateType) {
+                throw new Error(
+                    `updateMode: "${current.name}" is a built-in mode — its template is fixed at `
+                    + `"${current.templateType}" and cannot be changed to "${updates.templateType}". `
+                    + `Duplicate it as a custom mode to change the template.`);
+            }
+        }
+        const { sourceContract, ...rest } = updates;
+        // Knowledge Source canonical-gate repair (2026-07-16): the renderer can
+        // change a mode's templateType AFTER creation (PI v3 W7). The mode's
+        // persisted ModeSourceContract was seeded by `createMode(...)` for the
+        // ORIGINAL template — silently keeping it after a template switch
+        // produces the exact failure reported by the user: a mode named
+        // "Technical Interview" with `sourceAuthority: 'reference_files_primary'`
+        // and `forbiddenSources: [profile_resume, profile_jd, ...]`. Fix: when
+        // templateType actually changes AND the existing contract is a system
+        // seed (`default_new_mode`), re-seed to the new template's default
+        // BEFORE persisting, so the mode's Knowledge Source policy matches its
+        // current template. `user_selected` and `migrated_from_prompt`
+        // contracts are NEVER overwritten — those are authoritative user/heuristic
+        // choices that survive template changes (matches the existing
+        // `isTemplateAwareSeed` invariant at `getOrMigrateSourceContract`).
+        let resolvedSourceContract: ModeSourceContract | undefined = sourceContract;
+        if (updates.templateType !== undefined && !sourceContract) {
+            const current = this.resolveMode(id);
+            if (current && current.templateType !== updates.templateType) {
+                if (current.sourceContract?.origin === 'default_new_mode') {
+                    resolvedSourceContract = defaultSourceContractForNewMode(updates.templateType);
+                }
+                // user_selected / migrated_from_prompt survive template change.
+                // Missing sourceContract on a pre-fix mode → defer to the
+                // getOrMigrateSourceContract self-heal (which migrates on next
+                // read), preserving backward compatibility with older modes.
+            }
+        }
+        DatabaseManager.getInstance().updateMode(id, {
+            ...rest,
+            ...(resolvedSourceContract !== undefined
+                ? { sourceContractJson: serializeModeSourceContract(resolvedSourceContract) }
+                : {}),
+        });
         this.invalidateActiveModeCache();
+    }
+
+    /**
+     * Build the canonical user-selected contract for a mode. The ONLY place the
+     * ModeSourceContract object should be assembled for `origin: 'user_selected'`
+     * saves — the renderer must call this via IPC instead of constructing the
+     * contract itself. This guarantees every saved contract has the correct
+     * `defaultOwner` (derived from `templateType`, not hard-coded to
+     * 'reference_files' which would force `evidenceRequired: true` on modes that
+     * have no documents, e.g. looking-for-work where the user keeps the seed).
+     *
+     * The switches parameter is the user's `allowedExplicitSwitches` Set from
+     * the panel, with deprecated 'transcript' values filtered out (live STT
+     * is always-on implicit context, never a user-settable switch).
+     *
+     * If `switches` is the empty array, the user has explicitly cleared all
+     * sources — return a `reference_files_only` or `profile_only` contract
+     * with empty `allowedExplicitSwitches`, NOT an `ask_if_ambiguous` fallback.
+     * The previously-implicit handling of "all dots unchecked" produced
+     * `ask_if_ambiguous` which silently allowed profile context through
+     * experience/project/skills answer types — exactly the leak this method
+     * prevents.
+     */
+    public buildUserSourceContract(input: {
+        // `modeId` is accepted-but-unused: the contract is derived purely from
+        // templateType + switches (two modes with the same inputs get the same
+        // contract shape). Kept in the signature so the IPC payload doesn't
+        // need to drop a field, and to leave room for future per-mode overrides
+        // without an IPC break.
+        modeId: string;
+        templateType: ModeTemplateType;
+        switches: string[];
+        hasLiveTranscriptCapable?: boolean;
+    }): ModeSourceContract {
+        const isInterviewPrep = input.templateType === 'looking-for-work'
+            || input.templateType === 'technical-interview';
+        const switches = input.switches.filter((s) => s !== 'transcript');
+        const defaultOwner: ModeSourceOwner = isInterviewPrep ? 'profile' : 'reference_files';
+        return buildUserSelectedSourceContract({
+            defaultOwner,
+            allowedExplicitSwitches: switches as any,
+            hasLiveTranscriptCapable: !!input.hasLiveTranscriptCapable,
+        });
+    }
+
+    /**
+     * Returns this mode's persisted ModeSourceContract, migrating it ONCE from
+     * legacy prompt-text heuristics (and persisting the result) if the mode has
+     * never had an explicit contract saved. This is the ONLY place the legacy
+     * regex-based heuristic still runs — after the first call for a given mode,
+     * the contract is stable and read verbatim from the database, closing the
+     * root cause of the P0 contamination incident (a mode's grounding behavior
+     * silently re-deriving, and potentially flipping, on every single turn).
+     */
+    public getOrMigrateSourceContract(modeId: string): ModeSourceContract {
+        const mode = this.resolveMode(modeId);
+        if (!mode) return defaultSourceContractForNewMode();
+        const files = this.getReferenceFiles(mode.id);
+        const hasReferenceFiles = files.some(file => file.content.trim());
+        const hasCustomPrompt = mode.customContext.trim().length > 0;
+        // Real-benchmark finding (2026-07-11): createMode() seeds every new
+        // mode with defaultSourceContractForNewMode() (origin='default_new_mode')
+        // AT CREATION TIME, before the user has written a prompt or attached
+        // any reference file. A naive "if mode.sourceContract, return it"
+        // check would short-circuit HERE and never migrate — permanently
+        // freezing every mode at the empty-mode default (defaultOwner=
+        // 'clarify'), regardless of what prompt/files get added afterward.
+        // This is the incident's failure class recurring one layer up: a
+        // stale cached decision silently overriding the mode's real content.
+        //
+        // EXCEPTION (fix, 2026-07-15): if the seed was already template-aware
+        // (i.e. defaultSourceContractForNewMode received the mode's actual
+        // templateType, not undefined), the seed's `sourceAuthority` and
+        // `allowedExplicitSwitches` are the correct runtime contract for this
+        // mode — even when the user later writes a prompt. The prompt-text
+        // heuristic would silently OVERRIDE the template intent (e.g. a
+        // Team-meet mode with seeded `sourceAuthority='reference_files_primary'`
+        // re-migrating to `ask_if_ambiguous` after the user types anything).
+        // Template-aware seeds are stable; only `general` mode's default_new_mode
+        // contract is eligible for re-migration on prompt change (the user's
+        // intent is genuinely blank there — `general` is the "I'll figure out
+        // what I want later" template).
+        //
+        // Self-heal (rev-2): a contract migrated by an OLDER revision of the
+        // prompt→contract heuristic is re-migrated ONCE so its persisted
+        // authority reflects the corrected logic — e.g. a seminar prompt that
+        // says "default to the thesis, but use my résumé/JD if I ask" was
+        // over-locked to `reference_files_only` by rev 1 and must self-heal to
+        // `reference_files_primary`. This NEVER touches a `user_selected`
+        // contract (the user's explicit choice); only `migrated_from_prompt`
+        // contracts carry a migrationRevision and are eligible.
+        const isTemplateAwareSeed = mode.sourceContract?.origin === 'default_new_mode'
+            && (mode.sourceContract.seededForTemplateType === mode.templateType
+                || (!mode.sourceContract.seededForTemplateType && mode.templateType !== 'general'));
+        const staleMigration = mode.sourceContract?.origin === 'migrated_from_prompt'
+            && (mode.sourceContract.migrationRevision ?? 1) < CURRENT_MIGRATION_REVISION;
+        // Stale-seed detection (Knowledge Source canonical-gate repair, 2026-07-16):
+        // a default_new_mode contract whose seededForTemplateType differs from the
+        // mode's current templateType was created for the wrong template (someone
+        // updated templateType without updating the contract — a direct-DB or
+        // pre-fix code path). Force a re-seed so the persisted authority matches
+        // the active template. This is the defense-in-depth companion to
+        // `updateMode`'s re-seed, catching paths the renderer-side update bypasses.
+        const staleSeedForCurrentTemplate = mode.sourceContract?.origin === 'default_new_mode'
+            && mode.sourceContract.seededForTemplateType !== undefined
+            && mode.sourceContract.seededForTemplateType !== mode.templateType;
+        const needsMigration = !mode.sourceContract
+            || (mode.sourceContract.origin === 'default_new_mode' && !isTemplateAwareSeed && (hasCustomPrompt || hasReferenceFiles))
+            || staleMigration
+            || staleSeedForCurrentTemplate;
+        if (!needsMigration) return mode.sourceContract!;
+        // Stale-seed path (Knowledge Source canonical-gate repair, 2026-07-16):
+        // when the persisted default_new_mode seed was built for a DIFFERENT
+        // template than the mode's current templateType, re-seed with the
+        // correct per-template default. `migrateSourceContractFromPrompt`
+        // doesn't know about the template dimension (it only sees hasRefFiles
+        // + hasProfileFacts), so it's the wrong tool here — it would collapse
+        // to `ask_if_ambiguous` and lose the user's template intent.
+        if (staleSeedForCurrentTemplate) {
+            const reseeded = defaultSourceContractForNewMode(mode.templateType);
+            this.updateMode(mode.id, { sourceContract: reseeded });
+            return reseeded;
+        }
+        // Profile-facts availability is not known to ModesManager (it lives in
+        // KnowledgeOrchestrator/profile services); migration only needs to
+        // distinguish "has files" from "no files" for its decision tree — see
+        // docs/context-os/real-custom-mode-repair/05_PRODUCT_SOURCE_POLICY.md.
+        // A profile-only migration branch is intentionally conservative
+        // (defaults to `clarify`) when this signal is unavailable at migration
+        // time; a caller with profile-facts knowledge may pass it via
+        // migrateSourceContractFromPrompt directly if a tighter migration is
+        // later needed.
+        const migrated = migrateSourceContractFromPrompt({
+            customContext: mode.customContext,
+            hasReferenceFiles,
+            hasProfileFacts: false,
+        });
+        this.updateMode(mode.id, { sourceContract: migrated });
+        return migrated;
     }
 
     public deleteMode(id: string): void {
@@ -519,6 +955,37 @@ export class ModesManager {
         return DatabaseManager.getInstance().getReferenceFiles(modeId).map(rowToFile);
     }
 
+    /**
+     * Return one immutable mode record captured by an answer request at t0.
+     *
+     * `getActiveModeInfo()` intentionally returns a narrow planner snapshot; the
+     * governed EvidenceResolver additionally needs the mode's template/context
+     * fields. The only valid capture target is the current active mode at t0;
+     * reject a mismatched id instead of falling forward to a different active
+     * mode. This avoids a full mode-list scan on the latency-critical path.
+     */
+    public getModeSnapshot(modeId: string): Readonly<Mode> | null {
+        const mode = this.getActiveMode();
+        if (!mode || mode.id !== modeId) return null;
+        // Deep-freeze at runtime for genuine request-scoped immutability. The
+        // frozen arrays widen to `readonly T[]` which TS cannot assign back to
+        // the mutable `Mode` shape, so cast through unknown — the runtime object
+        // is strictly narrower (frozen) than the declared type, never wider.
+        const frozen = {
+            ...mode,
+            sourceContract: mode.sourceContract
+                ? Object.freeze({
+                    ...mode.sourceContract,
+                    allowedExplicitSwitches: Object.freeze([...mode.sourceContract.allowedExplicitSwitches]),
+                    groundingProfile: mode.sourceContract.groundingProfile
+                        ? Object.freeze({ ...mode.sourceContract.groundingProfile })
+                        : mode.sourceContract.groundingProfile,
+                  })
+                : null,
+        };
+        return Object.freeze(frozen) as unknown as Readonly<Mode>;
+    }
+
     public addReferenceFile(params: {
         modeId: string;
         fileName: string;
@@ -542,6 +1009,15 @@ export class ModesManager {
             pageCount: params.pageCount,
             extractedPageCount: params.extractedPageCount,
         });
+        // Ingestion audit (deep-test D4, 2026-08-01): a document must not be
+        // treated as fully ingested when pages are missing. Extraction is
+        // all-or-nothing upstream, so a mismatch here means image-only/empty
+        // pages — surfaced loudly instead of discovered later as a "retrieval
+        // miss" on a fact that was never ingested.
+        if (typeof params.pageCount === 'number' && typeof params.extractedPageCount === 'number'
+            && params.extractedPageCount < params.pageCount) {
+            console.warn(`[ModesManager] INGESTION AUDIT: "${params.fileName}" parsed ${params.extractedPageCount}/${params.pageCount} pages — ${params.pageCount - params.extractedPageCount} page(s) produced no text. Facts on those pages are NOT retrievable.`);
+        }
         this.invalidateActiveModeCache();
         // OKF Phase 2/7 (2026-07-01): generate a Knowledge Pack alongside the
         // existing chunk pipeline. Heuristic v1 extraction is pure string
@@ -961,51 +1437,74 @@ export class ModesManager {
 
     public getActiveModeDocumentGroundingInfo(pinnedModeId?: string): ActiveModeDocumentGroundingInfo {
         const mode = this.resolveMode(pinnedModeId);
-        if (!mode) return { isCustom: false, hasReferenceFiles: false, documentGrounded: false, documentGroundedCustomModeActive: false, hasCustomPrompt: false };
+        if (!mode) {
+            return {
+                isCustom: false, hasReferenceFiles: false, documentGrounded: false,
+                documentGroundedCustomModeActive: false, strictDocumentGroundedActive: false,
+                hasCustomPrompt: false,
+                sourceContract: defaultSourceContractForNewMode(),
+            };
+        }
         const files = this.getReferenceFiles(mode.id);
         const custom = isCustomMode(mode);
         const hasReferenceFiles = files.some(file => file.content.trim());
         const hasCustomPrompt = mode.customContext.trim().length > 0;
-        // A mode is "document-grounded" if it has reference files AND a custom
-        // prompt that declares source-of-truth on the uploaded material. We
-        // intentionally do NOT gate this on `custom` (= templateType === 'general'
-        // && name !== 'General') because users legitimately create deeply
-        // document-grounded prompts for built-in templates (e.g. a Seminar
-        // mode that explicitly says "answer only from the uploaded seminar file"
-        // — see live repro: a team-meet mode with 2k chars of doc-grounded
-        // customContext + 1 PDF, but documentGrounded=false because custom=false
-        // → retrieval never fires → model says "please upload your document").
-        const documentGrounded = hasReferenceFiles && detectCustomModeDocumentGrounding(mode.customContext);
-        // CRITICAL (code-review audit 2026-07-05, following the fix above):
+        // Real-custom-mode-repair (2026-07-11): `documentGrounded` is now a PURE
+        // function of the mode's PERSISTED ModeSourceContract, never a live regex
+        // re-match against the prompt text. Root cause of the P0 contamination
+        // incident: the prior implementation ran detectCustomModeDocumentGrounding
+        // on every single turn, and a real user's natural phrasing routinely
+        // failed to satisfy both regexes simultaneously, silently defaulting the
+        // mode to `general_mixed` (everything allowed) with zero user visibility.
+        // getOrMigrateSourceContract() migrates + PERSISTS a legacy mode's
+        // contract exactly once (docs/context-os/real-custom-mode-repair/
+        // 05_PRODUCT_SOURCE_POLICY.md); after that this call is a pure DB read.
+        const sourceContract = this.getOrMigrateSourceContract(mode.id);
+        const documentGrounded = documentGroundedFromContract(sourceContract, hasReferenceFiles);
         // `documentGroundedCustomModeActive` — NOT `documentGrounded` — is the
         // flag every production retrieval/prompt-shaping call site actually
         // reads (WhatToAnswerLLM.ts forceDocumentGrounding, both LLMHelper.ts
         // active-mode-injection sites, IntelligenceEngine.ts's context
         // suppression + profile bypass, ipcHandlers.ts's Hindsight/OKF
-        // isolation gates and phone-chat). `documentGrounded` alone is
-        // essentially write-only (only 2 diagnostic console.log fields read
-        // it) — broadening ONLY `documentGrounded` (as an earlier, incomplete
-        // fix did) left every real behavior still gated on the unbroadened
-        // `custom` requirement below, so the original "please upload your
-        // document" bug persisted for built-in-template modes even after
-        // that fix landed. The name retains "CustomMode" for historical/API
-        // -compat reasons (~65 call sites reference this exact field name)
-        // but it no longer requires `isCustomMode` — any mode (built-in
-        // template or user-created) with reference files + a document-
-        // grounded prompt now activates the full doc-grounded behavior.
-        // `hasCustomPrompt` and `hasReferenceFiles` are both already implied
-        // by `documentGrounded` (empty customContext can't match either
-        // regex; documentGrounded requires hasReferenceFiles) — kept as
-        // explicit conjuncts only for readability/defense-in-depth.
-        const documentGroundedCustomModeActive = hasCustomPrompt && documentGrounded && hasReferenceFiles;
+        // isolation gates and phone-chat). The name retains "CustomMode" for
+        // historical/API-compat reasons (~65 call sites reference this exact
+        // field name) but does not require `isCustomMode` — any mode (built-in
+        // template or user-created) whose PERSISTED CONTRACT names reference
+        // files as the (primary or exclusive) source activates full doc-grounded
+        // behavior.
+        //
+        // FIX (2026-07-15): the previous gate `hasCustomPrompt && documentGrounded
+        // && hasReferenceFiles` neutralized doc-grounded isolation on freshly-
+        // created Team-meet / Lecture / Sales / Recruiting modes before the user
+        // had written any prompt AND before any reference files were uploaded —
+        // leaving Hindsight, OKF Profile Cards, and JIT profile evidence all
+        // reachable via the answer-type-driven sourceOwnership resolver. The
+        // new gate keys purely on the PERSISTED CONTRACT AUTHORITY (the runtime
+        // signal that already encodes the user's template-level intent via the
+        // seed). Reference-file presence is no longer required: the user's
+        // template-level intent to use reference files is honored the moment
+        // the mode is created, before any upload happens.
+        const documentGroundedCustomModeActive =
+            sourceContract.sourceAuthority === 'reference_files_only'
+            || sourceContract.sourceAuthority === 'reference_files_primary'
+            || sourceContract.sourceAuthority === 'reference_files_plus_transcript';
+        // Defect C (2026-08-01): strictness must be EXPLICIT. The template seed
+        // stamps `reference_files_primary` with origin 'default_new_mode' on
+        // every non-interview mode, so the authority-only test above classifies
+        // a stock Team Meet/Lecture as a strict document-grounded custom mode.
+        // See the field's doc comment on ActiveModeDocumentGroundingInfo.
+        const strictDocumentGroundedActive =
+            strictDocumentGroundedFromContract(sourceContract, hasReferenceFiles);
         return {
             isCustom: custom,
             hasReferenceFiles,
             documentGrounded,
             documentGroundedCustomModeActive,
+            strictDocumentGroundedActive,
             modeId: mode.id,
             modeName: mode.name,
             hasCustomPrompt,
+            sourceContract,
         };
     }
 
@@ -1042,6 +1541,24 @@ export class ModesManager {
      *  DIAGNOSTICS only — NOT used by the false-refusal gate (see setter). */
     public getLastRetrievalConfidence(): number {
         return this.lastRetrievalConfidence;
+    }
+
+    /**
+     * Evidence-execution-repair (2026-07-12): raw hybrid-retrieval passthrough
+     * for EvidenceResolver. Returns the STRUCTURED HybridContext (chunks +
+     * per-chunk scores), not the formatted string the other wrappers below
+     * build — EvidenceResolver needs typed items, not prose. CRITICAL: this
+     * delegates to `this.modeContextRetriever`, the SAME shared instance
+     * `main.ts` wires with `setSharedEmbeddingPipeline()` at RAG-manager init.
+     * A caller that constructs its own `new ModeContextRetriever()` gets an
+     * instance whose `_sharedEmbeddingPipeline` is permanently null — every
+     * `retrieveHybrid()` call on it then hits the `!ensureHybridRetriever()`
+     * guard and returns `{ chunks: [], usedFallback: true }` even when the
+     * mode's files are genuinely indexed and ready, which is exactly the bug
+     * this passthrough exists to prevent a future caller from reintroducing.
+     */
+    public async retrieveHybridRaw(mode: Mode, files: ModeReferenceFile[], options: RetrieveOptions): Promise<HybridContext> {
+        return this.modeContextRetriever.retrieveHybrid(mode, files, options);
     }
 
     /**

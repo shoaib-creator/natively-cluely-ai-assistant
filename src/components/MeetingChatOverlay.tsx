@@ -7,6 +7,7 @@ import { mapLanguageForPrism, isBlockCode } from '../utils/prismLanguage';
 import { registerPrismLanguages } from '../utils/registerPrismLanguages';
 import nativelyIcon from './icon.png';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
+import { splitGistLineStreaming } from '../lib/displayMarkup';
 
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -53,21 +54,13 @@ type ChatState = 'idle' | 'opening' | 'waiting_for_llm' | 'streaming_response' |
 // ============================================
 
 const TypingIndicator: React.FC = () => {
-    const isLightTheme = useResolvedTheme() === 'light';
-    const isModernTheme = !!document.querySelector('[data-interface-theme="modern"]');
-    const isGlassTheme = !!document.querySelector('[data-interface-theme="liquid-glass"]');
-    const isWhiteDots = isModernTheme || isGlassTheme;
-    const cardBgBorderClass = isLightTheme
-        ? 'bg-emerald-500/10 backdrop-blur-md border border-emerald-500/20 text-emerald-900'
-        : 'bg-emerald-600/20 backdrop-blur-md border border-emerald-500/30 text-emerald-100';
-
     return (
-        <div className={`w-fit rounded-[20px] rounded-tl-[4px] px-[16.5px] py-[12.5px] ${cardBgBorderClass} my-2.5 flex items-center justify-center`}>
-            <div className="flex items-center gap-1.5 py-0.5">
+        <div className="flex items-center gap-1 py-4">
+            <div className="flex items-center gap-1">
                 {[0, 1, 2].map((i) => (
                     <motion.div
                         key={i}
-                        className={`w-2 h-2 rounded-full ${isWhiteDots ? 'bg-white' : 'bg-emerald-400'}`}
+                        className="w-2 h-2 rounded-full bg-text-tertiary"
                         animate={{ opacity: [0.4, 1, 0.4] }}
                         transition={{
                             duration: 0.6,
@@ -101,14 +94,13 @@ const UserMessage: React.FC<{ content: string }> = ({ content }) => (
 
 const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = ({ content, isStreaming }) => {
     const [copied, setCopied] = useState(false);
-    const isLightTheme = useResolvedTheme() === 'light';
-    const cardBgBorderClass = isLightTheme
-        ? 'bg-emerald-500/10 backdrop-blur-md border border-emerald-500/20 text-emerald-900'
-        : 'bg-emerald-600/20 backdrop-blur-md border border-emerald-500/30 text-emerald-100';
+    // Teleprompter gist: persisted answers can end with a [[GIST]] line —
+    // split it into a bottom summary chip instead of showing the marker.
+    const { body: gistBody, gist: gistLine } = splitGistLineStreaming(content);
 
     const handleCopy = async () => {
         try {
-            await navigator.clipboard.writeText(content);
+            await navigator.clipboard.writeText(gistBody);
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
         } catch (err) {
@@ -121,15 +113,15 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
             initial={{ opacity: 0, y: 8 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.15 }}
-            className="flex flex-col items-start mb-6 w-full"
+            className="flex flex-col items-start mb-6"
         >
-            <div className={`w-full max-w-[85%] rounded-[20px] rounded-tl-[4px] p-[14px_18px] ai-response-card ${cardBgBorderClass} my-2.5`}>
+            <div className="text-text-primary text-[15px] leading-relaxed max-w-[85%]">
                 {/* Minimal Copy Button (no AI response header) */}
                 {!isStreaming && content && (
                     <div className="flex justify-end mb-2 select-none w-full">
                         <button
                             onClick={handleCopy}
-                            className="flex items-center gap-1.5 text-[11px] text-text-tertiary hover:text-[#4ade80] transition-colors"
+                            className="flex items-center gap-1.5 text-[11px] text-text-tertiary hover:text-text-secondary transition-colors"
                         >
                             {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
                             {copied ? 'Copied' : 'Copy'}
@@ -144,7 +136,7 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
                         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false, errorColor: '#cc0000' }]]}
                         components={{
                             p: ({ node, ...props }: any) => <p className="mb-[6px] last:mb-0 leading-relaxed whitespace-pre-wrap text-[13.5px]" {...props} />,
-                            a: ({ node, ...props }: any) => <a className="text-[#4ade80] hover:underline" {...props} />,
+                            a: ({ node, ...props }: any) => <a className="text-accent-primary hover:underline" {...props} />,
                             h1: ({ node, ...props }: any) => <h1 className="text-sm font-bold mt-2 mb-[4.5px] leading-relaxed uppercase tracking-wide" {...props} />,
                             h2: ({ node, ...props }: any) => <h2 className="text-xs font-bold mt-1.5 mb-[4.5px] leading-relaxed uppercase tracking-wide" {...props} />,
                             h3: ({ node, ...props }: any) => <h3 className="text-xs font-semibold mt-1.5 mb-[4.5px] leading-relaxed" {...props} />,
@@ -195,15 +187,9 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
                             },
                         }}
                     >
-                        {content}
+                        {gistBody}
                     </ReactMarkdown>
-                    {isStreaming && (
-                        <motion.span
-                            className="inline-block w-0.5 h-3.5 bg-[#fbbf24] ml-1 align-middle"
-                            animate={{ opacity: [1, 0] }}
-                            transition={{ duration: 0.5, repeat: Infinity }}
-                        />
-                    )}
+                    {gistLine && <div className="overlay-gist-chip">{gistLine}</div>}
                 </div>
             </div>
         </motion.div>
@@ -228,6 +214,10 @@ const MeetingChatOverlay: React.FC<MeetingChatOverlayProps> = ({
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const chatWindowRef = useRef<HTMLDivElement>(null);
     const streamBuffer = useStreamBuffer();
+    // Match the modes manager's `--mm-bg` exactly so the expanded chat
+    // card looks like the same dark grey surface.
+    const isLightTheme = useResolvedTheme() === 'light';
+    const chatWindowBg = isLightTheme ? '#f9f9f9' : '#111111';
 
     // Submit initial query when overlay opens
     useEffect(() => {
@@ -327,6 +317,14 @@ const MeetingChatOverlay: React.FC<MeetingChatOverlayProps> = ({
 
         const assistantMessageId = genMessageId();
 
+        // Track active listener cleanups so the finally block can always
+        // remove them — even if the IPC done/error events never arrive.
+        // Without this, a hung stream leaves `chatState` stuck at
+        // 'waiting_for_llm' / 'streaming_response' and the guard at the
+        // top of submitQuestion silently drops every subsequent message
+        // (no user-message push, no response).
+        let activeCleanups: Array<() => void> = [];
+
         try {
             // Add typing indicator delay (200ms) - makes the AI feel "thoughtful"
             await new Promise(resolve => setTimeout(resolve, 200));
@@ -378,6 +376,10 @@ const MeetingChatOverlay: React.FC<MeetingChatOverlayProps> = ({
                 errorCleanup?.();
             });
 
+            if (tokenCleanup) activeCleanups.push(tokenCleanup);
+            if (doneCleanup) activeCleanups.push(doneCleanup);
+            if (errorCleanup) activeCleanups.push(errorCleanup);
+
             // Get meeting ID from context for RAG queries
             const meetingId = meetingContext.id;
 
@@ -392,6 +394,7 @@ const MeetingChatOverlay: React.FC<MeetingChatOverlayProps> = ({
                     tokenCleanup?.();
                     doneCleanup?.();
                     errorCleanup?.();
+                    activeCleanups = [];
 
                     // FALLBACK LOGIC
                     const contextString = buildContextString();
@@ -400,7 +403,17 @@ const MeetingChatOverlay: React.FC<MeetingChatOverlayProps> = ({
 ${contextString}`;
 
                     streamBuffer.reset();
-                    const oldTokenCleanup = window.electronAPI?.onGeminiStreamToken((token: string) => {
+                    // Stream-id guard (2026-07-31) — see GlobalChatOverlay: drop
+                    // tokens/done/error belonging to an older abandoned stream.
+                    let adoptedStreamId: number | null = null;
+                    const acceptsMeta = (meta?: { streamId?: number }) => {
+                        const id = meta?.streamId;
+                        if (typeof id !== 'number') return true;
+                        if (adoptedStreamId === null || id > adoptedStreamId) { adoptedStreamId = id; return true; }
+                        return id === adoptedStreamId;
+                    };
+                    const oldTokenCleanup = window.electronAPI?.onGeminiStreamToken((token: string, meta?: { streamId?: number }) => {
+                        if (!acceptsMeta(meta)) return;
                         setChatState('streaming_response');
                         streamBuffer.appendToken(token, (content) => {
                             setMessages(prev => prev.map(msg =>
@@ -411,20 +424,24 @@ ${contextString}`;
                         });
                     });
 
-                    const oldDoneCleanup = window.electronAPI?.onGeminiStreamDone(() => {
+                    const oldDoneCleanup = window.electronAPI?.onGeminiStreamDone((payload?: { streamId?: number }) => {
+                        if (!acceptsMeta(payload)) return;
                         const finalContent = streamBuffer.getBufferedContent();
                         setMessages(prev => prev.map(msg =>
                             msg.id === assistantMessageId
                                 ? { ...msg, content: finalContent, isStreaming: false }
                                 : msg
                         ));
+                        setChatState('idle');
                         streamBuffer.reset();
                         oldTokenCleanup?.();
                         oldDoneCleanup?.();
                         oldErrorCleanup?.();
                     });
 
-                    const oldErrorCleanup = window.electronAPI?.onGeminiStreamError((error: string) => {
+                    const oldErrorCleanup = window.electronAPI?.onGeminiStreamError((error: string, meta?: { streamId?: number | null; source?: string }) => {
+                        if (meta?.source === 'phone-mirror') return;
+                        if (typeof meta?.streamId === 'number' && adoptedStreamId !== null && meta.streamId !== adoptedStreamId) return;
                         console.error('[MeetingChat] Gemini stream error (fallback):', error);
                         setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
                         setErrorMessage("Couldn't get a response. Please check your settings.");
@@ -434,6 +451,10 @@ ${contextString}`;
                         oldDoneCleanup?.();
                         oldErrorCleanup?.();
                     });
+
+                    if (oldTokenCleanup) activeCleanups.push(oldTokenCleanup);
+                    if (oldDoneCleanup) activeCleanups.push(oldDoneCleanup);
+                    if (oldErrorCleanup) activeCleanups.push(oldErrorCleanup);
 
                     await window.electronAPI?.streamGeminiChat(
                         question,
@@ -451,7 +472,15 @@ ${contextString}`;
 
                 // Switch to Gemini streaming (RAF-batched)
                 streamBuffer.reset();
-                const oldTokenCleanup = window.electronAPI?.onGeminiStreamToken((token: string) => {
+                let adoptedStreamId: number | null = null;
+                const acceptsMeta = (meta?: { streamId?: number }) => {
+                    const id = meta?.streamId;
+                    if (typeof id !== 'number') return true;
+                    if (adoptedStreamId === null || id > adoptedStreamId) { adoptedStreamId = id; return true; }
+                    return id === adoptedStreamId;
+                };
+                const oldTokenCleanup = window.electronAPI?.onGeminiStreamToken((token: string, meta?: { streamId?: number }) => {
+                    if (!acceptsMeta(meta)) return;
                     setChatState('streaming_response');
                     streamBuffer.appendToken(token, (content) => {
                         setMessages(prev => prev.map(msg =>
@@ -462,7 +491,8 @@ ${contextString}`;
                     });
                 });
 
-                const oldDoneCleanup = window.electronAPI?.onGeminiStreamDone(() => {
+                const oldDoneCleanup = window.electronAPI?.onGeminiStreamDone((payload?: { streamId?: number }) => {
+                    if (!acceptsMeta(payload)) return;
                     const finalContent = streamBuffer.getBufferedContent();
                     setMessages(prev => prev.map(msg =>
                         msg.id === assistantMessageId
@@ -476,7 +506,9 @@ ${contextString}`;
                     oldErrorCleanup?.();
                 });
 
-                const oldErrorCleanup = window.electronAPI?.onGeminiStreamError((error: string) => {
+                const oldErrorCleanup = window.electronAPI?.onGeminiStreamError((error: string, meta?: { streamId?: number | null; source?: string }) => {
+                    if (meta?.source === 'phone-mirror') return;
+                    if (typeof meta?.streamId === 'number' && adoptedStreamId !== null && meta.streamId !== adoptedStreamId) return;
                     console.error('[MeetingChat] Gemini stream error:', error);
                     setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
                     setErrorMessage("Couldn't get a response. Please check your settings.");
@@ -486,6 +518,10 @@ ${contextString}`;
                     oldDoneCleanup?.();
                     oldErrorCleanup?.();
                 });
+
+                if (oldTokenCleanup) activeCleanups.push(oldTokenCleanup);
+                if (oldDoneCleanup) activeCleanups.push(oldDoneCleanup);
+                if (oldErrorCleanup) activeCleanups.push(oldErrorCleanup);
 
                 await window.electronAPI?.streamGeminiChat(
                     question,
@@ -500,6 +536,17 @@ ${contextString}`;
             setMessages(prev => prev.filter(msg => msg.id !== assistantMessageId));
             setErrorMessage("Something went wrong. Please try again.");
             setChatState('error');
+        } finally {
+            // Always remove listeners and reset chatState — even if the
+            // IPC done/error callbacks never fired. Without this, a single
+            // hung stream leaves chatState stuck and silently drops every
+            // subsequent submitQuestion (no user-message push, no response).
+            activeCleanups.forEach(fn => fn());
+            activeCleanups = [];
+            // Preserve an explicit 'error' state if one was set; otherwise
+            // fall back to 'idle' so the next submit can proceed.
+            setChatState(prev => (prev === 'error' ? prev : 'idle'));
+            streamBuffer.reset();
         }
     }, [chatState, buildContextString, meetingContext]);
 
@@ -534,7 +581,8 @@ ${contextString}`;
                             height: { type: "spring", stiffness: 300, damping: 30, mass: 0.8 },
                             opacity: { duration: 0.2 }
                         }}
-                        className="relative mx-auto w-full max-w-[680px] mb-0 bg-bg-secondary rounded-t-[24px] border-t border-x border-border-subtle shadow-2xl overflow-hidden flex flex-col"
+                        className="relative mx-auto w-full max-w-[680px] mb-0 rounded-t-[24px] border-t border-x border-border-subtle shadow-2xl overflow-hidden flex flex-col"
+                        style={{ backgroundColor: chatWindowBg }}
                         onClick={(e) => e.stopPropagation()}
                     >
                         {/* Header with close button */}

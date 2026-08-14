@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useId } from 'react';
+import { useT } from '../i18n';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { ArrowLeft, Search, Mail, Link, ChevronDown, Play, ArrowUp, Copy, Check, MoreHorizontal, Settings, ArrowRight, RefreshCw, Info, Eye, EyeOff, History, Pencil, X, ChevronRight } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
@@ -11,7 +12,8 @@ import NativelyLogo from './icon.png';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import SyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { vividDarkCodeTheme } from '../lib/codeTheme';
+import { splitGistLine } from '../lib/displayMarkup';
 
 registerPrismLanguages();
 
@@ -211,6 +213,7 @@ function techniqueLabel(body: string): string {
 // Copy-to-clipboard control for the code hero. Ghosted until hover on desktop,
 // icon crossfades copy → check on success and reverts after 2s.
 const CopyButton: React.FC<{ text: string }> = ({ text }) => {
+    const t = useT();
     const [copied, setCopied] = useState(false);
     const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
     useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
@@ -230,7 +233,7 @@ const CopyButton: React.FC<{ text: string }> = ({ text }) => {
         <button
             type="button"
             onClick={handle}
-            aria-label={copied ? 'Copied' : 'Copy code'}
+            aria-label={copied ? t('Copied') : t('Copy code')}
             className="relative w-6 h-6 inline-flex items-center justify-center rounded-md text-white/40 hover:text-white/80 hover:bg-white/[0.06] transition-[color,background-color,transform] duration-100 ease-out active:scale-[0.92] opacity-100 md:opacity-0 md:group-hover:opacity-100 focus:outline-none focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-white/20"
         >
             <AnimatePresence mode="wait" initial={false}>
@@ -268,6 +271,7 @@ function markdownToPlainText(md: string): string {
 // Text button used in the answer-level hover action bar (copy whole answer).
 // Same copy→check feedback as CopyButton but with a visible label.
 const AnswerCopyButton: React.FC<{ text: string }> = ({ text }) => {
+    const t = useT();
     const [copied, setCopied] = useState(false);
     const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
     useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
@@ -284,11 +288,11 @@ const AnswerCopyButton: React.FC<{ text: string }> = ({ text }) => {
         <button
             type="button"
             onClick={handle}
-            aria-label={copied ? 'Copied answer' : 'Copy answer'}
+            aria-label={copied ? t('Copied answer') : t('Copy answer')}
             className="inline-flex items-center gap-1 h-6 px-1.5 rounded-md cursor-default select-none text-[11px] font-medium text-text-tertiary hover:text-text-secondary hover:bg-white/[0.05] transition-[color,background-color,transform] duration-[120ms] ease-out active:scale-[0.97] focus:outline-none focus-visible:ring-2 focus-visible:ring-white/25"
         >
             {copied ? <Check className="w-3 h-3 text-emerald-400" strokeWidth={2.5} /> : <Copy className="w-3 h-3" strokeWidth={2} />}
-            <span>{copied ? 'Copied' : 'Copy'}</span>
+            <span>{copied ? t('Copied') : t('Copy')}</span>
         </button>
     );
 };
@@ -331,6 +335,23 @@ function parseCodingTemplate(answer: string): CodingSection[] | null {
     return sections;
 }
 
+// GFM table renderers, defined once and shared by every ReactMarkdown surface in
+// this file. Tailwind's preflight zeroes cell padding, so columns need explicit
+// gaps (right padding) and a hairline under the header. The min-w-0 wrapper is
+// what makes a wide table scroll instead of stretching the column it sits in,
+// and `code-scroll` keeps that scrollbar discreet — see the .code-scroll block
+// in index.css for why the global scrollbar rule does not cover this case.
+// `tableClass` is the only thing that varies between surfaces (font size).
+const makeTableComponents = (tableClass: string) => ({
+    table: ({ node, ...props }: any) => (
+        <div className="code-scroll w-full min-w-0 overflow-x-auto mb-2 last:mb-0">
+            <table className={`border-collapse ${tableClass}`} {...props} />
+        </div>
+    ),
+    th: ({ node, ...props }: any) => <th className="text-left align-top font-semibold text-text-primary pr-5 last:pr-0 pb-1.5 border-b border-border-muted" {...props} />,
+    td: ({ node, ...props }: any) => <td className="text-left align-top text-text-secondary tabular-nums pr-5 last:pr-0 py-1" {...props} />,
+});
+
 // Shared markdown renderer config — used by both CodingAnswerBlock and plain answers.
 const mdComponents = {
     h1: ({ node, ...props }: any) => <p className="text-[15px] text-text-secondary font-semibold leading-relaxed mb-2" {...props} />,
@@ -341,7 +362,8 @@ const mdComponents = {
     ol: ({ node, ...props }: any) => <ol className="list-decimal ml-4 mb-2 space-y-1.5" {...props} />,
     li: ({ node, ...props }: any) => <li className="text-[15px] text-text-secondary font-normal leading-relaxed" {...props} />,
     strong: ({ node, ...props }: any) => <strong className="font-semibold text-text-primary" {...props} />,
-    a: ({ node, ...props }: any) => <a target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors duration-150" {...props} />,
+    ...makeTableComponents('text-[13.5px] leading-relaxed'),
+    a: ({ node, ...props }: any) => <a target="_blank" rel="noopener noreferrer" className="text-accent-primary hover:text-accent-hover underline underline-offset-2 transition-colors duration-150" {...props} />,
     pre: ({ children }: any) => <div className="mb-3 last:mb-0">{children}</div>,
     code: ({ node, className, children, ...props }: any) => {
         const match = /language-([\w+#-]+)/.exec(className || '');
@@ -382,7 +404,7 @@ const CodeHero: React.FC<{ lang: string; code: string; technique?: string }> = (
         return () => { el.removeEventListener('scroll', update); ro.disconnect(); };
     }, [code]);
     return (
-        <div className="group relative w-full min-w-0 rounded-xl overflow-hidden border border-white/[0.08] ring-1 ring-inset ring-white/[0.05] bg-zinc-900/80 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] transition-colors duration-200 hover:border-white/[0.12]">
+        <div className="group relative w-full min-w-0 rounded-xl overflow-hidden border border-white/[0.08] ring-1 ring-inset ring-white/[0.05] bg-[#0a0a0d]/90 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)] transition-colors duration-200 hover:border-white/[0.12]">
             <div className="flex items-center gap-2 h-9 px-3 border-b border-white/[0.05] bg-white/[0.02]">
                 <span className="text-[11px] uppercase tracking-[0.04em] font-medium text-text-tertiary font-mono select-none cursor-default">
                     {resolved || 'code'}
@@ -402,7 +424,7 @@ const CodeHero: React.FC<{ lang: string; code: string; technique?: string }> = (
             >
                 <SyntaxHighlighter
                     language={resolved}
-                    style={vscDarkPlus}
+                    style={vividDarkCodeTheme}
                     customStyle={{ margin: 0, borderRadius: 0, fontSize: '13px', lineHeight: '1.6', background: 'transparent', padding: '14px 16px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace' }}
                     showLineNumbers={lineCount > 8}
                     lineNumberStyle={{ minWidth: '2.2em', paddingRight: '1.2em', color: 'rgba(255,255,255,0.2)', textAlign: 'right', fontSize: '11px', userSelect: 'none' }}
@@ -424,6 +446,7 @@ const CodeHero: React.FC<{ lang: string; code: string; technique?: string }> = (
  *   crossfade when switching, iOS drawer curve for open/close).
  */
 const CodingAnswerBlock: React.FC<{ sections: CodingSection[]; firstView?: boolean }> = ({ sections, firstView = false }) => {
+    const t = useT();
     const reduce = useReducedMotion();
     const [activeDetail, setActiveDetail] = useState<DetailKind | null>(null);
     const panelRef = useRef<HTMLDivElement>(null);
@@ -530,7 +553,7 @@ const CodingAnswerBlock: React.FC<{ sections: CodingSection[]; firstView?: boole
             {/* Complexity — always-visible chip, never behind a click */}
             {complexityChip && (
                 <motion.div variants={childVariant} className="flex items-center gap-1.5 -mt-1">
-                    <span className="text-[10px] uppercase tracking-[0.1em] font-semibold text-white/25 select-none cursor-default">cost</span>
+                    <span className="text-[10px] uppercase tracking-[0.1em] font-semibold text-white/25 select-none cursor-default">{t('cost')}</span>
                     <span className="text-[12px] tabular-nums text-text-secondary font-medium select-text font-mono">{renderComplexity(complexityChip)}</span>
                 </motion.div>
             )}
@@ -554,7 +577,7 @@ const CodingAnswerBlock: React.FC<{ sections: CodingSection[]; firstView?: boole
                         <div
                             ref={pillsRef}
                             role="tablist"
-                            aria-label="Answer detail"
+                            aria-label={t("Answer detail")}
                             className="flex items-center gap-0.5"
                             onKeyDown={onPillKeyDown}
                         >
@@ -586,13 +609,6 @@ const CodingAnswerBlock: React.FC<{ sections: CodingSection[]; firstView?: boole
                                             />
                                         )}
                                         <span className="relative z-10">{pill.label}</span>
-                                        {/* Chevron signals panel OPEN vs closed (not which pill) */}
-                                        {isActive && (
-                                            <ChevronDown
-                                                className="relative z-10 w-3 h-3 text-text-tertiary transition-transform duration-200 ease-out rotate-180"
-                                                strokeWidth={2.5}
-                                            />
-                                        )}
                                     </button>
                                 );
                             })}
@@ -652,7 +668,7 @@ const UsageInteraction: React.FC<{
     useEffect(() => { seenInteractionIds.add(id); }, [id]);
 
     const codingSections = interaction.answer ? parseCodingTemplate(interaction.answer) : null;
-    const answerPlain = interaction.answer ? markdownToPlainText(interaction.answer) : '';
+    const answerPlain = interaction.answer ? markdownToPlainText(splitGistLine(interaction.answer).body) : '';
 
     const enter = (offset: { x?: number; y?: number }, delay: number) => {
         // Repeat views are always instant. First view: full slide-in normally,
@@ -667,7 +683,16 @@ const UsageInteraction: React.FC<{
             {/* User question — contained bubble, enters from the right, selectable */}
             {interaction.question && (
                 <div className="group/q flex flex-col items-end">
-                    <motion.div {...enter({ x: 8 }, staggerDelay)} className="bg-accent-primary text-white px-5 py-2.5 rounded-2xl rounded-tr-sm max-w-[80%] text-[15px] leading-relaxed shadow-sm select-text">
+                    {/* Fill, gradient, glow and foreground all come from .bubble-user (index.css)
+                        rather than utilities — a gradient cannot live in the background-color that
+                        bg-[var(...)] compiles to. It also replaces shadow-sm, whose plain black
+                        shadow is invisible on the dark pane and muddies the tinted glow. Not
+                        the accent tokens directly: --bubble-user-* points AT the accent but stays a
+                        separate pair, so the bubble can be retuned without moving every button and
+                        focus ring with it. White text on the dark-mode fill is 2.21:1 — an
+                        accepted but severe AA shortfall, recorded in
+                        PeriwinkleContrastGuard.test.mjs. */}
+                    <motion.div {...enter({ x: 8 }, staggerDelay)} className="bubble-user px-5 py-2.5 rounded-2xl rounded-tr-sm max-w-[80%] text-[15px] leading-relaxed select-text">
                         {interaction.question}
                     </motion.div>
                     <span className="mt-1 pr-1 text-[11px] text-text-tertiary select-none cursor-default opacity-0 translate-y-1 group-hover/q:opacity-100 group-hover/q:translate-y-0 transition-all duration-[160ms] ease-out">
@@ -686,11 +711,19 @@ const UsageInteraction: React.FC<{
                         <div className="text-text-secondary text-[15px] leading-relaxed max-w-none select-text">
                             {codingSections
                                 ? <CodingAnswerBlock sections={codingSections} firstView={firstView} />
-                                : (
-                                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                                        {cleanMarkdown(interaction.answer || '')}
-                                    </ReactMarkdown>
-                                )}
+                                : (() => {
+                                    // Teleprompter gist: persisted answers can end with a
+                                    // [[GIST]] line — render it as a summary chip, not text.
+                                    const { body: gistBody, gist: gistLine } = splitGistLine(interaction.answer || '');
+                                    return (
+                                        <>
+                                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                                                {cleanMarkdown(gistBody)}
+                                            </ReactMarkdown>
+                                            {gistLine && <div className="overlay-gist-chip">{gistLine}</div>}
+                                        </>
+                                    );
+                                })()}
                         </div>
                         {/* Answer action bar — bottom-left, revealed on hover/focus-within */}
                         <div className="flex items-center gap-2 mt-2 opacity-0 translate-y-1 [@media(hover:hover)]:group-hover/a:opacity-100 [@media(hover:hover)]:group-hover/a:translate-y-0 group-focus-within/a:opacity-100 group-focus-within/a:translate-y-0 [@media(hover:none)]:opacity-100 transition-all duration-[160ms] ease-out select-none">
@@ -711,11 +744,12 @@ const ToneDropdown: React.FC<{
     isRegeneratingFollowUp: boolean;
     onSelect: (tone: 'professional' | 'warm' | 'concise' | 'friendly') => void;
 }> = ({ followUpTone, isRegeneratingFollowUp, onSelect }) => {
+    const t = useT();
     const toneOptions: { value: 'professional' | 'warm' | 'concise' | 'friendly'; label: string }[] = [
-        { value: 'professional', label: 'Professional' },
-        { value: 'warm',         label: 'Warm'         },
-        { value: 'concise',      label: 'Concise'      },
-        { value: 'friendly',     label: 'Friendly'     },
+        { value: 'professional', label: t('Professional') },
+        { value: 'warm',         label: t('Warm')         },
+        { value: 'concise',      label: t('Concise')      },
+        { value: 'friendly',     label: t('Friendly')     },
     ];
     const [toneOpen, setToneOpen] = useState(false);
     const toneRef = useRef<HTMLDivElement>(null);
@@ -735,7 +769,7 @@ const ToneDropdown: React.FC<{
                 onClick={() => setToneOpen(v => !v)}
                 className="h-7 inline-flex items-center gap-1.5 text-[11px] font-medium pl-2.5 pr-2 rounded-md text-text-secondary hover:text-text-primary hover:bg-white/[0.06] disabled:opacity-50 transition-colors"
             >
-                <span>{toneOptions.find(o => o.value === followUpTone)?.label ?? 'Tone'}</span>
+                <span>{toneOptions.find(o => o.value === followUpTone)?.label ?? t('Tone')}</span>
                 <ChevronDown className={`w-3 h-3 text-text-tertiary transition-transform duration-150 ${toneOpen ? 'rotate-180' : ''}`} strokeWidth={2.5} />
             </button>
             <AnimatePresence>
@@ -852,6 +886,7 @@ interface MeetingDetailsProps {
 }
 
 const MeetingDetails: React.FC<MeetingDetailsProps> = ({ meeting: initialMeeting }) => {
+    const t = useT();
     const isLight = useResolvedTheme() === 'light';
     // We need local state for the meeting object to reflect optimistic updates
     const [meeting, setMeeting] = useState<Meeting>(initialMeeting);
@@ -904,6 +939,56 @@ const MeetingDetails: React.FC<MeetingDetailsProps> = ({ meeting: initialMeeting
     const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
     const [speakerDraft, setSpeakerDraft] = useState('');
     const prefersReducedMotion = useReducedMotion();
+
+    // Tabs sliding — refs into the segmented control so the pill can be
+    // positioned at the active tab. The pill's `transform`/`width` are
+    // written inline by JS; CSS owns the transition. We keep the active
+    // tab in React state (`activeTab`) so this component still drives
+    // content rendering — the pill is purely visual.
+    const meetingTabsBarRef = useRef<HTMLDivElement | null>(null);
+    const meetingTabsPillRef = useRef<HTMLSpanElement | null>(null);
+    const meetingTabsBtnRefs = useRef<Record<'summary' | 'transcript' | 'usage', HTMLButtonElement | null>>({
+        summary: null,
+        transcript: null,
+        usage: null,
+    });
+    useEffect(() => {
+        const bar = meetingTabsBarRef.current;
+        const pill = meetingTabsPillRef.current;
+        if (!bar || !pill) return;
+        const tab = meetingTabsBtnRefs.current[activeTab];
+        if (!tab) return;
+        // First-paint / active-change path. On first paint the pill starts
+        // at `translateX(0) width:0`; without suspending the transition it
+        // would animate in from that origin to the active tab. Suspend the
+        // transition, write, reflow, restore — so the pill snaps into
+        // position before any animation can run. Same trick on resize so a
+        // window resize doesn't replay the slide.
+        const prev = pill.style.transition;
+        pill.style.transition = 'none';
+        pill.style.transform = `translateX(${tab.offsetLeft}px)`;
+        pill.style.width = `${tab.offsetWidth}px`;
+        // Force the layout so the suspended transition is committed before
+        // we restore it. `void el.offsetWidth` is the standard reflow probe.
+        void pill.offsetWidth;
+        pill.style.transition = prev;
+    }, [activeTab]);
+    useEffect(() => {
+        const pill = meetingTabsPillRef.current;
+        if (!pill) return;
+        const handleResize = () => {
+            const tab = meetingTabsBtnRefs.current[activeTab];
+            if (!tab) return;
+            const prev = pill.style.transition;
+            pill.style.transition = 'none';
+            pill.style.transform = `translateX(${tab.offsetLeft}px)`;
+            pill.style.width = `${tab.offsetWidth}px`;
+            void pill.offsetWidth;
+            pill.style.transition = prev;
+        };
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, [activeTab]);
 
     const copyRecipe = (text: string) => {
         navigator.clipboard?.writeText(text || '').catch(() => { /* swallow */ });
@@ -1137,16 +1222,23 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
     };
 
 
+    // Dark theme sits on the elevated grey (#151515) rather than the near-black
+    // --bg-secondary, matching the Launcher hero section. Light theme is unchanged.
     return (
-        <div className="h-full w-full flex flex-col bg-bg-secondary text-text-secondary font-sans overflow-hidden">
+        <div className={`h-full w-full flex flex-col ${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'} text-text-secondary font-sans overflow-hidden`}>
             {/* Main Content */}
-            <main className="flex-1 overflow-y-auto custom-scrollbar">
-                <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.1, duration: 0.3 }}
-                    className="max-w-4xl mx-auto px-8 py-8 pb-32" // Added pb-32 for floating footer clearance
-                >
+            <main className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
+                {/* Pinned header — date, title and the tab row stay put; only tab content scrolls.
+                    Kept inside <main> (rather than hoisted above it) so it shares the scroll box's
+                    content width: a two-container split would offset this column from the one below
+                    by the scrollbar width on platforms with classic (non-overlay) scrollbars. */}
+                <div className={`sticky top-0 z-20 ${isLight ? 'bg-bg-secondary' : 'bg-bg-elevated'}`}>
+                    <motion.div
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.1, duration: 0.3 }}
+                        className="max-w-4xl mx-auto px-8 pt-8 pb-8"
+                    >
                     {/* Meta Info & Actions Row */}
                     <div className="flex items-start justify-between mb-6">
                         <div className="w-full pr-4">
@@ -1171,26 +1263,25 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
 
                     {/* Tabs */}
                     {/* Designing Tabs to match reference 1:1 (Dark Pill Container) */}
-                    <div className="flex items-center justify-between mb-8">
-                        <div className={`p-1 rounded-xl inline-flex items-center gap-0.5 ${isLight ? 'bg-[#E5E5EA] border border-black/[0.04]' : 'bg-[#121214] border border-white/[0.08]'}`}>
-                            {['summary', 'transcript', 'usage'].map((tab) => (
+                    {/* Spacing below the tab row lives on the sticky wrapper's pb-8, not a margin
+                        here — a trailing child margin collapses out of the sticky box and would
+                        leave a 32px strip the header background doesn't paint. */}
+                    <div className="flex items-center justify-between">
+                        {/* Dark well deepened from #121214 to #0D0D0F: against the old near-black
+                            surface it read as a raised container, but on the elevated grey it was
+                            within ~3 levels of the page and the control lost its shape. */}
+                        <div ref={meetingTabsBarRef} className="t-tabs" role="tablist">
+                            <span ref={meetingTabsPillRef} className="t-tabs-pill" aria-hidden="true" />
+                            {(['summary', 'transcript', 'usage'] as const).map((tab) => (
                                 <button
                                     key={tab}
-                                    onClick={() => setActiveTab(tab as any)}
-                                    className={`
-                                        relative px-3 py-1 text-[13px] font-medium rounded-lg transition-all duration-200 z-10
-                                        ${activeTab === tab ? (isLight ? 'text-black' : 'text-[#E9E9E9]') : `${isLight ? 'text-text-secondary' : 'text-text-tertiary'} hover:text-text-primary`}
-                                    `}
+                                    ref={(el) => { meetingTabsBtnRefs.current[tab] = el; }}
+                                    role="tab"
+                                    aria-selected={activeTab === tab}
+                                    onClick={() => setActiveTab(tab)}
+                                    className="t-tab"
                                 >
-                                    {activeTab === tab && (
-                                        <motion.div
-                                            layoutId="activeTabBackground"
-                                            className={`absolute inset-0 rounded-lg -z-10 shadow-sm ${isLight ? 'bg-white' : 'bg-[#3A3A3C]'}`}
-                                            initial={false}
-                                            transition={{ type: "spring", stiffness: 400, damping: 30 }}
-                                        />
-                                    )}
-                                    {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                                    {tab === 'summary' ? t('Summary') : tab === 'transcript' ? t('Transcript') : t('Usage')}
                                 </button>
                             ))}
                         </div>
@@ -1201,10 +1292,18 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                             className="flex items-center gap-2 text-xs font-medium text-text-secondary hover:text-text-primary transition-colors"
                         >
                             {isCopied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
-                            {isCopied ? 'Copied' : activeTab === 'summary' ? 'Copy full summary' : activeTab === 'transcript' ? 'Copy full transcript' : 'Copy usage'}
+                            {isCopied ? t('Copied') : activeTab === 'summary' ? t('Copy full summary') : activeTab === 'transcript' ? t('Copy full transcript') : t('Copy usage')}
                         </button>
                     </div>
+                    </motion.div>
+                </div>
 
+                <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.1, duration: 0.3 }}
+                    className="max-w-4xl mx-auto px-8 pb-32" // pb-32 for floating footer clearance
+                >
                     {/* Tab Content */}
                     <div className="space-y-8">
                         {/* Using standard divs for content, framer motion for layout */}
@@ -1224,7 +1323,8 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                             ol: ({ node, ...props }) => <ol className="list-decimal ml-4 mb-2 space-y-1" {...props} />,
                                             li: ({ node, ...props }) => <li className="text-sm text-text-secondary" {...props} />,
                                             strong: ({ node, ...props }) => <strong className="font-semibold text-text-primary" {...props} />,
-                                            a: ({ node, ...props }) => <a className="text-blue-500 hover:underline" {...props} />,
+                                            a: ({ node, ...props }) => <a className="text-accent-primary hover:underline" {...props} />,
+                                            ...makeTableComponents('text-sm leading-relaxed'),
                                         }}
                                     >
                                         {meeting.detailedSummary?.overview || ''}
@@ -1289,7 +1389,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                         strokeWidth={2}
                                                     />
                                                 </motion.span>
-                                                <span>{isRegenerating ? 'Regenerating…' : 'Regenerate notes'}</span>
+                                                <span>{isRegenerating ? t('Regenerating…') : t('Regenerate notes')}</span>
                                             </motion.button>
 
                                             <div className="w-px h-4 bg-border-subtle shrink-0" aria-hidden="true" />
@@ -1300,7 +1400,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                 whileTap={prefersReducedMotion ? undefined : { scale: 0.96 }}
                                                 transition={{ duration: 0.16, ease: [0.23, 1, 0.32, 1] }}
                                                 aria-pressed={showEvidence}
-                                                className={`h-7 inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 rounded-md transition-colors ${showEvidence ? 'text-accent-primary bg-accent-primary/10' : 'text-text-secondary hover:text-text-primary hover:bg-white/[0.06]'}`}
+                                                className={`h-7 inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 rounded-md transition-colors ${showEvidence ? 'text-accent-primary bg-accent-subtle' : 'text-text-secondary hover:text-text-primary hover:bg-white/[0.06]'}`}
                                             >
                                                 <span className="relative w-3.5 h-3.5 shrink-0">
                                                     <AnimatePresence initial={false} mode="wait">
@@ -1318,7 +1418,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                         </motion.span>
                                                     </AnimatePresence>
                                                 </span>
-                                                <span>{showEvidence ? 'Hide evidence' : 'Show evidence'}</span>
+                                                <span>{showEvidence ? t('Hide evidence') : t('Show evidence')}</span>
                                             </motion.button>
                                         </div>
                                         {v3SummaryStatus && v3SummaryStatus !== 'completed' && (
@@ -1345,12 +1445,12 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     >
                                         <div className="min-w-0">
                                             <p className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-tertiary mb-1">
-                                                {v3Mode.selectedModeName ? `This looks like a ${v3Mode.detectedModeName}` : 'Better template available'}
+                                                {v3Mode.selectedModeName ? `${t('This looks like a')} ${v3Mode.detectedModeName}` : t('Better template available')}
                                             </p>
                                             <p className="text-[14px] font-semibold text-text-primary tracking-[-0.01em] truncate leading-tight">
                                                 {isRegenerating
-                                                    ? 'Regenerating…'
-                                                    : <>Regenerate notes as <span className="text-accent-primary">{v3Mode.detectedModeName}</span></>}
+                                                    ? t('Regenerating…')
+                                                    : <>{t('Regenerate notes as')} <span className="text-accent-primary">{v3Mode.detectedModeName}</span></>}
                                             </p>
                                         </div>
                                         <ChevronRight className="shrink-0 w-4 h-4 text-text-tertiary group-hover:text-accent-primary group-hover:translate-x-0.5 transition-all duration-150" strokeWidth={2} />
@@ -1367,7 +1467,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     >
                                         <div className="flex items-center gap-2 mb-2.5">
                                             <History className="w-3.5 h-3.5 text-text-tertiary shrink-0" strokeWidth={2} />
-                                            <p className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-tertiary">From earlier meetings</p>
+                                            <p className="text-[11px] font-medium uppercase tracking-[0.06em] text-text-tertiary">{t('From earlier meetings')}</p>
                                         </div>
                                         <ul className="space-y-2">
                                             {meeting.detailedSummary.crossMeeting.stillOpen.map((line, i) => (
@@ -1383,7 +1483,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                 {/* Summary on top — outcome-first, grounded. Then the mode's template sections below. */}
                                 {isV3Summary && v3Tldr.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Summary</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Summary')}</h2>
                                         <ul className="space-y-3">
                                             {v3Tldr.map((item, i) => (
                                                 <li key={i} className="flex items-start gap-3 group">
@@ -1410,7 +1510,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             <div className="min-w-0 flex-1">
                                                                 <p className="text-sm text-text-secondary leading-relaxed">{bullet.text}</p>
                                                                 {showEvidence && evidenceLabel(bullet.evidence) && (
-                                                                    <button type="button" onClick={() => jumpToEvidence(bullet.evidence)} className="text-[11px] text-blue-400/80 hover:text-blue-300 mt-1 text-left">↳ {evidenceLabel(bullet.evidence)}</button>
+                                                                    <button type="button" onClick={() => jumpToEvidence(bullet.evidence)} className="text-[11px] text-accent-primary hover:text-accent-hover mt-1 text-left">↳ {evidenceLabel(bullet.evidence)}</button>
                                                                 )}
                                                             </div>
                                                         </li>
@@ -1427,7 +1527,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     recall). Flip to true to surface them again. */}
                                 {SHOW_STRUCTURED_BLOCKS && isV3Summary && v3WhatChanged.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">What changed</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('What changed')}</h2>
                                         <ul className="space-y-3">
                                             {v3WhatChanged.map((item, i) => (
                                                 <li key={i} className="flex items-start gap-3 group">
@@ -1441,7 +1541,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
 
                                 {SHOW_STRUCTURED_BLOCKS && isV3Summary && v3Decisions.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Decisions</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Decisions')}</h2>
                                         <ul className="space-y-3">
                                             {v3Decisions.map((item, i) => (
                                                 <li key={item.id || i} className="p-3 rounded-[10px] border border-white/10 bg-white/[0.02]">
@@ -1451,10 +1551,10 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             <p className="text-sm text-text-secondary leading-relaxed">{item.text}</p>
                                                             <p className="text-[11px] text-text-tertiary mt-1">
                                                                 {item.owner && <span>{item.owner} · </span>}
-                                                                <span>{item.confidence} confidence</span>
+                                                                <span>{item.confidence} {t('confidence')}</span>
                                                             </p>
                                                             {showEvidence && evidenceLabel(item.evidence) && (
-                                                                <button type="button" onClick={() => jumpToEvidence(item.evidence)} className="text-[11px] text-blue-400/80 hover:text-blue-300 mt-1 text-left">↳ {evidenceLabel(item.evidence)}</button>
+                                                                <button type="button" onClick={() => jumpToEvidence(item.evidence)} className="text-[11px] text-accent-primary hover:text-accent-hover mt-1 text-left">↳ {evidenceLabel(item.evidence)}</button>
                                                             )}
                                                         </div>
                                                     </div>
@@ -1466,7 +1566,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
 
                                 {SHOW_STRUCTURED_BLOCKS && isV3Summary && v3Actions.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Action Items</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Action Items')}</h2>
                                         <ul className="space-y-3">
                                             {v3Actions.map((item, i) => (
                                                 <li key={item.id || i} className="p-3 rounded-[10px] border border-emerald-400/20 bg-emerald-500/[0.03]">
@@ -1476,12 +1576,12 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             <p className="text-sm text-text-secondary leading-relaxed">{item.text}</p>
                                                             <p className="text-[11px] text-text-tertiary mt-1 flex flex-wrap gap-x-1">
                                                                 {item.owner && <span className="font-medium">{item.owner}</span>}
-                                                                {item.deadline && <span>by {item.deadline}</span>}
+                                                                {item.deadline && <span>{t('by')} {item.deadline}</span>}
                                                                 <span className={`px-1.5 py-0.5 rounded border ${item.explicitness === 'explicit' ? 'border-emerald-400/30 text-emerald-400' : 'border-amber-400/30 text-amber-400'}`}>{item.explicitness}</span>
-                                                                <span>{item.confidence} confidence</span>
+                                                                <span>{item.confidence} {t('confidence')}</span>
                                                             </p>
                                                             {showEvidence && evidenceLabel(item.evidence) && (
-                                                                <button type="button" onClick={() => jumpToEvidence(item.evidence)} className="text-[11px] text-blue-400/80 hover:text-blue-300 mt-1 text-left">↳ {evidenceLabel(item.evidence)}</button>
+                                                                <button type="button" onClick={() => jumpToEvidence(item.evidence)} className="text-[11px] text-accent-primary hover:text-accent-hover mt-1 text-left">↳ {evidenceLabel(item.evidence)}</button>
                                                             )}
                                                         </div>
                                                     </div>
@@ -1493,7 +1593,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
 
                                 {SHOW_STRUCTURED_BLOCKS && isV3Summary && v3Questions.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Open Questions</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Open Questions')}</h2>
                                         <ul className="space-y-3">
                                             {v3Questions.map((item, i) => (
                                                 <li key={item.id || i} className="flex items-start gap-3 group">
@@ -1510,12 +1610,12 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
 
                                 {SHOW_STRUCTURED_BLOCKS && isV3Summary && v3Risks.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Risks / Blockers</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Risks / Blockers')}</h2>
                                         <ul className="space-y-3">
                                             {v3Risks.map((item, i) => (
                                                 <li key={item.id || i} className="p-3 rounded-[10px] border border-red-400/20 bg-red-500/[0.03]">
                                                     <p className="text-sm text-text-secondary leading-relaxed">{item.text}</p>
-                                                    <p className="text-[11px] text-text-tertiary mt-1">{item.severity} severity{evidenceLabel(item.evidence) ? ` · ${evidenceLabel(item.evidence)}` : ''}</p>
+                                                    <p className="text-[11px] text-text-tertiary mt-1">{item.severity} {t('severity')}{evidenceLabel(item.evidence) ? ` · ${evidenceLabel(item.evidence)}` : ''}</p>
                                                 </li>
                                             ))}
                                         </ul>
@@ -1526,7 +1626,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                 {isV3Summary && followUpBody.trim() && (
                                     <section className="mb-8">
                                         <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
-                                            <h2 className="text-lg font-semibold text-text-primary">Follow-up draft</h2>
+                                            <h2 className="text-lg font-semibold text-text-primary">{t('Follow-up draft')}</h2>
                                             <div className="flex items-center gap-1 p-1 rounded-lg bg-white/[0.03] border border-border-subtle">
                                                 {/* Copy — with a real copied-confirmation state. */}
                                                 <motion.button
@@ -1538,7 +1638,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                     }}
                                                     whileTap={prefersReducedMotion ? undefined : { scale: 0.96 }}
                                                     transition={{ duration: 0.16, ease: [0.23, 1, 0.32, 1] }}
-                                                    aria-label={followUpCopied ? 'Copied' : 'Copy follow-up draft'}
+                                                    aria-label={followUpCopied ? t('Copied') : t('Copy follow-up draft')}
                                                     className="h-7 inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 rounded-md text-text-secondary hover:text-text-primary hover:bg-white/[0.06] transition-colors"
                                                 >
                                                     <span className="relative w-3.5 h-3.5 shrink-0">
@@ -1568,7 +1668,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             )}
                                                         </AnimatePresence>
                                                     </span>
-                                                    <span className="min-w-[30px] text-left">{followUpCopied ? 'Copied' : 'Copy'}</span>
+                                                    <span className="min-w-[30px] text-left">{followUpCopied ? t('Copied') : t('Copy')}</span>
                                                 </motion.button>
 
                                                 <div className="w-px h-4 bg-border-subtle shrink-0" aria-hidden="true" />
@@ -1586,7 +1686,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                         className={`w-3.5 h-3.5 shrink-0 ${isRegeneratingFollowUp && !prefersReducedMotion ? 'animate-spin' : ''}`}
                                                         strokeWidth={2}
                                                     />
-                                                    <span>{isRegeneratingFollowUp ? 'Regenerating…' : 'Regenerate'}</span>
+                                                    <span>{isRegeneratingFollowUp ? t('Regenerating…') : t('Regenerate')}</span>
                                                 </motion.button>
 
                                                 <div className="w-px h-4 bg-border-subtle shrink-0" aria-hidden="true" />
@@ -1599,7 +1699,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                 />
                                             </div>
                                         </div>
-                                        {followUpSubject && <p className="text-[12.5px] text-text-tertiary mb-1">Subject: {followUpSubject}</p>}
+                                        {followUpSubject && <p className="text-[12.5px] text-text-tertiary mb-1">{t('Subject:')} {followUpSubject}</p>}
                                         <pre className="text-[12.5px] text-text-secondary leading-relaxed whitespace-pre-wrap font-sans select-text cursor-text p-3 rounded-[10px] border border-white/10 bg-white/[0.02]">{followUpBody}</pre>
                                     </section>
                                 )}
@@ -1609,7 +1709,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     <section className="mb-8">
                                         <div className="flex items-center justify-between mb-4">
                                             <EditableTextBlock
-                                                initialValue={meeting.detailedSummary?.actionItemsTitle || 'Action Items'}
+                                                initialValue={meeting.detailedSummary?.actionItemsTitle || t('Action Items')}
                                                 onSave={(val) => {
                                                     setMeeting(prev => ({
                                                         ...prev,
@@ -1625,14 +1725,14 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         <ul className="space-y-3">
                                             {meeting.detailedSummary.actionItems.map((item, i) => (
                                                 <li key={actionItemKeys[i] ?? i} className="flex items-start gap-3 group">
-                                                    <div className="mt-2 w-1.5 h-1.5 rounded-full bg-text-secondary group-hover:bg-blue-500 transition-colors shrink-0" />
+                                                    <div className="mt-2 w-1.5 h-1.5 rounded-full bg-text-secondary group-hover:bg-accent-primary transition-colors shrink-0" />
                                                     <div className="flex-1">
                                                         <EditableTextBlock
                                                             initialValue={item}
                                                             onSave={(val) => handleActionItemSave(i, val)}
                                                             tagName="p"
                                                             className="text-sm text-text-secondary leading-relaxed -ml-2 px-2 rounded-sm transition-colors"
-                                                            placeholder="Type an action item..."
+                                                            placeholder={t("Type an action item...")}
                                                             onEnter={() => {
                                                                 const newItems = [...(meeting.detailedSummary?.actionItems || [])];
                                                                 newItems.splice(i + 1, 0, "");
@@ -1659,7 +1759,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     <section>
                                         <div className="flex items-center justify-between mb-4">
                                             <EditableTextBlock
-                                                initialValue={meeting.detailedSummary?.keyPointsTitle || 'Key Points'}
+                                                initialValue={meeting.detailedSummary?.keyPointsTitle || t('Key Points')}
                                                 onSave={(val) => {
                                                     setMeeting(prev => ({
                                                         ...prev,
@@ -1682,7 +1782,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             onSave={(val) => handleKeyPointSave(i, val)}
                                                             tagName="p"
                                                             className="text-sm text-text-secondary leading-relaxed -ml-2 px-2 rounded-sm transition-colors"
-                                                            placeholder="Type a key point..."
+                                                            placeholder={t("Type a key point...")}
                                                             onEnter={() => {
                                                                 const newItems = [...(meeting.detailedSummary?.keyPoints || [])];
                                                                 newItems.splice(i + 1, 0, "");
@@ -1710,7 +1810,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     pre-Phase-7 meetings still look the same. */}
                                 {!isV3Summary && meeting.detailedSummary?.actionItemsStructured && meeting.detailedSummary.actionItemsStructured.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Next Steps</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Next Steps')}</h2>
                                         <ul className="space-y-2">
                                             {meeting.detailedSummary.actionItemsStructured.map(item => (
                                                 <li key={item.id} className="flex items-start gap-3 group">
@@ -1721,7 +1821,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             <p className="text-[11px] text-text-tertiary mt-0.5">
                                                                 {item.owner && <span className="font-medium">{item.owner}</span>}
                                                                 {item.owner && item.deadline && <span> · </span>}
-                                                                {item.deadline && <span>by {item.deadline}</span>}
+                                                                {item.deadline && <span>{t('by')} {item.deadline}</span>}
                                                             </p>
                                                         )}
                                                     </div>
@@ -1734,7 +1834,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                 {/* Phase 7 — Coaching insights (mode-specific opportunities). */}
                                 {meeting.detailedSummary?.coachingInsights && meeting.detailedSummary.coachingInsights.length > 0 && (
                                     <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">Coaching</h2>
+                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Coaching')}</h2>
                                         <ul className="space-y-3">
                                             {meeting.detailedSummary.coachingInsights.map(insight => {
                                                 const tone = insight.severity === 'warning'
@@ -1760,7 +1860,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                 {!isV3Summary && typeof meeting.detailedSummary?.followUpDraft === 'string' && meeting.detailedSummary.followUpDraft.trim() && (
                                     <section className="mb-8">
                                         <div className="flex items-center justify-between mb-3">
-                                            <h2 className="text-lg font-semibold text-text-primary">Follow-up Draft</h2>
+                                            <h2 className="text-lg font-semibold text-text-primary">{t('Follow-up Draft')}</h2>
                                             <button
                                                 type="button"
                                                 onClick={() => {
@@ -1769,7 +1869,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                 }}
                                                 className="text-[11px] px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 text-text-secondary border border-white/10 transition-colors"
                                             >
-                                                Copy
+                                                {t('Copy')}
                                             </button>
                                         </div>
                                         <pre className="text-[12.5px] text-text-secondary leading-relaxed whitespace-pre-wrap font-sans select-text cursor-text p-3 rounded-[10px] border border-white/10 bg-white/[0.02]">{meeting.detailedSummary.followUpDraft}</pre>
@@ -1811,7 +1911,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     if (speakers.length === 0) return null;
                                     return (
                                         <div className="mb-5 flex flex-wrap items-center gap-2">
-                                            <span className="text-[11px] font-medium text-text-tertiary uppercase tracking-wide mr-0.5">Speakers</span>
+                                            <span className="text-[11px] font-medium text-text-tertiary uppercase tracking-wide mr-0.5">{t('Speakers')}</span>
                                             <AnimatePresence initial={false} mode="popLayout">
                                             {speakers.map((sp) => {
                                                 const display = resolveSpeakerName(sp);
@@ -1824,7 +1924,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                             initial={prefersReducedMotion ? undefined : { opacity: 0, scale: 0.96 }}
                                                             animate={prefersReducedMotion ? undefined : { opacity: 1, scale: 1 }}
                                                             transition={{ duration: 0.16, ease: [0.23, 1, 0.32, 1] }}
-                                                            className="inline-flex items-center gap-1 h-7 pl-2 pr-1 rounded-full bg-bg-secondary border border-accent-primary/50 ring-1 ring-accent-primary/20"
+                                                            className="inline-flex items-center gap-1 h-7 pl-2 pr-1 rounded-full bg-bg-secondary border border-accent-focus ring-1 ring-accent-border"
                                                         >
                                                             <input
                                                                 autoFocus
@@ -1839,8 +1939,8 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                                 onMouseDown={e => e.preventDefault()}
                                                                 onClick={() => handleSaveSpeakerLabel(id, speakerDraft)}
                                                                 whileTap={prefersReducedMotion ? undefined : { scale: 0.9 }}
-                                                                className="inline-flex items-center justify-center w-5 h-5 rounded-full text-accent-primary hover:bg-accent-primary/15 transition-colors"
-                                                                title="Save"
+                                                                className="inline-flex items-center justify-center w-5 h-5 rounded-full text-accent-primary hover:bg-accent-muted transition-colors"
+                                                                title={t("Save")}
                                                             >
                                                                 <Check className="w-3 h-3" strokeWidth={2.5} />
                                                             </motion.button>
@@ -1850,7 +1950,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                                 onClick={() => setEditingSpeaker(null)}
                                                                 whileTap={prefersReducedMotion ? undefined : { scale: 0.9 }}
                                                                 className="inline-flex items-center justify-center w-5 h-5 rounded-full text-text-tertiary hover:text-text-primary hover:bg-white/[0.08] transition-colors"
-                                                                title="Cancel"
+                                                                title={t("Cancel")}
                                                             >
                                                                 <X className="w-3 h-3" strokeWidth={2.5} />
                                                             </motion.button>
@@ -1866,7 +1966,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                                         whileTap={prefersReducedMotion ? undefined : { scale: 0.96 }}
                                                         transition={{ duration: 0.16, ease: [0.23, 1, 0.32, 1] }}
                                                         className="group inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full bg-white/[0.04] hover:bg-white/[0.08] text-text-secondary hover:text-text-primary border border-border-subtle transition-colors"
-                                                        title="Rename speaker"
+                                                        title={t("Rename speaker")}
                                                     >
                                                         <span className="text-[11px] font-medium">{display}</span>
                                                         <Pencil className="w-2.5 h-2.5 text-text-tertiary opacity-0 group-hover:opacity-100 transition-opacity shrink-0" strokeWidth={2} />
@@ -1885,7 +1985,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         }) || [];
 
                                         if (filteredTranscript.length === 0) {
-                                            return <p className="text-text-tertiary">No transcript available.</p>;
+                                            return <p className="text-text-tertiary">{t('No transcript available.')}</p>;
                                         }
 
                                         // Find the segment index closest to a pending evidence timestamp.
@@ -1897,7 +1997,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         return filteredTranscript.map((entry, i) => (
                                             <div
                                                 key={i}
-                                                className={`group rounded-md transition-colors ${i === scrollIndex ? 'bg-blue-500/10 ring-1 ring-blue-400/30 -mx-2 px-2 py-1' : ''}`}
+                                                className={`group rounded-md transition-colors ${i === scrollIndex ? 'bg-accent-subtle ring-1 ring-accent-border -mx-2 px-2 py-1' : ''}`}
                                                 ref={i === scrollIndex ? (el) => { if (el && pendingScrollTs != null) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); setTimeout(() => setPendingScrollTs(null), 1500); } } : undefined}
                                             >
                                                 <div className="flex items-center gap-2 mb-1">
@@ -1935,7 +2035,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                         );
                                     });
                                 })()}
-                                {!meeting.usage?.length && <p className="text-text-tertiary">No usage history.</p>}
+                                {!meeting.usage?.length && <p className="text-text-tertiary">{t('No usage history.')}</p>}
                             </section>
                         )}
                     </div>
@@ -1951,7 +2051,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
                         onKeyDown={handleInputKeyDown}
-                        placeholder="Ask about this meeting..."
+                        placeholder={t("Ask about this meeting...")}
                         className="w-full pl-5 pr-12 py-3 bg-transparent backdrop-blur-[24px] backdrop-saturate-[140%] shadow-[0_8px_30px_rgb(0,0,0,0.12)] border border-white/20 rounded-full text-sm text-text-primary placeholder-text-tertiary/70 focus:outline-none transition-shadow duration-200"
                     />
                     <button

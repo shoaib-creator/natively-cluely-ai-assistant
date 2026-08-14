@@ -43,14 +43,14 @@ test('generateSuggestion prepends mode context before transcript context', () =>
 
 test('generateSuggestion keeps active mode suffix in system prompt without user context', () => {
   assert.match(generateSuggestionSource, /const basePrompt = activeModePrompt[\s\S]*\? `\$\{HARD_SYSTEM_PROMPT\}\\n\\n## ACTIVE MODE\\n\$\{activeModePrompt\}`/);
-  assert.doesNotMatch(generateSuggestionSource, /\$\{activeModePrompt\}\$\{customNotesBlock\}/);
 });
 
-test('generateSuggestion sends custom notes and mode context as user message content', () => {
-  // INVARIANT (not exact source shape): custom notes + retrieved mode context are
-  // combined into `suggestionContext` and passed as the USER-content arg, while
-  // `basePrompt` (the trusted system prompt) carries only the mode persona suffix.
-  assert.match(generateSuggestionSource, /const suggestionContext = \[customNotesBlock, enrichedContext\]\.filter\(Boolean\)\.join\('\\n\\n'\);/);
+test('generateSuggestion sends mode context as user message content', () => {
+  // INVARIANT (not exact source shape): the retrieved mode context is passed
+  // through as `suggestionContext` (the USER-content arg), while `basePrompt`
+  // (the trusted system prompt) carries only the mode persona suffix. The
+  // global "Custom Context" textarea that used to be folded in here was removed.
+  assert.match(generateSuggestionSource, /const suggestionContext = enrichedContext;/);
   // The streaming providers receive suggestionContext as the 3rd (context) arg
   // and basePrompt as the 4th (systemPrompt) arg — context is NOT folded into the
   // system prompt. Two streaming branches (custom/curl provider + default client).
@@ -63,11 +63,6 @@ test('generateSuggestion sends custom notes and mode context as user message con
   // the raw promptMessage concatenated into it.
   assert.doesNotMatch(generateSuggestionSource, /generateWithFlash\(\[\{ text: `\$\{systemPrompt\}/);
   assert.doesNotMatch(generateSuggestionSource, /\$\{systemPrompt\}\\n\\n\$\{promptMessage\}/);
-});
-
-test('generateSuggestion does not append custom notes to any system prompt branch', () => {
-  assert.doesNotMatch(generateSuggestionSource, /basePrompt[\s\S]*customNotesBlock/);
-  assert.doesNotMatch(generateSuggestionSource, /Never hedge\. Never say "it depends"\.\$\{customNotesBlock\}/);
 });
 
 test('WhatToAnswerLLM does not append active mode context to system prompt override', () => {
@@ -93,7 +88,12 @@ test('intent answer shapes require grounding for examples and behavioral stories
   assert.doesNotMatch(intentClassifierSource, /Make it realistic and specific\./);
 });
 
-test('WhatToAnswerLLM sends mode context only through user content at runtime', async () => {
+test('WhatToAnswerLLM sends mode context only through user content at runtime (LEGACY path, pinned via kill-switch)', async () => {
+  // Prompt System v2 was promoted to default ON (2026-08-02). This test pins
+  // the LEGACY assembly invariant (mode suffix on the system prompt, untrusted
+  // retrieval only in user content), so it runs with the kill-switch set. The
+  // sibling test below asserts the SAME security property under the v2 regime.
+  process.env.NATIVELY_PROMPT_SYSTEM_V2 = '0';
   const { WhatToAnswerLLM } = require(distWhatToAnswerPath);
   const trustedSuffix = 'TRUSTED_MODE_SUFFIX_SENTINEL';
   const untrustedContext = 'UNTRUSTED_REFERENCE_CONTEXT_SENTINEL';
@@ -137,6 +137,40 @@ test('WhatToAnswerLLM sends mode context only through user content at runtime', 
   assert.match(message, /<transcript trust_level="untrusted">/);
   assert.match(systemPromptOverride, /TRUSTED_MODE_SUFFIX_SENTINEL/);
   assert.doesNotMatch(systemPromptOverride, /UNTRUSTED_REFERENCE_CONTEXT_SENTINEL/);
+  delete process.env.NATIVELY_PROMPT_SYSTEM_V2;
+});
+
+test('WhatToAnswerLLM v2 regime: untrusted retrieval stays OUT of the system prompt (default-on path)', async () => {
+  // Same security property as the legacy test above, asserted for the v2
+  // composition that now ships by default: the system prompt is v2's own
+  // mode contract (the legacy suffix is deliberately NOT appended — v2
+  // carries the mode itself), and untrusted retrieved context reaches the
+  // provider only through user content.
+  delete process.env.NATIVELY_PROMPT_SYSTEM_V2;
+  const { WhatToAnswerLLM } = require(distWhatToAnswerPath);
+  const untrustedContext = 'UNTRUSTED_REFERENCE_CONTEXT_SENTINEL';
+  const calls = [];
+  const llmHelper = {
+    getCapabilities: () => ({ outputBudgetTokens: 2000 }),
+    getPromptTier: () => 'full',
+    fitContextForCurrentModel: text => text,
+    async *streamChat(...args) { calls.push(args); yield 'ok'; },
+  };
+  const modesManager = {
+    getActiveModeSystemPromptSuffix: () => 'TRUSTED_MODE_SUFFIX_SENTINEL',
+    buildRetrievedActiveModeContextBlock: () => untrustedContext,
+    buildActiveModeContextBlock: () => 'RAW_CONTEXT_SHOULD_NOT_BE_USED',
+  };
+  const answerer = new WhatToAnswerLLM(llmHelper, modesManager);
+  for await (const _ of answerer.generateStream('CURRENT_TRANSCRIPT_SENTINEL')) { /* drain */ }
+  assert.equal(calls.length, 1);
+  const [message, _img, context, systemPromptOverride] = calls[0];
+  assert.equal(context, undefined);
+  assert.match(systemPromptOverride, /<active_mode name="/);
+  assert.doesNotMatch(systemPromptOverride, /UNTRUSTED_REFERENCE_CONTEXT_SENTINEL/);
+  assert.doesNotMatch(systemPromptOverride, /## ACTIVE MODE\n/);
+  assert.match(message, /UNTRUSTED_REFERENCE_CONTEXT_SENTINEL/);
+  assert.match(message, /CURRENT_TRANSCRIPT_SENTINEL/);
 });
 
 test('WhatToAnswerLLM does not dump raw active mode context when retrieval misses', async () => {

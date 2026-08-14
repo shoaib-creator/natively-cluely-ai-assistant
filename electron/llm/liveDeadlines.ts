@@ -56,10 +56,30 @@ export const LIVE_PROVIDER_FIRST_USEFUL_COMPLEX_TIMEOUT_MS = 7000;
 export const LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS = 30000;
 /**
  * Absolute ceiling on a live answer's first-useful token (the no-fallback budget).
- * Sits just above the 7s first-useful cap so a MiniMax stream about to deliver at
+ * Sits above the 7s first-useful cap so a MiniMax stream about to deliver at
  * ~6.5s isn't guillotined by this ceiling.
+ *
+ * MUST ALSO STAY ABOVE natively-api's AI_TTFT_BUDGET_MS (10s), and this is the
+ * binding constraint. A Natively-key user's chat goes to
+ * `${NATIVELY_API_URL}/v1/chat` (LLMHelper.ts), where the server runs a
+ * SEQUENTIAL provider cascade (Gemini Flash -> MiniMax-M3 -> Gemini Pro) and
+ * cuts over to the next provider when one is slow to first token. That cutover
+ * is the thing that actually RESCUES a slow turn — the client, by contrast, can
+ * only give up.
+ *
+ * At the previous 8000 the ordering was inverted: the client abandoned the turn
+ * 2s BEFORE the server would have rotated, so the user got the local fallback
+ * (or, for coding, a fabricated scaffold) instead of the answer the server was
+ * about to deliver. 13000 = the server's 10s cutover + 3s for the next leg to
+ * produce a first token. DeadlineBudgetOrdering2026_08_10.test.mjs reads
+ * AI_TTFT_BUDGET_MS out of server.js and fails if these drift back out of order.
+ *
+ * Cost of the raise is near-zero: this ceiling only fires when a provider is
+ * genuinely slow to first token — a healthy stream delivers in <1s and never
+ * approaches it. The inter-token stall guard (unchanged, 8s) still bounds a
+ * mid-stream hang, which is a different failure mode.
  */
-export const LIVE_TOTAL_HARD_TIMEOUT_MS = 8000;
+export const LIVE_TOTAL_HARD_TIMEOUT_MS = 13000;
 /**
  * Local-provider counterpart to LIVE_TOTAL_HARD_TIMEOUT_MS: the no-fallback ceiling
  * when there is no deterministic fallback to swap in. Matches the local first-useful
@@ -75,6 +95,44 @@ export const LIVE_LOCAL_TOTAL_HARD_TIMEOUT_MS = 30000;
 export const LIVE_INTER_TOKEN_STALL_MS = 8000;
 /** Benchmark per-question hard timeout — the outer wrapper that must never be exceeded. */
 export const BENCHMARK_PER_QUESTION_HARD_TIMEOUT_MS = 30000;
+
+/**
+ * Absolute ceiling on the TOTAL characters one answer may stream.
+ *
+ * This is a CHARACTER bound, not a wall-clock one — a different instrument from
+ * LIVE_INTER_TOKEN_STALL_MS, which bounds a mid-stream hang.
+ *
+ * Be honest about the tension (code review 2026-08-12). LIVE_INTER_TOKEN_STALL_MS
+ * promises unconditionally that "healthy long answers are never truncated
+ * mid-sentence". This cap DOES truncate mid-sentence, at whatever chunk boundary
+ * crosses the limit, and it cannot tell a looping model from a genuinely long
+ * answer — only their size. The earlier wording here reconciled the two by
+ * redefining "healthy" as "passes the time-based checks", which is not what that
+ * promise said. The real position: above this size an answer is treated as a
+ * runaway, accepting that a legitimate answer that large is cut off. It is set
+ * high enough (below) that no measured answer comes close, and it is
+ * env-overridable for anyone who hits it.
+ *
+ * Live capture 2026-08-12 (what_to_answer): the model produced 8047 tokens /
+ * 22871 chars over 61s before the SERVER aborted it. tfft was 2084ms and tokens
+ * flowed continuously, so no client guard applied — not the first-token ceiling
+ * (LIVE_TOTAL_HARD_TIMEOUT_MS), not the inter-token stall guard. Nothing on the
+ * client bounded total output at all.
+ *
+ * Sized off measured data, not intuition. Across 19 real answers captured in
+ * that same session the largest was 2530 chars (median 639). 16000 is ~6x that
+ * p100, and ~2x a generous estimate for the longest legitimate answer this
+ * pipeline can produce (a six-section coding answer with multiple code blocks,
+ * ~8000). An answer that reaches this has stopped being an answer.
+ *
+ * DEFENCE IN DEPTH, NOT THE FIX. The real fix is an output bound on the
+ * request: streamWithNatively's body sends { messages, stream, fast_mode,
+ * system, language, images } and no max_tokens — it is the ONLY provider in
+ * LLMHelper that does not bound output (DeepSeek, LiteLLM, Claude, Gemini and
+ * Groq all do). Adding it needs a natively-api change too, because /v1/chat
+ * destructures a fixed field list and would silently ignore the field today.
+ */
+export const MAX_STREAM_OUTPUT_CHARS = 16000;
 
 const COMPLEX_TYPES = new Set<AnswerType>([
   'coding_question_answer', 'dsa_question_answer', 'system_design_answer', 'debugging_question_answer',
@@ -126,13 +184,13 @@ export async function raceStreamWithDeadline(opts: {
   /** Bail predicate (e.g. superseded by a newer generation). */
   shouldAbort?: () => boolean;
   /**
-   * Called once when the loop ends for ANY reason (timeout/stall/abort/done).
-   * Use it to abort the underlying provider request (e.g. controller.abort()) so
-   * a timed-out HTTP stream doesn't keep running to its own network timeout —
-   * fire-and-forget iterator.return() alone cannot cancel a fetch parked in an
-   * await. Synchronous; must not throw.
+   * Called once when the loop ends. The reason distinguishes normal completion
+   * from a timeout/stall/supersession, so callers can abort an underlying HTTP
+   * request only when it still needs cancellation. Fire-and-forget iterator
+   * cleanup alone cannot interrupt a fetch parked in an await. Synchronous; it
+   * must not throw.
    */
-  onCleanup?: () => void;
+  onCleanup?: (reason: 'done' | 'first_useful_timeout' | 'stall_timeout' | 'aborted' | 'error') => void;
 }): Promise<'done' | 'first_useful_timeout' | 'stall_timeout' | 'aborted'> {
   const {
     stream, firstUsefulDeadlineMs: fuMs, interTokenStallMs = LIVE_INTER_TOKEN_STALL_MS,
@@ -147,14 +205,14 @@ export async function raceStreamWithDeadline(opts: {
   // must NOT `await` the cleanup on the deadline path — that would re-introduce
   // the multi-second hang we're guarding against. The underlying SDK stream
   // closes when the generator next checks its abort signal / yields.
-  const cleanup = () => {
-    try { onCleanup?.(); } catch { /* abort callback must not break cleanup */ }
+  const cleanup = (reason: 'done' | 'first_useful_timeout' | 'stall_timeout' | 'aborted' | 'error') => {
+    try { onCleanup?.(reason); } catch { /* abort callback must not break cleanup */ }
     try { const p = iterator.return?.(undefined); if (p && typeof (p as any).then === 'function') (p as Promise<unknown>).catch(() => {}); } catch { /* already closed */ }
   };
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      if (shouldAbort?.()) { cleanup(); return 'aborted'; }
+      if (shouldAbort?.()) { cleanup('aborted'); return 'aborted'; }
       let res: IteratorResult<string> | typeof DEADLINE;
       if (!isSpeculative) {
         if (!useful) useful = isUsefulYet();
@@ -173,20 +231,25 @@ export async function raceStreamWithDeadline(opts: {
         res = await Promise.race([nextP, deadline]);
         if (timer) clearTimeout(timer);
         if (res === DEADLINE) {
-          cleanup();
-          if (!useful) { onFirstUsefulTimeout?.(); return 'first_useful_timeout'; }
-          onStallTimeout?.(); return 'stall_timeout';
+          if (!useful) {
+            cleanup('first_useful_timeout');
+            onFirstUsefulTimeout?.();
+            return 'first_useful_timeout';
+          }
+          cleanup('stall_timeout');
+          onStallTimeout?.();
+          return 'stall_timeout';
         }
       } else {
         res = await iterator.next();
       }
-      if (res.done) { cleanup(); return 'done'; }
+      if (res.done) { cleanup('done'); return 'done'; }
       lastTokenAt = Date.now();
       await onToken(res.value);
       if (!useful) useful = isUsefulYet();
     }
   } catch (e) {
-    cleanup();
+    cleanup('error');
     throw e;
   }
 }

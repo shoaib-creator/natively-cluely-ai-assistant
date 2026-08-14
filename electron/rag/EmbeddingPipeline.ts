@@ -34,6 +34,9 @@ export class EmbeddingPipeline {
     /** Set of meeting IDs that have been downgraded to local fallback after primary provider exhaustion. */
     private fallbackMeetings = new Set<string>();
     private db: Database.Database;
+    /** Set at shutdown: the drain loop exits at the next safe point and no new
+     *  work is accepted, so no embedding write can race the DB close. */
+    private stopped = false;
     private vectorStore: VectorStore;
     private isProcessing = false;
     private initPromise: Promise<void> | null = null;
@@ -136,15 +139,20 @@ export class EmbeddingPipeline {
 
         } catch (err) {
             console.error('[EmbeddingPipeline] Failed to initialize primary provider:', err);
-            console.warn('[EmbeddingPipeline] Falling back to local-only mode for all meetings.');
-            // Promote fallback as the primary so isReady() returns true and queueing works.
-            // The local model still loads lazily on the first embed call.
-            this.provider = this.fallbackProvider;
-            // Persist the fallback provider's space so the next launch does not fire a
-            // false-positive incompatible-space warning (e.g. openai space vs local space).
-            try {
-                this.db.prepare("INSERT OR REPLACE INTO app_state (key, value) VALUES ('last_embedding_space', ?)").run(this.provider.space);
-            } catch (_) { /* non-fatal — DB may not have app_state yet in edge cases */ }
+            if (!this.fallbackProvider) {
+                console.warn('[EmbeddingPipeline] No embedding provider available — pipeline idle.');
+                this.provider = null;
+            } else {
+                console.warn('[EmbeddingPipeline] Falling back to local-only mode for all meetings.');
+                // Promote fallback as the primary so isReady() returns true and queueing works.
+                // The local model still loads lazily on the first embed call.
+                this.provider = this.fallbackProvider;
+                // Persist the fallback provider's space so the next launch does not fire a
+                // false-positive incompatible-space warning (e.g. openai space vs local space).
+                try {
+                    this.db.prepare("INSERT OR REPLACE INTO app_state (key, value) VALUES ('last_embedding_space', ?)").run(this.provider.space);
+                } catch (_) { /* non-fatal — DB may not have app_state yet in edge cases */ }
+            }
         }
 
         // Flush any queue items submitted during the startup race window (i.e. before the
@@ -225,6 +233,10 @@ export class EmbeddingPipeline {
      * Called when meeting ends
      */
     async queueMeeting(meetingId: string): Promise<void> {
+        if (this.stopped) {
+            console.log('[EmbeddingPipeline] Stopped — refusing new work during shutdown.');
+            return;
+        }
         // Get chunks without embeddings
         const chunks = this.vectorStore.getChunksWithoutEmbeddings(meetingId);
 
@@ -312,7 +324,21 @@ export class EmbeddingPipeline {
      * meeting is transparently downgraded to LocalEmbeddingProvider (on-device)
      * and its queue is reset so it re-embeds from scratch at the correct dimensions.
      */
+    /**
+     * Stop accepting and processing work (lifecycle fix, 2026-08-01). The
+     * pipeline's while-loop awaits network calls and backoff delays; between
+     * any of those awaits the before-quit handler used to close the shared
+     * better-sqlite3 handle, and the resumed loop's next db.prepare() raced a
+     * closed — or emergency-closed, uncheckpointed — database. Items in flight
+     * stay 'processing' and are recovered on next launch by processQueue's
+     * existing stuck-item reset.
+     */
+    stop(): void {
+        this.stopped = true;
+    }
+
     async processQueue(): Promise<void> {
+        if (this.stopped) return;
         if (this.isProcessing) {
             console.log('[EmbeddingPipeline] Already processing queue');
             return;
@@ -343,6 +369,7 @@ export class EmbeddingPipeline {
             const { ForegroundGate } = require('../services/ForegroundGate') as typeof import('../services/ForegroundGate');
             while (true) {
                 await ForegroundGate.waitUntilIdle();
+                if (this.stopped) break;
                 // Fetch next pending item. Items marked for local fallback (retry_count = -1)
                 // are also eligible, so we use a broad filter.
                 const pending = this.db.prepare(`
@@ -388,14 +415,20 @@ export class EmbeddingPipeline {
                         await this.embedMeetingSummary(pending.meeting_id, activeProvider);
                     }
 
+                    // The embed call awaited above may have outlived a shutdown;
+                    // never write to a database that may already be closed. The
+                    // item stays 'processing' and is recovered next launch.
+                    if (this.stopped) break;
+
                     // Mark as completed
                     this.db.prepare(`
-                        UPDATE embedding_queue 
+                        UPDATE embedding_queue
                         SET status = 'completed', processed_at = ?
                         WHERE id = ?
                     `).run(new Date().toISOString(), pending.id);
 
                 } catch (error: any) {
+                    if (this.stopped) break;
                     const newRetryCount = (pending.retry_count === -1 ? 0 : pending.retry_count) + 1;
                     console.error(
                         `[EmbeddingPipeline] Error processing queue item ${pending.id} ` +
@@ -491,22 +524,37 @@ export class EmbeddingPipeline {
      * Routes through embedWithTimeout() so a frozen API cannot stall the live indexer.
      */
     async getEmbedding(text: string): Promise<number[]> {
-        if (!this.provider) {
+        const result = await this.getEmbeddingWithFallback(text);
+        return result.embedding;
+    }
+
+    /**
+     * Get a single document embedding with metadata from the provider that actually
+     * produced the vector. Callers that persist vectors MUST prefer this over the
+     * bare getEmbedding() when they also persist an embedding_space label: a
+     * primary→fallback promotion can happen inside this call.
+     */
+    async getEmbeddingWithFallback(text: string): Promise<{ embedding: number[]; space: string; provider?: string; dimensions?: number }> {
+        const active = this.provider;
+        if (!active) {
             throw new Error('Embedding provider not initialized');
         }
         try {
-            return await this.embedWithTimeout(this.provider, text, 'live-chunk');
+            const embedding = await this.embedWithTimeout(active, text, 'live-chunk');
+            const space = active.space;
+            if (!space) throw new Error('Embedding provider has no active space');
+            return { embedding, space, provider: active.name, dimensions: active.dimensions };
         } catch (primaryError) {
             const fallback = this.fallbackProvider;
-            if (!fallback || fallback === this.provider) throw primaryError;
+            if (!fallback || fallback === active) throw primaryError;
             console.warn(
-                `[EmbeddingPipeline] Primary single embedding failed via ${this.provider?.name ?? 'unknown'}; ` +
+                `[EmbeddingPipeline] Primary single embedding failed via ${active.name}; ` +
                 `falling back to ${fallback.name}:`,
                 primaryError instanceof Error ? primaryError.message : primaryError
             );
             const embedding = await this.embedWithTimeout(fallback, text, 'fallback-live-chunk');
             this.promoteFallbackProvider(fallback);
-            return embedding;
+            return { embedding, space: fallback.space, provider: fallback.name, dimensions: fallback.dimensions };
         }
     }
 
@@ -541,11 +589,21 @@ export class EmbeddingPipeline {
     }
 
     async getEmbeddingsWithFallback(texts: string[]): Promise<{ embeddings: number[][]; space: string; provider?: string; dimensions?: number }> {
+        // Capture the active provider BEFORE the await. A concurrent
+        // promoteFallbackProvider() (triggered by another caller failing over)
+        // can reassign this.provider while getEmbeddings() is in flight; re-reading
+        // this.provider / getActiveSpaceKey() afterward would stamp embeddings that
+        // were produced by the OLD provider with the NEW provider's space label,
+        // corrupting cosine comparability of persisted vectors. Derive ALL returned
+        // metadata from the same reference that produced the embeddings — mirroring
+        // what the fallback path below already does with its local `fallback` ref.
+        const active = this.provider;
         try {
+            if (!active) throw new Error('Embedding provider not initialized');
             const embeddings = await this.getEmbeddings(texts);
-            const space = this.getActiveSpaceKey();
+            const space = active.space;
             if (!space) throw new Error('Embedding provider has no active space');
-            return { embeddings, space, provider: this.provider?.name, dimensions: this.provider?.dimensions };
+            return { embeddings, space, provider: active.name, dimensions: active.dimensions };
         } catch (primaryError) {
             const fallback = this.fallbackProvider;
             // If no fallback is configured, or the primary IS already the fallback

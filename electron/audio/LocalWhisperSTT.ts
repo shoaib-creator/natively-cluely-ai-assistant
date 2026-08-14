@@ -222,11 +222,24 @@ export class LocalWhisperSTT extends EventEmitter {
         this.isActive = true;
         this.vad = new VadProcessor();
         this.spawnWorker().catch((err) => {
-            // Gate refusal or worker spawn failure. The streaming loop will
-            // stall on `!workerReady` until a retry succeeds; surface as an
-            // error event so the UI can fall back to cloud STT.
+            // Gate refusal or worker spawn failure (e.g. insufficient memory for
+            // the ONNX session). There is NO retry path, so we must NOT leave a
+            // live streaming loop + VAD churning with worker=null — that silently
+            // drops every audio segment (dispatchFinal early-returns on !worker)
+            // and leaks a self-chaining 12s streaming timer for the whole session.
+            // Tear the instance back down to a clean inactive no-op (write() then
+            // no-ops on !isActive/!vad) and surface the error so the supervisor
+            // can fall back to cloud STT.
             console.error('[LocalWhisperSTT] spawnWorker failed:', err);
-            this.emit('error', err);
+            this.stopStreamingLoop();
+            if (this.gapFlushTimer) {
+                clearTimeout(this.gapFlushTimer);
+                this.gapFlushTimer = null;
+            }
+            this.vad = null;
+            this.isActive = false;
+            this.workerReady = false;
+            this.emit('error', err instanceof Error ? err : new Error(String(err)));
         });
         this.startStreamingLoop();
     }
@@ -701,10 +714,35 @@ export class LocalWhisperSTT extends EventEmitter {
                     const isOnnxSymbolError = msg.message.includes('Symbol not found')
                         || msg.message.includes('__ZNSt3__18to_charsEPcS0_d')
                         || msg.message.includes('libonnxruntime');
+
+                    // The files are present but unreadable — almost always a
+                    // truncated download that isModelCached waved through on its
+                    // `size > 0` check. Remove them so the cache check stops
+                    // reporting the model as installed and the next Install
+                    // actually re-fetches. Without this the state is permanent:
+                    // cached-but-corrupt reads as cached forever.
+                    let purged = false;
+                    if (!isOnnxSymbolError) {
+                        try {
+                            const { isCorruptModelError, purgeCorruptModel } = require('./whisper/modelManager');
+                            if (isCorruptModelError(msg.message)) {
+                                purged = purgeCorruptModel(this.modelId, msg.message);
+                            }
+                        } catch (e) {
+                            console.error('[LocalWhisperSTT] Corrupt-model purge failed:', e);
+                        }
+                    }
+
                     this.emit('error', new Error(
                         isOnnxSymbolError
                             ? 'Local Whisper is not supported on macOS 12 (Monterey) or earlier. Please upgrade to macOS 13 Ventura or later, or use a cloud STT provider.'
-                            : 'Local Whisper model not found. Please download a model in Settings → Audio.'
+                            // The old copy said "model not found" for this case, which was
+                            // wrong twice over: the files were there, and it pointed the
+                            // user at a download that silently no-opped because the model
+                            // still counted as cached.
+                            : purged
+                                ? 'The local model files were incomplete and have been removed. Please reinstall the model in Settings → Audio.'
+                                : 'Local Whisper model not found. Please download a model in Settings → Audio.'
                     ));
                 }
             }

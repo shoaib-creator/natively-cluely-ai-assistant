@@ -7,7 +7,8 @@ import { ModeReferenceFile } from '../ModesManager';
 import { VectorStore, ScoredChunk } from '../../rag/VectorStore';
 import { EmbeddingPipeline } from '../../rag/EmbeddingPipeline';
 import Database from 'better-sqlite3';
-import { buildDocumentMap, sectionAwareChunksFromMap, sentenceAwareWindows, tabularChunks } from './DocumentMap';
+import { buildDocumentMap, resolveTargetSections, sectionAwareChunksFromMap, selectTableOfContentsEntries, sentenceAwareWindows, tabularChunks } from './DocumentMap';
+import { wordsOf } from './lexicalTokens';
 // Round-8 (seminar-fix-2): use the SHARED 6-clause evidence rule so the hybrid
 // (live) path gives the model the SAME completeness + off-topic-redirect guidance
 // as the lexical path. Previously formatContext had a stale 1-sentence copy.
@@ -19,6 +20,7 @@ import {
     computeDocumentAnswerabilityScore,
     computeEvidenceCoverage,
     isBroadDocumentQuery,
+    normalizeDocumentGroundedRetrievalQuery,
     type DocumentQuestionShape,
 } from '../../llm/documentGroundedPrompt';
 
@@ -81,7 +83,22 @@ export interface ModeReferenceIndexState {
     embeddingSpace: string | null;
 }
 
-export type ModeReferenceIndexStatus = 'pending' | 'indexing' | 'ready' | 'failed' | 'lexical_only';
+export type ModeReferenceIndexStatus = 'pending' | 'indexing' | 'ready' | 'failed' | 'lexical_only' | 'ocr_required';
+
+/**
+ * TRUE when extracted document text is nothing but page markers/whitespace —
+ * the image-only-PDF signature (measured on the first live debug run: a
+ * scanned appendix extracted as "[Page 1] [Page 2]", 19 chars, was chunked,
+ * EMBEDDED, and reported lexical=ready/vector=ready — a placeholder presented
+ * as a searchable document). Such content must not be embedded and the file
+ * must be marked OCR_REQUIRED, never READY/PARTIAL.
+ */
+export function isPlaceholderOnlyContent(content: string): boolean {
+  const s = String(content ?? '');
+  if (!/\[Page \d+\]/.test(s)) return false;
+  const stripped = s.replace(/\[Page \d+\]/g, '').replace(/\s+/g, '');
+  return stripped.length < 40;
+}
 
 const DEFAULT_TOKEN_BUDGET = 1800;
 const DEFAULT_TOP_K = 6;
@@ -93,8 +110,55 @@ const CHUNK_OVERLAP = 30;
 // per-call embed timeout and lose all progress. 100 aligns with the Gemini
 // batchEmbedContents request cap.
 const MODE_INDEX_EMBED_BATCH = Number(process.env.NATIVELY_MODE_INDEX_EMBED_BATCH) || 100;
+
+/**
+ * F22 — the LOCAL ONNX embedder needs a much smaller indexing batch.
+ *
+ * A cloud batch of 100 is one HTTP request and is the efficient choice there.
+ * The local provider instead runs all 100 forward passes inside a single worker
+ * message, so the ONNX arena grows across every one of them without the worker
+ * returning to its event loop. On a large document that reliably aborts the
+ * process with SIGTRAP — the same BFCArena::Extend -> posix_memalign trap class
+ * as the 2026-07-06 crash, and it is a NATIVE abort, so the fault-tolerant
+ * try/catch around each sub-batch below cannot catch it.
+ *
+ * Measured on test-fixtures/modes-corpus/thesis/institutional_thesis.pdf
+ * (66 pages, 128 184 chars):
+ *     batch 100 -> SIGTRAP, process dead, file unindexed
+ *     batch  16 -> indexes cleanly
+ *
+ * Cloud batching is deliberately left at 100: this is an arena-pressure problem
+ * specific to in-process inference, not a batching problem in general.
+ */
+const MODE_INDEX_EMBED_BATCH_LOCAL =
+  Number(process.env.NATIVELY_MODE_INDEX_EMBED_BATCH_LOCAL) || 16;
 const MIN_COMBINED_SCORE = 0.15;
+
 const FTS_WEIGHT = 0.4;  // alpha for combined score: alpha * fts + (1-alpha) * vector
+
+/**
+ * F23 — the lexical fallback must NOT reuse the combined-score floor.
+ *
+ * `combinedScore = FTS_WEIGHT * fts + (1 - FTS_WEIGHT) * vector`, so a bare
+ * `ftsScore` and a combined score are on different scales. Filtering
+ * `ftsScore >= MIN_COMBINED_SCORE` requires the lexical arm alone to clear a bar
+ * that was calibrated for lexical AND vector together — i.e. to do 100% of the
+ * work while contributing at most FTS_WEIGHT of the scale.
+ *
+ * Measured consequence on a resume question whose answer IS in the corpus
+ * ("How many retailers did PriceX cover?"): fts = 0.109, vector = 0.478,
+ * combined = 0.330 — comfortably above the 0.15 combined floor — yet the lexical
+ * path returned ZERO chunks because 0.109 < 0.15. Retrieval reported
+ * `topScore: 0, reasons: ["no_candidates","lexical_degraded"]`, so uploaded
+ * references were silently inert for any keyless install.
+ *
+ * Scaling the floor by the lexical arm's own weight keeps the same intent
+ * (reject noise) on the correct scale.
+ */
+const MIN_LEXICAL_SCORE = MIN_COMBINED_SCORE * FTS_WEIGHT;
+
+/** Convert a combined-scale threshold to the lexical scale. */
+const toLexicalThreshold = (combinedThreshold: number): number => combinedThreshold * FTS_WEIGHT;
 
 // ── Phase 0 confidence-gate thresholds (OBSERVE ONLY) ───────────────────────
 // Tunable starting points for the low-confidence gate. These are deliberately
@@ -147,21 +211,8 @@ function encodePayload(value: unknown): string {
 function estimateTokens(text: string): number {
     return Math.ceil(text.length / 4);
 }
+// Tokenizer lives in ./lexicalTokens so the two retrievers cannot drift.
 
-// Simple word tokenization (matching ModeContextRetriever for FTS compatibility).
-// English possessive `'s` is stripped as a unit so "Green's"/"interviewer's"
-// collapse to the noun root, then any remaining apostrophes (contractions) are
-// dropped. Keep this in lock-step with ModeContextRetriever.wordsOf —
-// divergence breaks hybrid score fusion.
-function wordsOf(text: string): string[] {
-    return text
-        .toLowerCase()
-        .replace(/['’]s\b/g, '')
-        .replace(/['’]/g, '')
-        .replace(/[^a-z0-9\s-]/g, ' ')
-        .split(/\s+/)
-        .filter(word => word.length > 2);
-}
 
 // Content-aware hash using cityhash-style simple hash
 // Uses polynomial rolling hash for speed and reasonable distribution
@@ -367,15 +418,59 @@ export class ModeHybridRetriever {
         if (state && state.status === 'ready' && state.fileHash === contentHash && state.embeddingSpace === activeSpace) {
             return; // up to date
         }
+        // OCR_REQUIRED is terminal for this content hash — re-running cannot
+        // conjure text out of an image-only PDF, and prewarm must not loop on it.
+        if (state && state.status === 'ocr_required' && state.fileHash === contentHash) {
+            return;
+        }
 
         const chunks = this.chunkText(content);
         if (chunks.length === 0) return;
+
+        // Context-debug ingest event (observability only, 2026-08-01): reports
+        // what THIS pipeline computed — chunk/embed counts, page counts from
+        // the extractor, terminal index state. Level 'off' costs one call.
+        const ingestT0 = Date.now();
+        const emitIngestDebug = (indexState: string, embeddedCount: number, errorMessage?: string): void => {
+            try {
+                const { emitModeFileIngestDebug } = require('../../context-intelligence/debug/ingest-debug');
+                emitModeFileIngestDebug({
+                    fileId: file.id,
+                    fileName: file.fileName,
+                    modeId: (file as { modeId?: string }).modeId,
+                    characters: content.length,
+                    expectedPages: (file as { pageCount?: number }).pageCount,
+                    parsedPages: (file as { extractedPageCount?: number }).extractedPageCount,
+                    chunkCount: chunks.length,
+                    embeddedChunkCount: embeddedCount,
+                    embeddingSpace: activeSpace,
+                    indexState,
+                    totalMs: Date.now() - ingestT0,
+                    errorMessage,
+                });
+            } catch { /* debug logging must never affect indexing */ }
+        };
+
+        // Image-only / unparsed PDF: the "text" is page markers only. Embedding
+        // it manufactures a fake searchable document (measured, lastrun.md);
+        // mark OCR_REQUIRED instead and skip embedding entirely. Retrieval may
+        // still surface the placeholder lexically, where the property gate
+        // already grades it unsupporting — but no vectors, no READY, and the
+        // ingest event says exactly why the file cannot answer anything.
+        if (isPlaceholderOnlyContent(content)) {
+            this.persistChunks(file.id, chunks, null, null);
+            this.updateIndexState(file.id, contentHash, chunks.length, 'ocr_required', null);
+            console.warn(`[ModeHybridRetriever] "${file.fileName}": no searchable text extracted (image-only PDF?) — marked OCR_REQUIRED; the file cannot be searched until it has text.`);
+            emitIngestDebug('ocr_required', 0, 'no searchable text extracted — image-only or scanned PDF');
+            return;
+        }
 
         if (!this.isEmbeddingAvailable() || !activeSpace) {
             // No embedder: persist chunk TEXT (lexical retrieval still wins a
             // re-chunk per query) and mark lexical_only so prewarm retries later.
             this.persistChunks(file.id, chunks, null, null);
             this.updateIndexState(file.id, contentHash, chunks.length, 'lexical_only', null);
+            emitIngestDebug('lexical_only', 0);
             return;
         }
 
@@ -385,7 +480,12 @@ export class ModeHybridRetriever {
             // in ONE call: the pipeline wraps a single getEmbeddingsWithFallback in a
             // 30s timeout, so a big corpus times out all-or-nothing. Embed + persist in
             // bounded sub-batches so each has its own budget.
-            const INDEX_BATCH = MODE_INDEX_EMBED_BATCH;
+            // F22: provider-aware batch. The local ONNX path must stay small or a
+            // large document takes the whole process down with a native SIGTRAP.
+            const activeProvider = this.embeddingPipeline.getActiveProviderName?.();
+            const INDEX_BATCH = activeProvider === 'local'
+                ? MODE_INDEX_EMBED_BATCH_LOCAL
+                : MODE_INDEX_EMBED_BATCH;
             if (chunks.length <= INDEX_BATCH) {
                 const result = await this.embeddingPipeline.getEmbeddingsWithFallback(chunks);
                 const embeddings = result.embeddings;
@@ -394,6 +494,7 @@ export class ModeHybridRetriever {
                 }
                 this.persistChunks(file.id, chunks, embeddings, result.space);
                 this.updateIndexState(file.id, contentHash, chunks.length, 'ready', result.space);
+                emitIngestDebug('ready', chunks.length);
             } else {
                 // FAULT-TOLERANT batched indexing: a mid-file sub-batch failure (429
                 // rotation exhausted, timeout) must NOT discard the chunks already
@@ -425,9 +526,11 @@ export class ModeHybridRetriever {
                     // Nothing embedded — lexical only, mark failed so a later prewarm retries.
                     this.persistChunks(file.id, chunks, null, null);
                     this.updateIndexState(file.id, contentHash, chunks.length, 'failed', null);
+                    emitIngestDebug('failed', 0, `embedding failed at offset ${failedOffset}`);
                 } else if (embeddedCount === chunks.length) {
                     this.persistChunks(file.id, chunks, embeddedVectors, embeddingSpace);
                     this.updateIndexState(file.id, contentHash, chunks.length, 'ready', embeddingSpace);
+                    emitIngestDebug('ready', embeddedCount);
                 } else {
                     // Partial: persist the embedded prefix WITH vectors, and the tail as
                     // lexical-only text. persistChunks reads embeddings[i] per row and
@@ -439,6 +542,7 @@ export class ModeHybridRetriever {
                     // A follow-up prewarm/retry can complete the tail when quota frees up.
                     this.updateIndexState(file.id, contentHash, chunks.length, 'ready', embeddingSpace);
                     console.log(`[ModeHybridRetriever] ${file.fileName}: partial index READY (${embeddedCount}/${chunks.length} vectors, tail lexical; failed@${failedOffset})`);
+                    emitIngestDebug('ready', embeddedCount, `embedding stopped at offset ${failedOffset}; tail lexical-only`);
                 }
             }
         } catch (e) {
@@ -446,6 +550,7 @@ export class ModeHybridRetriever {
             // Keep the chunk text for lexical retrieval; mark failed for retry.
             this.persistChunks(file.id, chunks, null, null);
             this.updateIndexState(file.id, contentHash, chunks.length, 'failed', null);
+            emitIngestDebug('failed', 0, e instanceof Error ? e.message : String(e));
         }
     }
 
@@ -771,7 +876,20 @@ export class ModeHybridRetriever {
         candidateCount: number,
         usedFallback: boolean
     ): RetrievalConfidence {
-        const scoreOf = (c: ChunkCandidate) => this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT);
+        // Include the POSITIVE answerability contribution (2026-07-13), matching
+        // rankScore() and the score reported to the resolver. A chunk selected by
+        // a strong structural signal — e.g. a Table-of-Contents navigation chunk
+        // promoted for a "title of Chapter N" question, which has zero lexical or
+        // vector overlap with the query — is genuinely high-confidence. Judging it
+        // on bare combined(fts,vector) alone reported `weak_top`, which tripped the
+        // low-confidence gate and escalated to the local cross-encoder reranker for
+        // a query that did not need it (and, when the reranker model is unavailable
+        // in a headless/benchmark environment, that escalation stalls the turn).
+        // Adding only the positive answerability term never LOWERS a chunk's
+        // confidence, so a genuinely weak retrieval still trips the gate. Generic:
+        // no document, entity, or question text is special-cased.
+        const scoreOf = (c: ChunkCandidate) =>
+            this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT) + Math.max(0, c.answerabilityScore ?? 0);
         const topScore = sorted.length > 0 ? scoreOf(sorted[0]) : 0;
         const secondScore = sorted.length > 1 ? scoreOf(sorted[1]) : 0;
         const margin = topScore - secondScore;
@@ -932,13 +1050,19 @@ export class ModeHybridRetriever {
     }): Promise<ModeRetrievedContext> {
         const {
             query,
-            files,
+            files: rawFiles,
             tokenBudget: _rawTokenBudget,
             topK: _rawTopK,
             hasTranscript = false,
             allowRerank = false,
             forceDocumentGrounding = false,
         } = params;
+        // Unsearchable placeholder files (deep-run 2, issue 12): an image-only
+        // PDF's "[Page 1] [Page 2]" extraction is not evidence — served as a
+        // candidate it was retrieved, admitted, and answered from generically.
+        // OCR_REQUIRED files are excluded from retrieval entirely; the ingest
+        // audit already told the user why the file cannot answer anything.
+        const files = rawFiles.filter((f) => !isPlaceholderOnlyContent(f.content || ''));
         // Auto-upgrade limits for doc-grounded large PDFs (mirrors the guard in
         // ModeContextRetriever.retrieve()). Must be applied AFTER extracting
         // forceDocumentGrounding from params — JS destructuring can't reference
@@ -962,8 +1086,12 @@ export class ModeHybridRetriever {
             };
         }
 
-        // Get query words for FTS scoring
-        const queryText = query.trim();
+        // Keep the raw user question outside this retriever. Document-grounded
+        // ranking uses only its derived factual query so a conversational wrapper
+        // cannot dilute lexical, semantic, or section-planner relevance.
+        const queryText = (forceDocumentGrounding
+            ? normalizeDocumentGroundedRetrievalQuery(query)
+            : query).trim();
         const queryWords = new Set(wordsOf(queryText));
 
         // Zero-token query short-circuit: if the user input collapses to no
@@ -1014,13 +1142,23 @@ export class ModeHybridRetriever {
 
         const usingLexicalForLocalManualQuery = this.shouldUseLexicalForLocalManualQuery(hasTranscript);
 
+        const h4StageTrace = process.env.NATIVELY_E2E === '1'
+            && process.env.NATIVELY_H4_STAGE_TRACE === '1';
+        const h4StartedAt = Date.now();
+        const markH4HybridStage = (stage: string, details: Record<string, unknown> = {}) => {
+            if (h4StageTrace) console.log('[TRACE:H4-HYBRID]', JSON.stringify({ stage, atMs: Date.now() - h4StartedAt, ...details }));
+        };
         // Try hybrid retrieval first, fall back to lexical-only. Keyless/manual
         // local-ONNX query embedding is intentionally treated like an unavailable
         // embedding provider to reduce crash-prone native memory pressure.
+        markH4HybridStage('ranking_enter', { embeddingAvailable: this.isEmbeddingAvailable(), usingLexicalForLocalManualQuery });
         if (this.isEmbeddingAvailable() && !usingLexicalForLocalManualQuery) {
             try {
+                markH4HybridStage('perform_hybrid_enter', { candidateCount: allCandidates.length });
                 candidates = await this.performHybridRetrieval(allCandidates, queryWords, queryText, adaptiveThreshold, files);
+                markH4HybridStage('perform_hybrid_exit', { candidateCount: candidates.length });
             } catch (error) {
+                markH4HybridStage('perform_hybrid_error', { message: error instanceof Error ? error.message : String(error) });
                 console.warn('[ModeHybridRetriever] Hybrid retrieval failed, falling back to lexical:', error);
                 this.emitFallbackTelemetry({
                     reason: 'hybrid_threw',
@@ -1029,7 +1167,7 @@ export class ModeHybridRetriever {
                     modeId: params.modeId,
                     errorClass: error instanceof Error ? error.constructor.name : typeof error,
                 });
-                candidates = this.performLexicalRetrieval(allCandidates, queryWords, adaptiveThreshold);
+                candidates = this.performLexicalRetrieval(allCandidates, queryWords, toLexicalThreshold(adaptiveThreshold));
             }
         } else {
             if (usingLexicalForLocalManualQuery) {
@@ -1043,11 +1181,154 @@ export class ModeHybridRetriever {
                 queryTokenCount: queryWords.size,
                 modeId: params.modeId,
             });
-            candidates = this.performLexicalRetrieval(allCandidates, queryWords, adaptiveThreshold);
+            candidates = this.performLexicalRetrieval(allCandidates, queryWords, toLexicalThreshold(adaptiveThreshold));
         }
 
+        markH4HybridStage('ranking_complete', { candidateCount: candidates.length });
         if (forceDocumentGrounding) {
-            candidates = this.applyAnswerabilityScores(candidates, queryText, queryShape);
+            // Preserve the Document Map's structural routing in the hybrid path.
+            // The lexical retriever already uses this advisory section signal; omitting
+            // it here meant the canonical Context OS resolver could retrieve a
+            // topically similar section while excluding the exact table/subsection.
+            markH4HybridStage('document_map_enter', { fileCount: files.length });
+            const sectionTargets = files.flatMap((file) => {
+                const map = buildDocumentMap(file.content);
+                return map.hasToc ? resolveTargetSections(queryText, map) : [];
+            });
+            const uniqueSectionTargets = [...new Set(sectionTargets)];
+            markH4HybridStage('document_map_exit', {
+                targetCount: uniqueSectionTargets.length,
+                targets: uniqueSectionTargets,
+            });
+
+            // Targeted-section restore (2026-07-13): resolveTargetSections is a
+            // strong, precise routing signal — it maps "what working voltage is
+            // listed for Mercury X1?" to §2.3.2 (Technical Specifications). But a
+            // TABLE section has low natural-language embedding similarity to the
+            // question, so its chunk can fall below the admission floor and be
+            // dropped BEFORE the section-target boost in applyAnswerabilityScores
+            // can act on it (the boost cannot rescue a non-admitted chunk). Restore
+            // any targeted section's chunks from the full pool so the boost applies.
+            // Mirrors the navigation restore below; generic (no document/entity text).
+            if (uniqueSectionTargets.length > 0) {
+                const admitted = new Set(candidates.map((c) => `${c.sourceId}:${c.chunkIndex}`));
+                const matchesTarget = (text: string): boolean => {
+                    const section = text.match(/^\[Section\s+([\d.]+)\s*\|/)?.[1];
+                    if (!section) return false;
+                    return uniqueSectionTargets.some((t) => section === t || section.startsWith(`${t}.`));
+                };
+                for (const candidate of allCandidates) {
+                    if (!matchesTarget(candidate.text)) continue;
+                    const key = `${candidate.sourceId}:${candidate.chunkIndex}`;
+                    if (admitted.has(key)) continue;
+                    candidates.push({ ...candidate });
+                    admitted.add(key);
+                }
+            }
+
+            markH4HybridStage('answerability_enter', { candidateCount: candidates.length });
+            candidates = this.applyAnswerabilityScores(candidates, queryText, queryShape, uniqueSectionTargets);
+            markH4HybridStage('answerability_exit', { candidateCount: candidates.length });
+
+            // Positional restore (deep-test D4, 2026-08-01): "What is the
+            // last-page canary?" names a POSITION, not content. When the target
+            // line is a bare identifier the answer chunk shares no vocabulary
+            // with the question (measured: all 14 chunks of the system-design
+            // PDF tied on the stopword "the"), so ranking is noise and the tail
+            // chunk loses. A first/last locator in the query is a deterministic
+            // navigation signal — restore and boost the corresponding chunk per
+            // file, exactly as the section-target and ToC restores above do for
+            // their signals. Generic: no content or identifier text referenced.
+            {
+                const wantsTail = /\b(last|final|end(?:ing)?|closing)[-\s]?(page|pages|section|chunk|part|paragraph|appendix)\b|\bend of (the )?(document|file|pdf|doc)\b/i.test(queryText);
+                const wantsHead = /\b(first|opening|beginning|start(?:ing)?)[-\s]?(page|pages|section|chunk|part|paragraph)\b|\b(start|beginning) of (the )?(document|file|pdf|doc)\b/i.test(queryText);
+                if (wantsTail || wantsHead) {
+                    const range = new Map<string, { min: number; max: number }>();
+                    for (const c of allCandidates) {
+                        const idx = c.chunkIndex ?? 0;
+                        const cur = range.get(c.sourceId) ?? { min: Infinity, max: -Infinity };
+                        if (idx < cur.min) cur.min = idx;
+                        if (idx > cur.max) cur.max = idx;
+                        range.set(c.sourceId, cur);
+                    }
+                    const isPositional = (c: { sourceId: string; chunkIndex?: number }): boolean => {
+                        const r = range.get(c.sourceId);
+                        if (!r) return false;
+                        const idx = c.chunkIndex ?? 0;
+                        return (wantsTail && idx === r.max) || (wantsHead && idx === r.min);
+                    };
+                    const admitted = new Set(candidates.map((c) => `${c.sourceId}:${c.chunkIndex}`));
+                    for (const c of allCandidates) {
+                        if (!isPositional(c)) continue;
+                        const key = `${c.sourceId}:${c.chunkIndex}`;
+                        if (!admitted.has(key)) {
+                            candidates.push({ ...c });
+                            admitted.add(key);
+                        }
+                    }
+                    candidates = candidates.map((c) => (isPositional(c)
+                        ? {
+                            ...c,
+                            answerabilityScore: (c.answerabilityScore ?? 0) + 0.6,
+                            answerabilityBoosts: [...(c.answerabilityBoosts ?? []), 'positional_locator_match'],
+                        }
+                        : c));
+                }
+            }
+
+            // A Table of Contents is navigation evidence, not topical evidence.
+            // It is excluded from routine section ranking above, then explicitly
+            // promoted only when the question directly identifies an entry or a
+            // chapter number. This gives chapter-title and printed-page questions
+            // their source while preserving the ToC-fragment protections for all
+            // ordinary document questions.
+            //
+            // GATE (2026-07-13): only a genuine STRUCTURAL/navigation question may
+            // promote the ToC chunk. `selectTableOfContentsEntries` matches on a
+            // shared title word, so a topical question that merely names a section
+            // ("What working voltage is listed for Mercury X1?" — "Mercury X1" is a
+            // ToC entry title) would otherwise pull the navigation chunk to the top
+            // (+1.2) and starve the real spec section that actually holds the value.
+            // classifyDocumentQuestionShape cleanly separates the two: title/page/
+            // chapter-count questions are 'document_structure_answer'; a spec-value
+            // question is 'lecture_answer'. Generic — no document/entity/title text
+            // is referenced.
+            const isStructuralQuery = queryShape === 'document_structure_answer';
+            const navigationEntriesByFile = new Map<string, Set<string>>();
+            if (isStructuralQuery) {
+                for (const file of files) {
+                    const entries = selectTableOfContentsEntries(queryText, buildDocumentMap(file.content));
+                    if (entries.length > 0) navigationEntriesByFile.set(file.id, new Set(entries));
+                }
+            }
+            if (navigationEntriesByFile.size > 0) {
+                // The lexical/vector admission floor runs before answerability
+                // scoring. A question such as "What is the title of Chapter 3?"
+                // may have no literal overlap with its `3 Research Methodology`
+                // entry, so restore that directly-matched navigation candidate
+                // from the complete pool before applying the routing boost.
+                const admitted = new Set(candidates.map((candidate) => `${candidate.sourceId}:${candidate.chunkIndex}`));
+                for (const candidate of allCandidates) {
+                    if (!candidate.text.startsWith('[Table of Contents |')) continue;
+                    const entries = navigationEntriesByFile.get(candidate.sourceId);
+                    if (!entries || ![...entries].some((entry) => candidate.text.includes(entry))) continue;
+                    const key = `${candidate.sourceId}:${candidate.chunkIndex}`;
+                    if (!admitted.has(key)) {
+                        candidates.push({ ...candidate, ftsScore: 0, vectorScore: 0 });
+                        admitted.add(key);
+                    }
+                }
+                candidates = candidates.map((candidate) => {
+                    if (!candidate.text.startsWith('[Table of Contents |')) return candidate;
+                    const entries = navigationEntriesByFile.get(candidate.sourceId);
+                    if (!entries || ![...entries].some((entry) => candidate.text.includes(entry))) return candidate;
+                    return {
+                        ...candidate,
+                        answerabilityScore: (candidate.answerabilityScore ?? 0) + 1.2,
+                        answerabilityBoosts: [...(candidate.answerabilityBoosts ?? []), 'table_of_contents_navigation_match'],
+                    };
+                });
+            }
         }
 
         // Sort by combined score descending, layered with answerability for
@@ -1085,11 +1366,34 @@ export class ModeHybridRetriever {
         if (allowRerank) {
             const gate = confidence
                 ?? this.computeConfidence(candidates, queryWords.size, allCandidates.length, usedFallback);
-            if (gate.lowConfidence) {
-                const escalated = await this.maybeRerankCandidates(queryText, candidates);
-                if (escalated) {
-                    candidates = escalated;
-                    reranked = true;
+            const lowConfidence = gate.lowConfidence === true;
+            markH4HybridStage('rerank_gate', { lowConfidence, candidateCount: candidates.length, hasOverride: Boolean(this.rerankerOverride) });
+            if (lowConfidence) {
+                // A manual-chat answer has a fixed first-useful deadline. The local
+                // cross-encoder is optional ranking refinement, so it must never
+                // consume that whole deadline and prevent a lexical/evidence-pack
+                // answer from reaching the provider. Keep its late result isolated
+                // rather than awaiting it on the critical path.
+                const RERANK_BUDGET_MS = 1200;
+                markH4HybridStage('rerank_enter', { candidateCount: candidates.length, budgetMs: RERANK_BUDGET_MS });
+                const rerankPromise = this.maybeRerankCandidates(queryText, candidates);
+                let rerankTimer: NodeJS.Timeout | undefined;
+                const raced = await Promise.race([
+                    rerankPromise.then((value) => ({ value, timedOut: false })),
+                    new Promise<{ value: ChunkCandidate[] | null; timedOut: boolean }>((resolve) => {
+                        rerankTimer = setTimeout(() => resolve({ value: null, timedOut: true }), RERANK_BUDGET_MS);
+                    }),
+                ]);
+                if (rerankTimer) clearTimeout(rerankTimer);
+                if (raced.timedOut) {
+                    markH4HybridStage('rerank_timeout', { budgetMs: RERANK_BUDGET_MS });
+                    rerankPromise.catch(() => { /* late optional rerank never rejects the turn */ });
+                } else {
+                    markH4HybridStage('rerank_exit', { reranked: Boolean(raced.value), candidateCount: raced.value?.length ?? candidates.length });
+                    if (raced.value) {
+                        candidates = raced.value;
+                        reranked = true;
+                    }
                 }
             }
         }
@@ -1097,12 +1401,14 @@ export class ModeHybridRetriever {
         // Deduplicate: keep highest-scoring chunk per file (default), or per
         // section when document-grounded (preserves multi-section answers).
         const deduped = this.deduplicateChunks(candidates, reranked, forceDocumentGrounding);
+        markH4HybridStage('dedupe_complete', { candidateCount: deduped.length });
 
         // Enforce token budget. For document-grounded modes with MULTIPLE files,
         // guarantee each file contributes its best chunk so a large dataset can't
         // starve a small one out of the retrieved set.
         const guaranteePerFile = forceDocumentGrounding && files.length > 1;
         const selected = this.enforceTokenBudget(deduped, tokenBudget, reranked, topK, guaranteePerFile, forceDocumentGrounding);
+        markH4HybridStage('selection_complete', { chunkCount: selected.length });
 
         // Format output with citations
         const formattedContext = this.formatContext(selected);
@@ -1143,7 +1449,7 @@ export class ModeHybridRetriever {
                     fileName: c.fileName,
                     text: c.text,
                     chunkIndex: c.chunkIndex,
-                    score: this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT),
+                    score: this.reportedDocGroundedScore(c),
                     ftsScore: c.ftsScore,
                     vectorScore: c.vectorScore,
                     trustLevel: 'untrusted_reference',
@@ -1416,16 +1722,34 @@ export class ModeHybridRetriever {
 
         // Compute combined scores from persisted or ephemeral vectors.
         const scored: ChunkCandidate[] = [];
+        // Chunks whose vector is UNAVAILABLE this turn (cross-space skip, batch
+        // embed failure) — their score is lexical-only and must be judged on
+        // the lexical scale (F23), not against the combined floor.
+        const vectorless = new Set<string>();
         for (const candidate of candidates) {
             const key = `${candidate.sourceId}:${candidate.chunkIndex}`;
             const ftsScore = this.computeFtsScore(candidate.text, queryWords);
             const vec = persisted.get(key) ?? ephemeral.get(key);
+            if (!vec) vectorless.add(key);
             const vectorScore = vec ? this.computeVectorScore(queryEmbedding, vec) : 0;
             scored.push({ ...candidate, ftsScore, vectorScore });
         }
 
         // Filter by minimum combined score (adaptive — see retrieve()).
+        //
+        // Defect F-C (2026-08-01): F23's lexical-scale correction was applied
+        // only to the EXPLICIT lexical branches. A chunk degraded to
+        // lexical-only INSIDE the hybrid path (mid-query embedding-space flip,
+        // batch-embed failure) still had combined = FTS_WEIGHT * fts compared
+        // against the combined-scale floor — the lexical arm had to do 100% of
+        // the work while contributing at most FTS_WEIGHT of the scale. F23's
+        // own measured example (fts 0.109, floor 0.15) returned ZERO chunks on
+        // the transition turn after an embedding-provider promotion, which is
+        // exactly a mid-session "the résumé disappeared" symptom.
         return scored.filter(c => {
+            if (vectorless.has(`${c.sourceId}:${c.chunkIndex}`)) {
+                return c.ftsScore >= toLexicalThreshold(minScore);
+            }
             const combined = this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT);
             return combined >= minScore;
         });
@@ -1437,7 +1761,8 @@ export class ModeHybridRetriever {
     private performLexicalRetrieval(
         candidates: ChunkCandidate[],
         queryWords: Set<string>,
-        minScore: number = MIN_COMBINED_SCORE
+        // Lexical SCALE, not combined scale. See MIN_LEXICAL_SCORE (F23).
+        minScore: number = MIN_LEXICAL_SCORE
     ): ChunkCandidate[] {
         return candidates
             .map(c => ({
@@ -1452,17 +1777,30 @@ export class ModeHybridRetriever {
         candidates: ChunkCandidate[],
         queryText: string,
         queryShape: DocumentQuestionShape,
+        sectionTargets: string[] = [],
     ): ChunkCandidate[] {
+        const sectionBoost = (text: string): number => {
+            const section = text.match(/^\[Section\s+([\d.]+)\s*\|/)?.[1];
+            if (!section) return 0;
+            const targetIndex = sectionTargets.findIndex((target) => section === target || section.startsWith(`${target}.`));
+            if (targetIndex < 0) return 0;
+            const depth = Math.max(0, section.split('.').length - sectionTargets[targetIndex].split('.').length);
+            const depthWeight = depth === 0 ? 1 : depth === 1 ? 1.1 : Math.pow(0.7, depth);
+            return Math.min(0.4, 0.35 * Math.pow(0.6, targetIndex) * depthWeight);
+        };
         const scored = candidates.map(c => {
             const a = computeDocumentAnswerabilityScore({
                 question: queryText,
                 queryShape,
                 candidateText: c.text,
             });
+            const targetBoost = sectionBoost(c.text);
             return {
                 ...c,
-                answerabilityScore: a.score,
-                answerabilityBoosts: a.boosts,
+                answerabilityScore: a.score + targetBoost,
+                answerabilityBoosts: targetBoost > 0
+                    ? [...a.boosts, `target_section:${targetBoost.toFixed(2)}`]
+                    : a.boosts,
                 answerabilityPenalties: a.penalties,
             };
         });
@@ -1502,6 +1840,32 @@ export class ModeHybridRetriever {
     }
 
     /**
+     * Confidence reported to the caller (Context OS EvidenceResolver) for a
+     * document-grounded chunk.
+     *
+     * WHY THIS EXISTS (2026-07-13): the doc-grounded path selects chunks by
+     * `rankScore` = combined(fts,vector) + answerabilityScore, but historically
+     * REPORTED only combined(fts,vector). Structural-navigation evidence — a
+     * Table-of-Contents chunk promoted purely by the answerability boost — is
+     * admitted with ftsScore/vectorScore = 0 (it has no lexical overlap with a
+     * query like "the title of Chapter 2"), so it was reported to the resolver
+     * with confidence 0 and fell below MIN_ANSWER_CONFIDENCE → the turn refused
+     * a fact the ToC plainly contains. The page-number ToC questions only
+     * survived because their entity string overlapped the ToC text lexically.
+     *
+     * FIX: report the composite score that actually selected the chunk, adding
+     * ONLY the positive answerability contribution. This restores the dropped
+     * structural/answerability confidence without ever LOWERING a chunk's score
+     * — an absent-fact chunk (whose answerability is zero or negative) still
+     * reports its bare retrieval score and still refuses. Generic: no document,
+     * entity, or question text is referenced.
+     */
+    private reportedDocGroundedScore(c: ChunkCandidate): number {
+        const base = this.combinedScore(c.ftsScore, c.vectorScore, FTS_WEIGHT);
+        return base + Math.max(0, c.answerabilityScore ?? 0);
+    }
+
+    /**
      * Deduplicate chunks from the same file, keeping highest-scoring. When
      * `byRerank` is true the "highest" is by cross-encoder score.
      */
@@ -1527,22 +1891,32 @@ export class ModeHybridRetriever {
      * downstream by the SECTION_CAP two-pass in enforceTokenBudget so siblings
      * survive without any single section crowding out the others.
      *
-     * The non-doc-grounded default path is unchanged (keyed by sourceId in
-     * deduplicateChunks — one best chunk per file).
+     * APPLIED TO EVERY CALLER since 2026-07-31. The default path used to key by
+     * `sourceId` — one best chunk per file — which is degenerate for a mode whose
+     * reference file is large: a 66-page PDF returned exactly ONE chunk no matter
+     * what topK asked for, and the fact being asked about was usually not in it.
+     * Measured on a real thesis: 1 chunk with per-file keying, 12 with per-chunk,
+     * and the answer moved from unreachable to rank 2.
+     *
+     * This is the SAME failure this docblock already describes ("throws the list
+     * away BEFORE top-K selection ... the answer is unrecoverable") — it was
+     * fixed for doc-grounded callers and left live for everyone else. The
+     * section-diversity protection it depends on (the SECTION_CAP two-pass in
+     * enforceTokenBudget) is now unconditional too; the two changes are a pair
+     * and must not be separated.
      */
     private dedupeGroupKey(candidate: ChunkCandidate): string {
         return `${candidate.sourceId}#chunk${candidate.chunkIndex}`;
     }
 
     private deduplicateChunks(candidates: ChunkCandidate[], byRerank: boolean = false, forceDocumentGrounding: boolean = false): ChunkCandidate[] {
-        // Document-grounded mode: dedup per-section (or per-chunk when no
-        // section prefix) so multi-section answers survive. Non-doc-grounded
-        // callers keep the original per-file behavior (unchanged default
-        // mode UX — one best chunk per reference file).
+        // Suppress only EXACT duplicates (same file, same chunk). Within-file
+        // siblings survive to top-K selection, where SECTION_CAP and the token
+        // budget decide what actually fits.
         const bestByKey = new Map<string, ChunkCandidate>();
 
         for (const candidate of candidates) {
-            const key = forceDocumentGrounding ? this.dedupeGroupKey(candidate) : candidate.sourceId;
+            const key = this.dedupeGroupKey(candidate);
             const existing = bestByKey.get(key);
 
             if (!existing) {
@@ -1590,12 +1964,24 @@ export class ModeHybridRetriever {
         // without blowing topK. Cheap: at most (#files * PER_FILE_FLOOR) reserved slots.
         const PER_FILE_FLOOR = Number(process.env.NATIVELY_RETRIEVAL_PER_FILE_FLOOR) || 2;
         if (guaranteePerFile) {
-            const perFileCount = new Map<string, number>();
+            // ROUND-ROBIN, not global order (deep-test D3, 2026-08-01): walking
+            // `sorted` globally let a large file's chunks consume the token
+            // budget before a small file's turn ever came — tryAdd rejects on
+            // budget, so the "guarantee" silently guaranteed nothing for
+            // whichever files ranked late. One chunk per file per round means
+            // every file gets its first pick before any file gets its second.
+            const byFile = new Map<string, ChunkCandidate[]>();
             for (const c of sorted) {
-                if (selected.length >= topK) break;
-                const n = perFileCount.get(c.sourceId) || 0;
-                if (n >= PER_FILE_FLOOR) continue;
-                if (tryAdd(c)) perFileCount.set(c.sourceId, n + 1);
+                const list = byFile.get(c.sourceId);
+                if (list) list.push(c);
+                else byFile.set(c.sourceId, [c]);
+            }
+            for (let round = 0; round < PER_FILE_FLOOR; round++) {
+                for (const list of byFile.values()) {
+                    if (selected.length >= topK) break;
+                    const c = list[round];
+                    if (c) tryAdd(c);
+                }
             }
         }
 
@@ -1608,14 +1994,15 @@ export class ModeHybridRetriever {
         // pass 2 (below) backfills any remaining slots cap-free by pure score, so
         // a section that legitimately holds the whole answer can still fill topK.
         // Mirrors the lexical ModeContextRetriever SECTION_CAP two-pass so the two
-        // retrievers select consistently. Only for doc-grounded; default mode is
-        // untouched (it already dedups to one chunk per file).
+        // retrievers select consistently. UNCONDITIONAL since 2026-07-31: every
+        // caller now keeps within-file siblings through dedupe, so every caller
+        // needs the protection that stops one section monopolising top-K.
         const sectionOf = (c: ChunkCandidate): string => {
             const m = c.text.match(/^\[Section\s+([\d.]+)/);
             return m ? m[1] : `__chunk_${c.sourceId}_${c.chunkIndex}`;
         };
         const SECTION_CAP = Number(process.env.NATIVELY_RETRIEVAL_SECTION_CAP) || 4;
-        if (forceDocumentGrounding) {
+        {
             const perSection = new Map<string, number>();
             for (const c of sorted) {
                 if (selected.length >= topK) break;

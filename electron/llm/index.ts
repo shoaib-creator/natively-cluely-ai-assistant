@@ -13,6 +13,9 @@ export { WhatToAnswerLLM } from "./WhatToAnswerLLM";
 export { shouldThrottleTrigger } from "./triggerGate";
 export type { TriggerGateInput } from "./triggerGate";
 export { clampResponse, validateResponse, reduceDashes, reduceDashesInChunk, StreamingDashReducer } from "./postProcessor";
+export { speculativeQuestionSimilarity } from "./speculativeSimilarity";
+export { acceptRepairedAnswer } from "./repairAcceptance";
+export type { RepairAcceptanceInput, RepairAcceptanceVerdict, RepairRejectionReason } from "./repairAcceptance";
 export {
     cleanTranscript,
     sparsifyTranscript,
@@ -33,9 +36,11 @@ export {
     warmupIntentClassifier
 } from "./IntentClassifier";
 export type { ConversationIntent, IntentResult } from "./IntentClassifier";
+export { checkAnswerRelevance } from "./AnswerRelevanceChecker";
+export type { AnswerRelevanceResult } from "./AnswerRelevanceChecker";
 export { planNextAssistantAction } from "./PlannerDecision";
 export type { PlannerDecision, PlannerDecisionKind, PlannerInput } from "./PlannerDecision";
-export { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, shouldScaffold, isStealthEvasionQuestion } from "./AnswerPlanner";
+export { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, shouldScaffold, isStealthEvasionQuestion, isJdFactualLookupNotNegotiationAdvice } from "./AnswerPlanner";
 export { detectAnswerStyle, styleSuppressesScaffold } from "./answerStyle";
 export type { AnswerStyle, AnswerStyleResult } from "./answerStyle";
 export { detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode } from "./codingFollowup";
@@ -52,10 +57,39 @@ export {
 export type { SpeakabilityDecision, SpeakabilityClass, SpeakabilityTarget, ShortLengthBand, ShortBandTarget } from "./speakability";
 export { checkAnswerForCodeBugs, checkCodeCompleteness } from "./CodeSanityCheck";
 export type { CodeSanityResult, CodeSanityIssue } from "./CodeSanityCheck";
-export { AnswerDiversityGuard, cleanAnswerArtifacts, isLeakedSchemaStub, stripMetaPreamble, compressToSpeakable, varySpokenOpening, SCAFFOLD_LABEL_RE } from "./answerPolish";
+export { AnswerDiversityGuard, cleanAnswerArtifacts, isLeakedSchemaStub, isLeakedJsonEnvelope, extractAnswerFromJsonEnvelope, isProviderTransportError, isLeakedInternalTagBlock, isLeakedAnswerArtifact, stripMetaPreamble, stripFabricatedTranscriptPreamble, isFabricatedTranscriptOnly, compressToSpeakable, varySpokenOpening, SCAFFOLD_LABEL_RE, BOLD_PSEUDO_HEADER_RE } from "./answerPolish";
 export type { RepetitionVerdict, RepetitionReason, DiversityCheckOpts } from "./answerPolish";
 export type { AnswerPlan, AnswerSource, AnswerType, ContextLayer, OutputPerspective, SpeakerPerspective } from "./AnswerPlanner";
 export { applyModeFallback, MODE_CONTEXT_PROFILES } from "./modeProfiles";
+
+// Prompt System v2 — provider-neutral composer (flag: promptSystemV2).
+export {
+    NO_ACTION_SENTINEL,
+    shouldSuppressModelOutput,
+    couldBecomeNoActionSentinel,
+    stripLeadingNoActionSentinel,
+    GIST_MARKER,
+    splitGistLine,
+    stripDisplayMarkup,
+    buildSystemPromptV2,
+    buildTurnContentV2,
+    buildAssembledTurnContentV2,
+    hasV2TurnEnvelope,
+    recommendedGenerationProfile,
+    spokenFormatViolations,
+    isPromptSystemV2Enabled,
+    resolveV2SystemPrompt,
+    isV2ComposedPrompt,
+    getV2PromptDescriptor,
+    v2ModeForActiveMode,
+    v2TierForPromptTier,
+    CUSTOM_INSTRUCTIONS_MAX_CHARS,
+    type PromptSystemV2Mode,
+    type PromptSystemV2Action,
+    type PromptTierV2,
+    type EvidenceBlockV2,
+    type GenerationProfileV2,
+} from "./promptSystemV2";
 export type { ActiveModeInfo, ModeContextProfile, ModeTemplateType } from "./modeProfiles";
 export { resolveFollowUp, resolveFollowUpOrClarify, isBareFollowUp, isRefinementFollowUp, isSameSessionFollowUp, buildContextFreeClarification } from "./FollowUpResolver";
 export { classifyProviderError, isClarificationStall, isPermanentKeyError } from "./providerErrorClassifier";
@@ -78,9 +112,10 @@ export {
   LIVE_PROVIDER_FIRST_USEFUL_COMPLEX_TIMEOUT_MS, LIVE_TOTAL_HARD_TIMEOUT_MS,
   LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, LIVE_LOCAL_TOTAL_HARD_TIMEOUT_MS,
   LIVE_INTER_TOKEN_STALL_MS, BENCHMARK_PER_QUESTION_HARD_TIMEOUT_MS,
+  MAX_STREAM_OUTPUT_CHARS,
 } from "./liveDeadlines";
 export type { FollowUpContext, ResolvedFollowUp, FollowUpSurface } from "./FollowUpResolver";
-export { renderCodingAnswerMarkdown, repairCodingAnswer, repairCodingMarkdown, validateAnswerStructure, validateCodingMarkdown, buildCodingScaffold } from "./AnswerValidator";
+export { renderCodingAnswerMarkdown, repairCodingAnswer, repairCodingMarkdown, validateAnswerStructure, validateCodingMarkdown, buildCodingScaffold, detectAndExtractScaffoldMisfire, hasUnrecoveredScaffoldContamination } from "./AnswerValidator";
 export type { AnswerValidationResult, CodingAnswer } from "./AnswerValidator";
 export { validateProfileOutput, buildProfileRepairInstruction, stripProfileTokensFromCoding, sanitizeCandidateAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES } from "./ProfileOutputValidator";
 export type { ProfileValidationResult, ProfileViolation, ProfileViolationCode, ProfileValidationInput, CandidateSanitizeResult, AssistantVoiceSanitizeResult } from "./ProfileOutputValidator";

@@ -344,8 +344,15 @@ export class PhoneMirrorService {
   publishDone(streamId: string, fullContent: string): void {
     if (!this.isRunning()) return;
     const createdAt = new Date().toISOString();
-    const content =
+    let content =
       fullContent || (this.livePartial?.streamId === streamId ? this.livePartial.content : '');
+    // Prompt System v2 no-action sentinel: never display or record on the
+    // phone surface (a second live sink parallel to the renderer).
+    try {
+      const { shouldSuppressModelOutput, stripLeadingNoActionSentinel } = require('../llm/promptSystemV2') as typeof import('../llm/promptSystemV2');
+      if (shouldSuppressModelOutput(content)) content = '';
+      else content = stripLeadingNoActionSentinel(content) || content;
+    } catch { /* non-fatal */ }
     if (content.trim()) {
       const msg: PersistedMessage = { id: 'a:' + streamId, role: 'assistant', content, createdAt };
       this.recordHistory(msg);
@@ -367,6 +374,11 @@ export class PhoneMirrorService {
    */
   publishAssistantMessage(id: string, content: string, label: string): void {
     if (!this.isRunning() || !content?.trim()) return;
+    // Prompt System v2 no-action sentinel: suppress on the phone surface.
+    try {
+      const { shouldSuppressModelOutput } = require('../llm/promptSystemV2') as typeof import('../llm/promptSystemV2');
+      if (shouldSuppressModelOutput(content)) return;
+    } catch { /* non-fatal */ }
     const createdAt = new Date().toISOString();
     const msg: PersistedMessage = {
       id: 'a:' + id,
@@ -1598,6 +1610,20 @@ export function pickTargetExtensionIndex(
     }
   }
   return best;
+}
+
+/**
+ * Pure decision for whether PhoneMirror should auto-start on boot, given the
+ * `NATIVELY_DISABLE_PHONE_MIRROR` kill switch (env.disablePhoneMirror) and the
+ * persisted `phoneMirrorEnabled` setting. Extracted from main.ts's boot
+ * sequence so the decision itself — not just its source text — is testable.
+ */
+export function shouldStartPhoneMirrorOnBoot(opts: {
+  disablePhoneMirror: boolean;
+  phoneMirrorEnabled: boolean;
+}): boolean {
+  if (opts.disablePhoneMirror) return false;
+  return opts.phoneMirrorEnabled;
 }
 
 /** True for IPv4/IPv6 loopback remote addresses (gates the /pair endpoint). */
