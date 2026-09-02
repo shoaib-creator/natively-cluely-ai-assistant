@@ -142,6 +142,20 @@ export interface BridgeResult {
   answerability: string;
   fallbackUsed: string;
   evidenceCount: number;
+  /**
+   * The evidence block this prompt was composed from — what the model was
+   * actually given, not what a later retrieval happens to return.
+   *
+   * Added 2026-08-28 for the post-stream doc-grounded validator, which re-ran a
+   * separate LEGACY retrieval and judged a V3-grounded answer against a
+   * different evidence set, overwriting a correct answer with the canonical
+   * refusal when the two disagreed. `evidenceCount` said HOW MUCH evidence
+   * there was; nothing said WHAT it was, so no caller could validate honestly.
+   *
+   * Empty string when the turn had no evidence — which is a meaningful answer,
+   * not a missing value.
+   */
+  evidenceBlock: string;
   /** True when the mode authorizes no source for this question — the caller
    *  should NOT quietly answer from model knowledge. */
   unsupportedInMode: boolean;
@@ -322,12 +336,13 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
         profileJobDescriptionSources: (input.resolvedProfileSources ?? []).filter((s) => s.role === 'profile_job_description').length,
         profileFactSources: (input.resolvedProfileSources ?? []).filter((s) => s.role === 'profile_fact').length,
         resolvedSources: input.resolvedProfileSources ?? [],
-        // Defect D/F telemetry (2026-08-01): the resolver's decision and the
-        // retrieval funnel were both invisible — a stale referent rewrite and a
-        // "0 raw candidates" vs "all candidates filtered" distinction each had
-        // to be reconstructed from answer prose.
-        originalQuestion: result.trace.originalQuestion,
-        resolvedQuestion: result.trace.resolvedQuestion,
+        // Preserve enough signal to spot a resolver rewrite without writing the
+        // user's typed, spoken, document, or screen-derived text to production
+        // logs. Full content remains available only through the explicit,
+        // development-only debug-content opt-in.
+        originalQuestionLength: result.trace.originalQuestion.length,
+        resolvedQuestionLength: result.trace.resolvedQuestion.length,
+        questionWasRewritten: result.trace.originalQuestion !== result.trace.resolvedQuestion,
         intent: result.trace.questionTypes,
         knowledgePolicy: policy.groundingPolicy,
         path: result.decision.retrievalPlan.path,
@@ -443,6 +458,16 @@ export async function buildV3Prompt(input: BridgeInput): Promise<BridgeResult | 
     return {
       system: composed.system,
       user: composed.user,
+      // T4 (2026-08-28): the evidence THIS PROMPT WAS BUILT FROM, exposed so a
+      // post-stream validator can check the answer against what the model was
+      // actually given. Before this, `IntelligenceEngine`'s doc-grounded
+      // validator re-ran a separate LEGACY retrieval and judged a V3-grounded
+      // answer against a different evidence set — then overwrote the streamed
+      // answer with the canonical refusal when the two disagreed. The evidence
+      // block is the only thing that can settle that, and it was never carried
+      // out of here. Empty string when the turn had no evidence, which is
+      // itself the answer to "was there anything to be grounded in?".
+      evidenceBlock: composed.packed.evidenceBlock ?? '',
       answerability: result.answerability,
       fallbackUsed: result.trace.fallbackUsed,
       // Post-filter: the count callers branch on must describe the evidence the

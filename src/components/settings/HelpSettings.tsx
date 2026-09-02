@@ -1112,7 +1112,7 @@ export const HelpSettings: React.FC<{ onNavigate?: (tab: string) => void }> = ({
                                         </span>
                                         <button onClick={() => { (window as any).electronAPI?.openExternal('https://console.groq.com/keys') }} className="text-accent-primary hover:underline text-[10px] flex items-center gap-1"><ExternalLink size={10} /> Get Key</button>
                                     </h5>
-                                    <p className="text-[11px] opacity-80 mb-2">Ultra-fast inference using LPU hardware. Default model: <strong>llama-3.3-70b-versatile</strong>.</p>
+                                    <p className="text-[11px] opacity-80 mb-2">Ultra-fast inference using LPU hardware. Default model: <strong>qwen/qwen3.6-27b</strong>.</p>
                                     <span className={kbdClass}>gsk_...</span>
                                 </div>
                                 <div className="p-3 rounded-xl border bg-bg-item-surface border-border-subtle hover:border-border-muted transition-colors">
@@ -1142,7 +1142,7 @@ export const HelpSettings: React.FC<{ onNavigate?: (tab: string) => void }> = ({
                                         </span>
                                         <button onClick={() => { (window as any).electronAPI?.openExternal('https://aistudio.google.com/app/apikey') }} className="text-accent-primary hover:underline text-[10px] flex items-center gap-1"><ExternalLink size={10} /> Get Key</button>
                                     </h5>
-                                    <p className="text-[11px] opacity-80 mb-2">Immense contextual window. Default model: <strong>gemini-3.1-pro</strong>.</p>
+                                    <p className="text-[11px] opacity-80 mb-2">Immense contextual window. Default models: <strong>gemini-3.1-flash-lite</strong>, and <strong>gemini-3.7-flash</strong> for interviews and screenshots.</p>
                                     <span className={kbdClass}>AIzaSy...</span>
                                 </div>
                             </div>
@@ -1997,7 +1997,7 @@ hindsight-api`}
                                 </h4>
                                 <ul className="text-[11px] text-text-secondary space-y-2 list-disc pl-4">
                                     <li>
-                                        <strong>Global Hotkey (Recommended):</strong> Press <kbd className="bg-bg-elevated px-1.5 py-0.5 rounded border text-[10.5px] border-border-subtle font-sans">{isMac ? '⌘' : 'Ctrl'}+Shift+Y</kbd> anywhere on your system. Natively pulls DOM context automatically; if the browser isn't active/reachable, it defaults to a screenshot automatically.
+                                        <strong>Global Hotkey (Recommended):</strong> Press <kbd className="bg-bg-elevated px-1.5 py-0.5 rounded border text-[10.5px] border-border-subtle font-sans">{isMac ? '⌘' : 'Ctrl'}+Y</kbd> anywhere on your system. Keep holding {isMac ? '⌘' : 'Ctrl'} and tap Enter to send the question in the same motion. Natively pulls DOM context automatically; if the browser isn't active/reachable, it defaults to a screenshot automatically.
                                     </li>
                                     <li>
                                         <strong>Manual Capture:</strong> Open the extension toolbar popup and click <strong>Capture this page</strong>.

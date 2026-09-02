@@ -20,7 +20,8 @@ import type {
 import { freezeTurnDecision } from '../contracts/types';
 import { resolveModePolicy, generalKnowledgeAllowed, type ModePolicy } from '../policies/mode-policy-registry';
 import { resolveAnswerPolicy, type AnswerPolicy } from '../policies/answer-policy';
-import { CLAIM_AUTHORITY } from '../policies/source-authority-policy';
+import { CLAIM_AUTHORITY, claimAuthority } from '../policies/source-authority-policy';
+import { isRetrievalFixEnabled } from '../contracts/retrieval-flags';
 import { classifyTurn, isBareFollowUp } from '../question/turn-classifier';
 import type { AnswerTrace, RetrievalAttemptTrace } from '../observability/answer-trace';
 
@@ -107,7 +108,10 @@ function buildClaimRequirements(
   clauses: Partial<Record<string, string>> = {},
 ): ClaimRequirement[] {
   return claimTypes.map((ct) => {
-    const authority = CLAIM_AUTHORITY[ct as keyof typeof CLAIM_AUTHORITY];
+    // `claimAuthority()`, not the raw table: T1's widening is resolved per
+    // call, and `authoritativeSources` here is what the retrieval plan and
+    // the admission filter both read.
+    const authority = claimAuthority(ct as keyof typeof CLAIM_AUTHORITY);
     const isPrivate = authority.authoritative.length > 0;
     return {
       claimType: ct as ClaimRequirement['claimType'],
@@ -663,7 +667,27 @@ export async function orchestrate(
   req: AnswerRequest,
   retrieval?: RetrievalPort,
 ): Promise<OrchestratorResult> {
-  const t0 = 0;
+  // performance.now(), NOT Date.now(). This is a desktop app that sleeps in the
+  // middle of a turn all the time — a lid closed between here and the trace
+  // literal would otherwise report a four-hour retrieval. A monotonic clock
+  // cannot be dragged by a sleep, an NTP step or a timezone change.
+  const clock = () => (typeof performance !== 'undefined' && typeof performance.now === 'function')
+    ? performance.now()
+    : Date.now();
+  const span = (from: number) => Math.max(0, Math.round(clock() - from));
+  const t0 = clock();
+
+  // Phase spans. Every one of these was a hardcoded 0 from the day the trace
+  // was written (`const t0 = 0` was literally the total), so `latency` looked
+  // like a measurement and was a placeholder — 173 production telemetry rows
+  // reported 0ms for everything before this was noticed. A zero here now means
+  // "measured zero", which is why the two spans that genuinely cannot be timed
+  // from inside this function are documented at the trace literal instead of
+  // being left to look measured.
+  let questionResolutionMs = 0;
+  let classificationMs = 0;
+  let retrievalMs = 0;
+  let evidenceEvaluationMs = 0;
 
   // ── Conversation continuity (§12.3) ───────────────────────────────────────
   // Resolve a bare follow-up against this session's state BEFORE deciding.
@@ -685,13 +709,17 @@ export async function orchestrate(
   // that as "original" hid every resolver decision from the telemetry.
   const originalQuestion = (req.manualQuestion ?? req.transcriptQuestion ?? '').trim();
   let priorDecision: import('../contracts/types').PriorTurnDecision | undefined;
+  const tResolve = clock();
   try {
     const { resolveAgainstSession, getConversationState } = require('../question/conversation-state-store');
     const rawQ = originalQuestion;
     if (rawQ) {
       const priorState = getConversationState(req.sessionId);
       priorDecision = priorState?.previousDecision;
-      const ref = resolveAgainstSession(req.sessionId, rawQ);
+      // T7: pass this turn's scope so a topic from the PREVIOUS meeting/mode
+      // cannot rewrite this question. `advance()` resets on scope change, but it
+      // runs AFTER this line -- resetting on write cannot protect a read.
+      const ref = resolveAgainstSession(req.sessionId, rawQ, req.scope);
       referentResolution = {
         applied: Boolean(ref.usedState && ref.resolved !== rawQ),
         ...(ref.referent ? { referent: ref.referent } : {}),
@@ -708,8 +736,72 @@ export async function orchestrate(
       }
     }
   } catch { /* continuity must never break a turn */ }
+  questionResolutionMs = span(tResolve);
 
+  // decide() resolves the mode policy AND classifies the turn, so this span
+  // covers both. policyResolutionMs is left at 0 rather than being given half
+  // of a number nobody measured — splitting it means instrumenting decide().
+  const tClassify = clock();
   let decision = decide(effectiveReq);
+  classificationMs = span(tClassify);
+
+  // ── T5: a resolved bare follow-up regains its subject's pool ───────────────
+  //
+  // The unclaimed-retrieval fallback in `decide()` consults DOCUMENT pools only
+  // and deliberately excludes identity pools — "Reverse a linked list in Python"
+  // must not retrieve resumes (deep-run 2, issue 5). That exclusion is right for
+  // its own case and wrong for the one it also catches: a bare follow-up
+  // ("Why?", "What did you monitor after that?") has no claims of its own
+  // BECAUSE its subject lives in the previous turn, and the fallback then denies
+  // it the very pool that turn answered from. Measured:
+  //
+  //   looking-for-work  "Why? (referring to: Kubernetes)"  planned [REFERENCE_FILE]
+  //                     -- resume/profile excluded, though the prior turn used them
+  //   recruiting        same                               CANDIDATE_FILE excluded,
+  //                     the mode's PRIORITY-1 source
+  //
+  // That is a second, independent cause of "follow-ups jump to the wrong
+  // project", distinct from the chunking one: even when the referent resolves
+  // correctly, the plan can exclude the pool that owns the subject.
+  //
+  // Four conditions, and each is load-bearing:
+  //   • `usePreviousSourceContinuity` — the plan already declares this a
+  //     continuity turn. The field existed and had no consumer for this.
+  //   • `referentWasResolved` — the subject genuinely came from state. Without
+  //     it a self-contained question with no claims would inherit pools it never
+  //     asked for, which is exactly the deep-run 2 defect.
+  //   • the plan used the FALLBACK (no claim named a source). A follow-up that
+  //     names its own sources keeps them.
+  //   • intersect with the mode allowlist. Continuity can restore a pool the
+  //     mode authorizes; it can never introduce one it does not.
+  if (isRetrievalFixEnabled('followUpSourceContinuity')
+      && referentWasResolved
+      && decision.retrievalPlan.shouldRetrieve
+      && decision.retrievalPlan.usePreviousSourceContinuity
+      && decision.claimRequirements.every((c) => c.authority !== 'PRIVATE_SOURCE_REQUIRED')) {
+    try {
+      const { getConversationState } = require('../question/conversation-state-store');
+      const prior = getConversationState(req.sessionId)?.previousPlannedSourceTypes ?? [];
+      // `optional` is the mode allowlist minus what the claims required (see
+      // where it is computed in decide()), so the two together ARE the
+      // allowlist — including any extraAllowedSourceTypes decide() folded in.
+      const allowed = new Set<SourceType>([
+        ...decision.requiredSourceTypes,
+        ...decision.optionalSourceTypes,
+      ]);
+      const planned = new Set(decision.retrievalPlan.sourceTypes);
+      const restored = prior.filter((s: SourceType) => allowed.has(s) && !planned.has(s));
+      if (restored.length) {
+        decision = freezeTurnDecision({
+          ...decision,
+          retrievalPlan: {
+            ...decision.retrievalPlan,
+            sourceTypes: [...decision.retrievalPlan.sourceTypes, ...restored],
+          },
+        } as never);
+      }
+    } catch { /* continuity must never break a turn */ }
+  }
 
   // Precedence follow-up (live turns 18/92, 2026-08-01): "Why did you ignore
   // the other values?" / "Why are the lower values not current?" ask about the
@@ -728,11 +820,17 @@ export async function orchestrate(
   let attempts: RetrievalAttemptTrace[] = [];
 
   if (decision.retrievalPlan.shouldRetrieve && retrieval) {
+    // Timed at the call site, not read from `attempts[].durationMs`: only
+    // legacy-retrieval-port populates that field, so trusting it would report
+    // 0ms for every turn served by any other port.
+    const tRetrieve = clock();
     try {
       const r = await retrieval.retrieve({ decision });
       evidence = r.evidence;
       attempts = r.attempts;
+      retrievalMs = span(tRetrieve);
     } catch (e) {
+      retrievalMs = span(tRetrieve);
       // §22.1: a retrieval dependency failure is RECORDED and the turn
       // continues with no evidence — it must NOT abort the turn back to a
       // legacy path that would inject a raw context blob instead. Answerability
@@ -750,7 +848,9 @@ export async function orchestrate(
     }
   }
 
+  const tEvaluate = clock();
   const answerability = evaluateAnswerability(decision, evidence);
+  evidenceEvaluationMs = span(tEvaluate);
 
   // A question whose required source the MODE forbids is not answerable from
   // model knowledge — that would answer a meeting question out of thin air. It
@@ -826,10 +926,29 @@ export async function orchestrate(
     fallbackUsed,
     promptTokenEstimate: 0,
     latency: {
-      normalizationMs: 0, questionResolutionMs: 0, policyResolutionMs: 0, classificationMs: 0,
-      retrievalMs: 0, rerankingMs: 0, evidenceEvaluationMs: 0, promptCompositionMs: 0,
-      providerTtfbMs: 0, totalMs: t0,
+      // Measured.
+      questionResolutionMs, classificationMs, retrievalMs, evidenceEvaluationMs,
+      totalMs: span(t0),
+
+      // NOT measured, and deliberately not guessed. Each of these happens
+      // outside this function, so any number here would be invented:
+      //   normalizationMs / policyResolutionMs — inside decide(), which reports
+      //     one span; see classificationMs above.
+      //   rerankingMs      — inside the retrieval port, which does not report it.
+      //   promptCompositionMs — composePrompt runs in engine-bridge AFTER this
+      //     function returns.
+      //   providerTtfbMs   — the provider has not been called yet.
+      normalizationMs: 0, policyResolutionMs: 0, rerankingMs: 0,
+      promptCompositionMs: 0, providerTtfbMs: 0,
     },
+    // Empty, and it must STAY empty here. This trace is finalized before the
+    // prompt is composed and long before a provider is called, so there is no
+    // provider to attribute. Reading LLMHelper.lastProviderModel at this point
+    // would return the PREVIOUS turn's model — and with auto-answer running
+    // overlapping turns it would be wrong in a way that looks entirely
+    // plausible. An empty array is honest; a stale model is telemetry that
+    // lies. Provider attribution belongs to whoever observes the completed
+    // provider call, not here.
     providerAttempts: [],
     status: 'COMPLETED',
     errorCodes: [],
@@ -915,6 +1034,8 @@ export async function orchestrate(
       evidenceIds: evidence.map((e) => e.evidenceId),
       sourceIds: [...new Set(evidence.map((e) => e.sourceId))],
       decision: turnDecision,
+      // T5: what this turn planned, so a bare follow-up can inherit it.
+      plannedSourceTypes: decision.retrievalPlan.sourceTypes,
     });
   } catch { /* continuity must never break a turn */ }
 

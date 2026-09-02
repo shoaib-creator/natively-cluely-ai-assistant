@@ -9,6 +9,7 @@ import {
     Sparkles, Pencil, Briefcase, Building2, Search, MapPin, CheckCircle, HelpCircle, Zap, SlidersHorizontal, PointerOff, Folder,
     Star, AlertCircle, Gift, Smartphone, Cpu, Shield, Code2, Headphones
 } from 'lucide-react';
+import { AutoAnswerIcon } from './AutoAnswerIcon';
 import { HiCreditCard } from 'react-icons/hi2';
 import { analytics } from '../lib/analytics/analytics.service';
 import { AboutSection } from './AboutSection';
@@ -18,7 +19,7 @@ import { PlansSettings } from './settings/PlansSettings';
 import { PhoneMirrorSettings } from './settings/PhoneMirrorSettings';
 import { IntelligenceSettings } from './settings/IntelligenceSettings';
 import { SkillsSettings } from './settings/SkillsSettings';
-import { LocalWhisperModelPanel } from './LocalWhisperModelPanel';
+import { LocalWhisperModelPanel, type ChannelConfig as LocalWhisperChannelConfig } from './LocalWhisperModelPanel';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { useShortcuts } from '../hooks/useShortcuts';
 import { isMac } from '../utils/platformUtils';
@@ -39,6 +40,9 @@ import { ProfileVisualizer, PremiumUpgradeModal } from '../premium';
 import GlassEffectLayer from './ui/GlassEffectLayer';
 import { BrandMark, BrandMonogram } from './ui/BrandMark';
 import icon from './icon.png';
+// Shared with the main process so the picker cannot offer a model the ipc
+// validator rejects. Pure data module — no node/electron imports.
+import { NVIDIA_NIM_STT_MODELS, DEFAULT_NVIDIA_NIM_STT_MODEL, allowedLanguageKeysForNvidiaModel } from '../../electron/audio/nvidiaNimSttModels';
 
 // ---------------------------------------------------------------------------
 // StarRating — renders filled/empty stars for culture ratings
@@ -180,9 +184,12 @@ interface CustomSelectProps {
     options: MediaDeviceInfo[];
     onChange: (value: string) => void;
     placeholder?: string;
+    /** Greys the control out and blocks the dropdown — used when the active
+     *  local STT model doesn't accept this setting (see modelLanguageSupport). */
+    disabled?: boolean;
 }
 
-const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options, onChange, placeholder = "Select device" }) => {
+const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options, onChange, placeholder = "Select device", disabled = false }) => {
     const t = useT();
     const [isOpen, setIsOpen] = useState(false);
     const containerRef = React.useRef<HTMLDivElement>(null);
@@ -210,14 +217,16 @@ const CustomSelect: React.FC<CustomSelectProps> = ({ label, icon, value, options
 
             <div className="relative">
                 <button
-                    onClick={() => setIsOpen(!isOpen)}
-                    className="w-full bg-bg-input border border-border-subtle rounded-lg px-3 py-2.5 text-sm text-text-primary flex items-center justify-between hover:bg-bg-elevated transition-colors"
+                    onClick={() => !disabled && setIsOpen(!isOpen)}
+                    disabled={disabled}
+                    aria-disabled={disabled}
+                    className={`w-full bg-bg-input border border-border-subtle rounded-lg px-3 py-2.5 text-sm text-text-primary flex items-center justify-between transition-colors ${disabled ? 'opacity-50 cursor-not-allowed' : 'hover:bg-bg-elevated'}`}
                 >
                     <span className="truncate pr-4">{selectedLabel}</span>
                     <ChevronDown size={14} className={`text-text-secondary transition-transform ${isOpen ? 'rotate-180' : ''}`} />
                 </button>
 
-                {isOpen && (
+                {isOpen && !disabled && (
                     <div className="absolute top-full left-0 w-full mt-1 bg-bg-elevated border border-border-subtle rounded-lg shadow-xl z-50 max-h-48 overflow-y-auto animated fadeIn">
                         <div className="p-1 space-y-0.5">
                             {options.map((device) => (
@@ -418,6 +427,28 @@ interface SettingsOverlayProps {
     initialHasNativelyKey?: boolean;
 }
 
+/**
+ * Where each speech provider issues API keys. The "Get API Key" button reads
+ * this; a provider missing from it used to render a link that did NOTHING when
+ * clicked — soniox and nvidia_nim were both in that state — so the button is now
+ * hidden unless there is somewhere to send the user.
+ *
+ * nvidia_nim points at the SPEECH catalogue rather than a settings page:
+ * build.nvidia.com/settings/api-keys 404s (it returns the SPA's not-found
+ * shell), and NVIDIA issues keys from a model card's "Generate API Key" button,
+ * so /explore/speech is both a working URL and the right context for an ASR key.
+ */
+const STT_KEY_URLS: Record<string, string> = {
+    groq: 'https://console.groq.com/keys',
+    openai: 'https://platform.openai.com/api-keys',
+    deepgram: 'https://console.deepgram.com',
+    elevenlabs: 'https://elevenlabs.io/app/settings/api-keys',
+    azure: 'https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeech',
+    ibmwatson: 'https://cloud.ibm.com/catalog/services/speech-to-text',
+    soniox: 'https://console.soniox.com/api-keys',
+    nvidia_nim: 'https://build.nvidia.com/explore/speech',
+};
+
 const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     isOpen,
     onClose,
@@ -547,6 +578,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
 
     const [verboseLogging, setVerboseLogging] = useState(false);
     const [ambientChatEnabled, setAmbientChatEnabled] = useState(false);
+    const [autoAnswerEnabled, setAutoAnswerEnabled] = useState(false);
     const [meetingRetention, setMeetingRetention] = useState<'forever' | '7d' | '30d' | 'never'>('forever');
     const [showVerboseToast, setShowVerboseToast] = useState(false);
     const [codeVerification, setCodeVerification] = useState(false);
@@ -565,6 +597,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
             window.electronAPI?.getDisguise?.().then(setDisguiseMode).catch(() => { });
             window.electronAPI?.getVerboseLogging?.().then(setVerboseLogging).catch(() => { });
             window.electronAPI?.getAmbientChatEnabled?.().then(setAmbientChatEnabled).catch(() => { });
+            window.electronAPI?.getAutoAnswerEnabled?.().then(setAutoAnswerEnabled).catch(() => { });
             window.electronAPI?.getCodeVerification?.().then((v) => setCodeVerification(v === true)).catch(() => { });
             window.electronAPI?.getMeetingRetention?.().then(setMeetingRetention).catch(() => { });
         }
@@ -658,6 +691,29 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     const [selectedSttGroup, setSelectedSttGroup] = useState('');
     const [availableLanguages, setAvailableLanguages] = useState<Record<string, any>>({});
     const [autoDetectedLanguage, setAutoDetectedLanguage] = useState<string | null>(null);
+
+    // Active STT provider — declared here (not with the rest of the STT
+    // settings below) because the local-model language-capability effect and
+    // memo that follow depend on it.
+    const [sttProvider, setSttProvider] = useState<'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper'>('none');
+
+    // Declared here for the same reason sttProvider is: the NVIDIA
+    // language-capability memo below reads it, and which languages that model
+    // can recognise gates the recognition-language selector.
+    const [nvidiaNimSttModel, setNvidiaNimSttModel] = useState(DEFAULT_NVIDIA_NIM_STT_MODEL);
+
+    // Local model language capability (local-whisper provider only).
+    // Per-model: which RECOGNITION_LANGUAGES keys the model accepts, whether
+    // language is changeable at all, and whether accent/region variants mean
+    // anything to it — computed main-side from each model's official docs
+    // (electron/audio/whisper/modelLanguageSupport.ts) and attached to
+    // local-whisper-get-models. Combined with the live channel config to
+    // restrict/grey the Language and Accent/Region selects below.
+    const [localModelSupport, setLocalModelSupport] = useState<Record<string, {
+        name: string;
+        support: { languageSelectable: boolean; accentSelectable: boolean; allowedLanguageKeys: string[] };
+    }> | null>(null);
+    const [localWhisperConfig, setLocalWhisperConfig] = useState<LocalWhisperChannelConfig | null>(null);
 
     // AI Response Language
     const [aiResponseLanguage, setAiResponseLanguage] = useState('English');
@@ -911,6 +967,64 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         loadLanguages();
     }, []);
 
+    // Load per-model language capability whenever the local provider is
+    // active. The channel config is ALSO pushed live by LocalWhisperModelPanel
+    // via onModelConfigChanged (the panel and these selects are on the same
+    // Settings page), so a model swap re-restricts the selects immediately.
+    useEffect(() => {
+        if (sttProvider !== 'local-whisper') return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const [modelsRes, cfgRes] = await Promise.all([
+                    window.electronAPI?.localWhisperGetModels?.(),
+                    window.electronAPI?.localWhisperGetChannelConfig?.(),
+                ]);
+                if (cancelled) return;
+                if (modelsRes?.models) {
+                    const map: Record<string, { name: string; support: any }> = {};
+                    for (const m of modelsRes.models) {
+                        if (m?.id && m.languageSupport) map[m.id] = { name: m.name ?? m.id, support: m.languageSupport };
+                    }
+                    setLocalModelSupport(map);
+                }
+                if (cfgRes) setLocalWhisperConfig(cfgRes);
+            } catch (err) {
+                console.error('[Settings] Failed to load local model language capability:', err);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [sttProvider]);
+
+    // Effective capability across the ACTIVE local model(s): in split mode the
+    // one global language setting feeds BOTH channels, so the offered set is
+    // the intersection of what mic and system models accept; accent stays
+    // enabled if ANY active model consumes regional variants (harmless to the
+    // others — they collapse variants to a plain language token).
+    // null → no restriction (cloud providers, or capability not loaded yet).
+    const localLanguageCapability = useMemo(() => {
+        if (sttProvider !== 'local-whisper' || !localModelSupport || !localWhisperConfig) return null;
+        const { enabled, micModelId, systemModelId, globalModelId } = localWhisperConfig;
+        const ids = Array.from(new Set(
+            (enabled ? [micModelId || globalModelId, systemModelId || globalModelId] : [globalModelId]).filter(Boolean)
+        ));
+        const entries = ids.map(id => localModelSupport[id]).filter(Boolean);
+        if (entries.length === 0) return null;
+        let allowedKeys = new Set<string>(entries[0].support.allowedLanguageKeys);
+        for (const e of entries.slice(1)) {
+            allowedKeys = new Set(e.support.allowedLanguageKeys.filter((k: string) => allowedKeys.has(k)));
+        }
+        const accentSelectable = entries.some(e => e.support.accentSelectable);
+        const englishOnlyNames = entries.filter(e => !e.support.languageSelectable).map(e => e.name);
+        // Locked when every offered key sits in one group (the English-only
+        // case) — a select with a single meaningful choice is greyed, not hidden.
+        const allowedGroups = new Set(
+            Array.from(allowedKeys).map(k => availableLanguages[k]?.group).filter(Boolean)
+        );
+        const languageSelectable = allowedGroups.size > 1;
+        return { allowedKeys, accentSelectable, languageSelectable, englishOnlyNames, modelNames: entries.map(e => e.name) };
+    }, [sttProvider, localModelSupport, localWhisperConfig, availableLanguages]);
+
     const handleLanguageChange = async (key: string) => {
         setRecognitionLanguage(key);
         setAutoDetectedLanguage(null);  // always reset — new session may detect a different language
@@ -924,15 +1038,37 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
 
     const handleGroupChange = (group: string) => {
         setSelectedSttGroup(group);
-        // Find default variant for this group (first one)
-        const firstVariant = Object.entries(availableLanguages).find(([_, lang]) => lang.group === group);
+        // Find default variant for this group (first one the active model accepts)
+        const firstVariant = Object.entries(availableLanguages).find(
+            ([key, lang]) => lang.group === group && isLanguageEntryAllowed(key)
+        );
         if (firstVariant) {
             handleLanguageChange(firstVariant[0]);
         }
     };
 
-    // Helper to get unique groups
-    const languageGroups = Array.from(new Set(Object.values(availableLanguages).map((l: any) => l.group)))
+    // NVIDIA speech models are per-language deployments: the Vietnamese build
+    // serves vi-VN and nothing else, and the streaming English ones serve en-US
+    // only. Offering the full language list under them would let a user pick a
+    // language the selected model cannot recognise. Derived from each model's
+    // documented locales — see allowedLanguageKeysForNvidiaModel.
+    const nvidiaLanguageCapability = useMemo(() => {
+        if (sttProvider !== 'nvidia_nim') return null;
+        if (!availableLanguages || Object.keys(availableLanguages).length === 0) return null;
+        return allowedLanguageKeysForNvidiaModel(nvidiaNimSttModel, availableLanguages);
+    }, [sttProvider, nvidiaNimSttModel, availableLanguages]);
+
+    // Language keys the active STT backend accepts. Unrestricted for cloud
+    // providers; for local-whisper this is the active model's documented set.
+    const allowedLanguageKeySet = localLanguageCapability?.allowedKeys ?? nvidiaLanguageCapability ?? null;
+    const isLanguageEntryAllowed = (key: string) => !allowedLanguageKeySet || allowedLanguageKeySet.has(key);
+
+    // Helper to get unique groups (restricted to what the active model accepts)
+    const languageGroups = Array.from(new Set(
+        Object.entries(availableLanguages)
+            .filter(([key]) => isLanguageEntryAllowed(key))
+            .map(([, l]: [string, any]) => l.group)
+    ))
         .sort((a, b) => {
             if (a === 'Auto') return -1;
             if (b === 'Auto') return 1;
@@ -941,10 +1077,31 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
             return a.localeCompare(b);
         });
 
+    // The stored selection can name a language the newly-selected local model
+    // doesn't support (the setting is global across providers and is NOT
+    // rewritten when a model is picked). Display-only fallbacks: a locked
+    // (English-only) model shows English / United States — which IS what the
+    // pipeline does (the worker omits the language token for English-only
+    // checkpoints) — while an unsupported pick on a selectable model keeps
+    // showing the stored value alongside the warning hint below.
+    const languageLocked = localLanguageCapability ? !localLanguageCapability.languageSelectable : false;
+    // 'auto' is its own case, NOT an unsupported language. No local model has a
+    // real auto-detect mode with locale conditioning, but LocalWhisperSTT
+    // normalizes 'auto' to English rather than failing (see
+    // resolveAndApplyNemotronLanguage), so the honest message is "auto-detect
+    // is unavailable, English is used" — not "your language isn't supported".
+    const autoDetectUnavailable =
+        recognitionLanguage === 'auto' && !!allowedLanguageKeySet && !allowedLanguageKeySet.has('auto');
+    const storedLanguageUnsupported =
+        !!recognitionLanguage && recognitionLanguage !== 'auto'
+        && !!allowedLanguageKeySet && !allowedLanguageKeySet.has(recognitionLanguage);
+    const showsEnglishFallback = languageLocked && (storedLanguageUnsupported || autoDetectUnavailable);
+    const displayedSttGroup = showsEnglishFallback ? 'English' : selectedSttGroup;
+    const displayedRecognitionLanguage = showsEnglishFallback ? 'english-us' : recognitionLanguage;
+
     // Helper to get variants for current group
     const currentGroupVariants = Object.entries(availableLanguages)
-
-        .filter(([_, lang]) => lang.group === selectedSttGroup)
+        .filter(([key, lang]) => lang.group === displayedSttGroup && isLanguageEntryAllowed(key))
         .map(([key, lang]) => ({
             deviceId: key,
             label: lang.label,
@@ -1018,6 +1175,12 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     const [selectedInput, setSelectedInput] = useState('');
     const [selectedOutput, setSelectedOutput] = useState('');
     const [micLevel, setMicLevel] = useState(0);
+    // System-audio half of the pre-meeting check (UX4). The mic meter alone only
+    // proves we can hear the USER; this one proves we are capturing the other
+    // side of the call, which is the half that silently fails (permission not
+    // granted, no loopback device, tap init refused).
+    const [systemAudioLevel, setSystemAudioLevel] = useState(0);
+    const [systemAudioError, setSystemAudioError] = useState<string | null>(null);
     const [useExperimentalSck, setUseExperimentalSck] = useState(false);
     // Most-recent device fallback notice. Populated by main process via
     // 'device-selection-applied' IPC when the saved device couldn't be opened
@@ -1029,8 +1192,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         reason?: string;
     } | null>(null);
 
-    // STT Provider settings
-    const [sttProvider, setSttProvider] = useState<'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively' | 'local-whisper'>('none');
+    const [sttNvidiaNimKey, setSttNvidiaNimKey] = useState('');
     const [groqSttModel, setGroqSttModel] = useState('whisper-large-v3-turbo');
     const [sttGroqKey, setSttGroqKey] = useState('');
     const [sttOpenaiKey, setSttOpenaiKey] = useState('');
@@ -1050,6 +1212,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
     const [googleServiceAccountError, setGoogleServiceAccountError] = useState('');
     const [hasNativelyKey, setHasNativelyKey] = useState(initialHasNativelyKey);
     const [hasStoredSttGroqKey, setHasStoredSttGroqKey] = useState(false);
+    const [hasStoredNvidiaNimKey, setHasStoredNvidiaNimKey] = useState(false);
     const [hasStoredSttOpenaiKey, setHasStoredSttOpenaiKey] = useState(false);
     const [hasStoredDeepgramKey, setHasStoredDeepgramKey] = useState(false);
     const [hasStoredElevenLabsKey, setHasStoredElevenLabsKey] = useState(false);
@@ -1080,10 +1243,12 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                 // @ts-ignore
                 const creds = await window.electronAPI?.getStoredCredentials?.();
                 if (creds) {
-                    setSttProvider(creds.sttProvider || 'none');
+                    setSttProvider((creds.sttProvider || 'none') as any);
                     if (creds.groqSttModel) setGroqSttModel(creds.groqSttModel);
                     setGoogleServiceAccountPath(creds.googleServiceAccountPath);
                     setHasStoredSttGroqKey(creds.hasSttGroqKey);
+                    setHasStoredNvidiaNimKey(creds.hasNvidiaNimKey || false);
+                    if ((creds as any).nvidiaNimSttModel) setNvidiaNimSttModel((creds as any).nvidiaNimSttModel);
                     setHasStoredSttOpenaiKey(creds.hasSttOpenaiKey);
                     setHasStoredDeepgramKey(creds.hasDeepgramKey);
                     setHasStoredElevenLabsKey(creds.hasElevenLabsKey);
@@ -1134,7 +1299,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         return () => unsubscribe();
     }, []); // mount-once: isOpen is checked inside the callback
 
-    const handleSttProviderChange = async (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively' | 'local-whisper') => {
+    const handleSttProviderChange = async (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper') => {
         setSttProvider(provider);
         setIsSttDropdownOpen(false);
         setSttTestStatus('idle');
@@ -1147,7 +1312,42 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
         }
     };
 
-    const handleSttKeySubmit = async (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', key: string) => {
+    /**
+     * Commit a speech-model choice.
+     *
+     * Optimistic, then REVERTED if the write did not land. set-nvidia-nim-stt-model
+     * answers {success:false} for an unsupported id and for a degraded credential
+     * store (refuseWriteWhileDegraded), and the previous version neither awaited a
+     * result nor caught a rejection — so a refused write left the UI showing a model
+     * the next session would not load, with an unhandled rejection in the console.
+     */
+    const selectNvidiaNimSttModel = async (id: string) => {
+        const previous = nvidiaNimSttModel;
+        if (previous === id) return;
+        setNvidiaNimSttModel(id);
+        try {
+            const result = await window.electronAPI?.setNvidiaNimSttModel?.(id);
+            if (result && result.success === false) throw new Error(result.error || 'Could not save speech model');
+        } catch (err) {
+            console.error('[Settings] Failed to save NVIDIA NIM speech model:', err);
+            setNvidiaNimSttModel(previous);
+        }
+    };
+
+    /** Arrow-key navigation, which `role="radio"` obliges us to provide. */
+    const nvidiaNimSttModelKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+        const forward = e.key === 'ArrowDown' || e.key === 'ArrowRight';
+        const back = e.key === 'ArrowUp' || e.key === 'ArrowLeft';
+        if (!forward && !back) return;
+        e.preventDefault();
+        const count = NVIDIA_NIM_STT_MODELS.length;
+        const next = (index + (forward ? 1 : -1) + count) % count;
+        void selectNvidiaNimSttModel(NVIDIA_NIM_STT_MODELS[next].id);
+        const group = e.currentTarget.parentElement;
+        (group?.querySelectorAll<HTMLElement>('[role="radio"]')[next])?.focus();
+    };
+
+    const handleSttKeySubmit = async (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim', key: string) => {
         if (!key.trim()) return;
         // Reject masked values returned by getStoredCredentials ("sk-...XXXX").
         // These are never valid API keys and every provider rejects them.
@@ -1185,6 +1385,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
             if (provider === 'groq') {
                 // @ts-ignore
                 saveResult = await window.electronAPI?.setGroqSttApiKey?.(key.trim());
+            } else if (provider === 'nvidia_nim') {
+                saveResult = await window.electronAPI?.setNvidiaNimApiKey?.(key.trim());
             } else if (provider === 'openai') {
                 // @ts-ignore
                 saveResult = await window.electronAPI?.setOpenAiSttApiKey?.(key.trim());
@@ -1217,6 +1419,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
             }
 
             if (provider === 'groq') setHasStoredSttGroqKey(true);
+            else if (provider === 'nvidia_nim') setHasStoredNvidiaNimKey(true);
             else if (provider === 'openai') setHasStoredSttOpenaiKey(true);
             else if (provider === 'elevenlabs') setHasStoredElevenLabsKey(true);
             else if (provider === 'azure') setHasStoredAzureKey(true);
@@ -1549,6 +1752,21 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                 setMicLevel(Math.max(0, Math.min(100, level * 100)));
             });
 
+            // The main process probes system audio in PARALLEL with the mic for the
+            // duration of the same test, so both meters are driven by the one
+            // startAudioTest() call below — there is no separate start/stop to make.
+            const unsubscribeSystemLevel = window.electronAPI?.onAudioTestSystemLevel?.((level) => {
+                setSystemAudioError(null);
+                setSystemAudioLevel(Math.max(0, Math.min(100, level * 100)));
+            });
+            // A system-audio failure is reported, never left as a flat bar. A silent
+            // zero reads as "quiet" when it actually means the tap could not start,
+            // which is precisely the confusion this meter exists to remove.
+            const unsubscribeSystemError = window.electronAPI?.onAudioTestSystemError?.((message) => {
+                setSystemAudioLevel(0);
+                setSystemAudioError(message || 'System audio could not be captured.');
+            });
+
             window.electronAPI?.startAudioTest(selectedInput).catch((error) => {
                 console.error("Error starting native microphone test:", error);
                 setMicLevel(0);
@@ -1556,10 +1774,14 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
 
             return () => {
                 unsubscribe?.();
+                unsubscribeSystemLevel?.();
+                unsubscribeSystemError?.();
                 window.electronAPI?.stopAudioTest?.().catch((error) => {
                     console.error("Error stopping native microphone test:", error);
                 });
                 setMicLevel(0);
+                setSystemAudioLevel(0);
+                setSystemAudioError(null);
             };
         }
 
@@ -1574,6 +1796,10 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
             console.error("Error stopping native microphone test (guard=false):", error);
         });
         setMicLevel(0);
+        // Reset the system meter on the same guard-false path as the mic one, or a
+        // stale level/error from a previous test survives a tab switch.
+        setSystemAudioLevel(0);
+        setSystemAudioError(null);
     }, [isOpen, activeTab, selectedInput]);
 
     return (
@@ -1862,6 +2088,53 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                             window.electronAPI?.setAmbientChatEnabled?.(newState);
                                                         }}
                                                         className={ambientChatEnabled ? 'bg-accent-primary border border-transparent' : 'bg-bg-toggle-switch border border-border-muted'}
+                                                    />
+                                                </div>
+
+                                                {/* Auto Answer */}
+                                                <div className="flex items-center justify-between px-4 py-3">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle text-text-primary flex items-center justify-center shrink-0">
+                                                            <AutoAnswerIcon size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <div className="flex items-center gap-2">
+                                                                <h3 className="text-sm font-bold text-text-primary">{t('Auto Answer')}</h3>
+                                                                {/* Solid yellow, Apple style — no border, no tint. The colours
+                                                                    are tokens because systemYellow differs per appearance. */}
+                                                                <span
+                                                                    className="text-[10px] font-semibold uppercase tracking-wide leading-none px-1.5 py-0.5 rounded-full shrink-0"
+                                                                    style={{
+                                                                        color: 'var(--badge-beta-fg)',
+                                                                        backgroundColor: 'var(--badge-beta-bg)',
+                                                                    }}
+                                                                >
+                                                                    {t('Beta')}
+                                                                </span>
+                                                            </div>
+                                                            <p className="text-xs text-text-secondary mt-0.5">{t('Answers appear as soon as the interviewer finishes a question')}</p>
+                                                        </div>
+                                                    </div>
+                                                    <SettingsToggle
+                                                        checked={autoAnswerEnabled}
+                                                        label={t('Auto Answer')}
+                                                        onChange={async () => {
+                                                            const previous = autoAnswerEnabled;
+                                                            const newState = !previous;
+                                                            setAutoAnswerEnabled(newState); // Optimistic update
+                                                            try {
+                                                                const result = await window.electronAPI?.setAutoAnswerEnabled?.(newState);
+                                                                if (result && !result.success) {
+                                                                    // Rollback on explicit failure (settings store degraded)
+                                                                    setAutoAnswerEnabled(previous);
+                                                                    console.error('[Settings] Failed to set Auto Answer:', result.error);
+                                                                }
+                                                            } catch (err) {
+                                                                setAutoAnswerEnabled(previous);
+                                                                console.error('[Settings] Exception setting Auto Answer:', err);
+                                                            }
+                                                        }}
+                                                        className={autoAnswerEnabled ? 'bg-accent-primary border border-transparent' : 'bg-bg-toggle-switch border border-border-muted'}
                                                     />
                                                 </div>
 
@@ -2640,6 +2913,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                             ...(hasNativelyKey ? [{ id: 'natively', label: 'Natively API', badge: 'Saved' as const, desc: t('Managed transcription via Natively backend'), color: 'blue', icon: <BrandMark provider="natively" />, neutralTile: true }] : []),
                                                             { id: 'google', label: 'Google Cloud', badge: googleServiceAccountPath ? 'Saved' : null, desc: t('gRPC streaming via Service Account'), color: 'blue', icon: <BrandMark provider="google" />, neutralTile: true },
                                                             { id: 'groq', label: 'Groq Whisper', badge: hasStoredSttGroqKey ? 'Saved' : null, desc: t('Ultra-fast REST transcription'), color: 'orange', icon: <BrandMark provider="groq" />, neutralTile: true },
+                                                            { id: 'nvidia_nim', label: 'Nvidia Nim', badge: hasStoredNvidiaNimKey ? 'Saved' : null, desc: t('Low-latency Nemotron / Parakeet streaming ASR'), color: 'green', icon: <BrandMark provider="nvidia_nim" />, neutralTile: true },
                                                             { id: 'openai', label: 'OpenAI Whisper', badge: hasStoredSttOpenaiKey ? 'Saved' : null, desc: t('OpenAI-compatible Whisper API'), color: 'green', icon: <BrandMark provider="openai" />, neutralTile: true },
                                                             { id: 'deepgram', label: 'Deepgram Nova-3', badge: hasStoredDeepgramKey ? 'Saved' : null, desc: t('High-accuracy REST transcription'), color: 'purple', icon: <BrandMark provider="deepgram" />, neutralTile: true },
                                                             { id: 'elevenlabs', label: 'ElevenLabs Scribe', badge: hasStoredElevenLabsKey ? 'Saved' : null, desc: t('Scribe v2 Realtime API'), color: 'teal', icon: <BrandMark provider="elevenlabs" />, neutralTile: true },
@@ -2698,6 +2972,62 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 </div>
                                             )}
 
+                                            {sttProvider === 'nvidia_nim' && hasStoredNvidiaNimKey && (
+                                                <div className="bg-bg-card rounded-xl border border-border-subtle p-4">
+                                                    <label id="nvidia-nim-stt-model-label" className="text-xs font-medium text-text-secondary mb-2.5 block">{t('Nvidia Nim Speech Model')}</label>
+                                                    {/* One column, not a 2-col grid: there are THREE models, so a
+                                                        two-up grid leaves a lone orphan on the second row, and the
+                                                        descriptions ("Multilingual streaming ASR (40 locales,
+                                                        auto-detect)") wrap at half width. Mutually exclusive choice,
+                                                        so radiogroup semantics with a roving tabindex — previously
+                                                        three unrelated <button>s whose selected state was carried by
+                                                        colour alone and was invisible to a screen reader. */}
+                                                    <div role="radiogroup" aria-labelledby="nvidia-nim-stt-model-label"
+                                                        /* Nine models run ~420px; cap it so the picker cannot
+                                                           dominate the Audio tab. Arrow-key navigation scrolls the
+                                                           focused row into view for free. */
+                                                        className="flex flex-col gap-1.5 max-h-64 overflow-y-auto custom-scrollbar pr-0.5">
+                                                        {NVIDIA_NIM_STT_MODELS.map((m, i) => {
+                                                            const selected = nvidiaNimSttModel === m.id;
+                                                            return (
+                                                                <button
+                                                                    key={m.id}
+                                                                    type="button"
+                                                                    role="radio"
+                                                                    aria-checked={selected}
+                                                                    tabIndex={selected ? 0 : -1}
+                                                                    onClick={() => void selectNvidiaNimSttModel(m.id)}
+                                                                    onKeyDown={(e) => nvidiaNimSttModelKeyDown(e, i)}
+                                                                    className={`block w-full rounded-lg px-3 py-2.5 text-left text-text-primary
+                                                                        transition-[background-color,box-shadow,transform] duration-150 ease-[cubic-bezier(0.23,1,0.32,1)]
+                                                                        motion-safe:active:scale-[0.99] ${selected
+                                                                            ? 'bg-[color-mix(in_srgb,var(--accent-primary)_12%,var(--bg-input))] shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--accent-primary)_45%,transparent)]'
+                                                                            : 'bg-bg-input hover:bg-bg-elevated'}`}
+                                                                >
+                                                                    {/* Selected is a TINT plus a hairline accent ring, not
+                                                                        a solid accent slab: three full-width rows filled
+                                                                        with periwinkle overpowered a settings card, and
+                                                                        the label had to flip to --on-accent to stay
+                                                                        readable, which made the selected row the loudest
+                                                                        thing on the panel.
+                                                                        No check mark is needed even so: the ring is a
+                                                                        STRUCTURAL difference (present vs absent), not a
+                                                                        colour one, so the state survives greyscale and
+                                                                        colour-blind viewing — WCAG 1.4.1 without a second
+                                                                        glyph. `aria-checked` carries it to screen readers.
+                                                                        Opacity modifiers are unavailable here: the theme
+                                                                        colours are bare `var(--x)` with no <alpha-value>,
+                                                                        so `bg-accent-primary/12` would emit invalid CSS —
+                                                                        hence the explicit color-mix. */}
+                                                                    <span className="text-sm font-medium block leading-tight">{m.label}</span>
+                                                                    <span className={`text-[11px] leading-snug block mt-0.5 ${selected ? 'text-text-secondary' : 'text-text-tertiary'}`}>{m.description}</span>
+                                                                </button>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                            )}
+
                                             {/* Google Cloud Service Account */}
                                             {sttProvider === 'google' && (
                                                 <div className="bg-bg-card rounded-xl border border-border-subtle p-4">
@@ -2740,7 +3070,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                             {sttProvider !== 'google' && sttProvider !== 'local-whisper' && sttProvider !== 'natively' && sttProvider !== 'none' && (
                                                 <div className="bg-bg-card rounded-xl border border-border-subtle p-4 space-y-3">
                                                     <label className="text-xs font-medium text-text-secondary block">
-                                                        {sttProvider === 'groq' ? 'Groq' : sttProvider === 'openai' ? 'OpenAI STT' : sttProvider === 'elevenlabs' ? 'ElevenLabs' : sttProvider === 'azure' ? 'Azure' : sttProvider === 'ibmwatson' ? 'IBM Watson' : sttProvider === 'soniox' ? 'Soniox' : 'Deepgram'} API Key
+                                                        {sttProvider === 'nvidia_nim' ? 'Nvidia Nim' : sttProvider === 'groq' ? 'Groq' : sttProvider === 'openai' ? 'OpenAI STT' : sttProvider === 'elevenlabs' ? 'ElevenLabs' : sttProvider === 'azure' ? 'Azure' : sttProvider === 'ibmwatson' ? 'IBM Watson' : sttProvider === 'soniox' ? 'Soniox' : 'Deepgram'} API Key
                                                     </label>
                                                     {sttProvider === 'openai' && (
                                                         <p className="text-[10px] text-text-tertiary mb-1.5">
@@ -2751,7 +3081,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         <input
                                                             type="password"
                                                             value={
-                                                                sttProvider === 'groq' ? sttGroqKey
+                                                            sttProvider === 'nvidia_nim' ? sttNvidiaNimKey
+                                                                    : sttProvider === 'groq' ? sttGroqKey
                                                                     : sttProvider === 'openai' ? sttOpenaiKey
                                                                         : sttProvider === 'elevenlabs' ? sttElevenLabsKey
                                                                             : sttProvider === 'azure' ? sttAzureKey
@@ -2760,7 +3091,8 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                                         : sttDeepgramKey
                                                             }
                                                             onChange={(e) => {
-                                                                if (sttProvider === 'groq') setSttGroqKey(e.target.value);
+                                                                if (sttProvider === 'nvidia_nim') setSttNvidiaNimKey(e.target.value);
+                                                                else if (sttProvider === 'groq') setSttGroqKey(e.target.value);
                                                                 else if (sttProvider === 'openai') setSttOpenaiKey(e.target.value);
                                                                 else if (sttProvider === 'elevenlabs') setSttElevenLabsKey(e.target.value);
                                                                 else if (sttProvider === 'azure') setSttAzureKey(e.target.value);
@@ -2769,7 +3101,9 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                 else setSttDeepgramKey(e.target.value);
                                                             }}
                                                             placeholder={
-                                                                sttProvider === 'groq'
+                                                                sttProvider === 'nvidia_nim'
+                                                                    ? (hasStoredNvidiaNimKey ? '••••••••••••' : t('Enter Nvidia Nim API key'))
+                                                                    : sttProvider === 'groq'
                                                                     ? (hasStoredSttGroqKey ? '••••••••••••' : t('Enter Groq API key'))
                                                                     : sttProvider === 'openai'
                                                                         ? (hasStoredSttOpenaiKey ? '••••••••••••' : t('Enter OpenAI STT API key'))
@@ -2788,7 +3122,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         <button
                                                             onClick={() => {
                                                                 const keyMap: Record<string, string> = {
-                                                                    groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
+                                                                    nvidia_nim: sttNvidiaNimKey, groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
                                                                     elevenlabs: sttElevenLabsKey, azure: sttAzureKey, ibmwatson: sttIbmKey,
                                                                     soniox: sttSonioxKey,
                                                                 };
@@ -2796,7 +3130,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                             }}
                                                             disabled={sttSaving || !(() => {
                                                                 const keyMap: Record<string, string> = {
-                                                                    groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
+                                                                    nvidia_nim: sttNvidiaNimKey, groq: sttGroqKey, openai: sttOpenaiKey, deepgram: sttDeepgramKey,
                                                                     elevenlabs: sttElevenLabsKey, azure: sttAzureKey, ibmwatson: sttIbmKey,
                                                                     soniox: sttSonioxKey,
                                                                 };
@@ -2904,26 +3238,16 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                                 <>{t('Test Connection')}</>
                                                             )}
                                                         </button>
-                                                        <button
-                                                            onClick={() => {
-                                                                const urls: Record<string, string> = {
-                                                                    groq: 'https://console.groq.com/keys',
-                                                                    openai: 'https://platform.openai.com/api-keys',
-                                                                    deepgram: 'https://console.deepgram.com',
-                                                                    elevenlabs: 'https://elevenlabs.io/app/settings/api-keys',
-                                                                    azure: 'https://portal.azure.com/#create/Microsoft.CognitiveServicesSpeech',
-                                                                    ibmwatson: 'https://cloud.ibm.com/catalog/services/speech-to-text'
-                                                                };
-                                                                if (urls[sttProvider]) {
-                                                                    // @ts-ignore
-                                                                    window.electronAPI?.openExternal(urls[sttProvider]);
-                                                                }
-                                                            }}
-                                                            className="text-xs text-text-tertiary hover:text-text-primary flex items-center gap-1 transition-colors ml-1"
-                                                            title={t("Get API Key")}
-                                                        >
-                                                            <ExternalLink size={12} />
-                                                        </button>
+                                                        {STT_KEY_URLS[sttProvider] && (
+                                                            <button
+                                                                // @ts-ignore
+                                                                onClick={() => window.electronAPI?.openExternal(STT_KEY_URLS[sttProvider])}
+                                                                className="text-xs text-text-tertiary hover:text-text-primary flex items-center gap-1 transition-colors ml-1"
+                                                                title={t("Get API Key")}
+                                                            >
+                                                                <ExternalLink size={12} />
+                                                            </button>
+                                                        )}
                                                         {sttTestStatus === 'error' && (
                                                             <span className="text-xs text-red-400">{sttTestError}</span>
                                                         )}
@@ -2933,14 +3257,16 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
 
                                             {/* Local Whisper Model Panel */}
                                             {sttProvider === 'local-whisper' && (
-                                                <LocalWhisperModelPanel />
+                                                <LocalWhisperModelPanel onModelConfigChanged={setLocalWhisperConfig} />
                                             )}
 
-                                            {/* Recognition Language Family */}
+                                            {/* Recognition Language Family — options restricted to what the
+                                                active local model accepts (per its official docs); greyed out
+                                                entirely when the model is English-only and language cannot change. */}
                                             <CustomSelect
                                                 label={t("Language")}
                                                 icon={<Globe size={14} />}
-                                                value={selectedSttGroup}
+                                                value={displayedSttGroup}
                                                 options={languageGroups.map(g => ({
                                                     deviceId: g,
                                                     label: g,
@@ -2950,19 +3276,64 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                 }))}
                                                 onChange={handleGroupChange}
                                                 placeholder={t("Select Language")}
+                                                disabled={languageLocked}
                                             />
 
-                                            {/* Variant/Accent Selector (Conditional) */}
+                                            {/* Variant/Accent Selector (Conditional) — greyed out when the
+                                                active local model's language conditioning is region-neutral
+                                                (Whisper-family) or fixed (English-only checkpoints). Only
+                                                Nemotron consumes regional variants. */}
                                             {currentGroupVariants.length > 1 && (
                                                 <div className="mt-3 animated fadeIn">
                                                     <CustomSelect
                                                         label={t("Accent / Region")}
                                                         icon={<MapPin size={14} />}
-                                                        value={recognitionLanguage}
+                                                        value={displayedRecognitionLanguage}
                                                         options={currentGroupVariants}
                                                         onChange={handleLanguageChange}
                                                         placeholder={t("Select Region")}
+                                                        disabled={!!localLanguageCapability && !localLanguageCapability.accentSelectable}
                                                     />
+                                                </div>
+                                            )}
+
+                                            {/* Local model capability notes */}
+                                            {localLanguageCapability && languageLocked && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        {(localLanguageCapability.englishOnlyNames.length > 0
+                                                            ? localLanguageCapability.englishOnlyNames.join(', ')
+                                                            : t('The selected local model'))}
+                                                        {' '}{localLanguageCapability.accentSelectable
+                                                            ? t('supports English only — language is fixed for this model.')
+                                                            : t('supports English only — language and accent are fixed for this model.')}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {localLanguageCapability && !languageLocked && storedLanguageUnsupported && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <AlertCircle size={14} className="text-amber-400 shrink-0" />
+                                                    <p className="text-xs text-amber-200/90">
+                                                        {`"${availableLanguages[recognitionLanguage]?.label ?? recognitionLanguage}" ${t("isn't supported by the selected local model — pick one of the listed languages.")}`}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {localLanguageCapability && !languageLocked && autoDetectUnavailable && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        {t("This model has no auto-detect mode — English is transcribed unless you pick a language.")}
+                                                    </p>
+                                                </div>
+                                            )}
+                                            {localLanguageCapability && !languageLocked && !storedLanguageUnsupported && !autoDetectUnavailable
+                                                && !localLanguageCapability.accentSelectable && currentGroupVariants.length > 1 && (
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        {t("This model doesn't distinguish accents or regions — only the language itself applies.")}
+                                                    </p>
                                                 </div>
                                             )}
 
@@ -3052,6 +3423,29 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({
                                                         style={{ width: `${micLevel}%` }}
                                                     />
                                                 </div>
+                                            </div>
+
+                                            {/* System-audio meter, parallel to the mic meter above. Both run off
+                                                the same audio test; this one answers "will the app hear the person
+                                                I am talking to", which the mic meter cannot. */}
+                                            <div>
+                                                <div className="flex justify-between text-xs text-text-secondary mb-2 px-1">
+                                                    <span>{t('System Audio Level')}</span>
+                                                    {systemAudioError && (
+                                                        <span className="text-red-500" title={systemAudioError}>
+                                                            {t('Unavailable')}
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                <div className="h-1.5 bg-bg-input rounded-full overflow-hidden">
+                                                    <div
+                                                        className="h-full bg-green-500 transition-all duration-100 ease-out"
+                                                        style={{ width: `${systemAudioLevel}%` }}
+                                                    />
+                                                </div>
+                                                {systemAudioError && (
+                                                    <p className="text-xs text-red-500 mt-1 px-1">{systemAudioError}</p>
+                                                )}
                                             </div>
 
                                             <div className="h-px bg-border-subtle my-2" />

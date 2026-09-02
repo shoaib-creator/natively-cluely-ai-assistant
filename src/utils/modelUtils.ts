@@ -3,12 +3,12 @@ export const STANDARD_CLOUD_MODELS: Record<string, {
     ids: string[];
     names: string[];
     descs: string[];
-    pmKey: 'geminiPreferredModel' | 'openaiPreferredModel' | 'claudePreferredModel' | 'groqPreferredModel' | 'deepseekPreferredModel';
+    pmKey: 'geminiPreferredModel' | 'openaiPreferredModel' | 'claudePreferredModel' | 'groqPreferredModel' | 'deepseekPreferredModel' | 'nvidia_nimPreferredModel';
 }> = {
     gemini: {
         hasKeyCheck: (creds) => !!creds?.hasGeminiKey,
-        ids: ['gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
-        names: ['Gemini 3.6 Flash', 'Gemini 3.1 Flash Lite', 'Gemini 3.1 Pro'],
+        ids: ['gemini-3.7-flash', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'],
+        names: ['Gemini 3.7 Flash', 'Gemini 3.1 Flash Lite', 'Gemini 3.1 Pro'],
         descs: ['Fastest • Multimodal', 'Reasoning • High Quality'],
         pmKey: 'geminiPreferredModel'
     },
@@ -28,9 +28,14 @@ export const STANDARD_CLOUD_MODELS: Record<string, {
     },
     groq: {
         hasKeyCheck: (creds) => !!creds?.hasGroqKey,
-        ids: ['llama-3.3-70b-versatile'],
-        names: ['Groq Llama 3.3'],
-        descs: ['Ultra Fast'],
+        // Groq retired every Llama id it hosted (llama-3.3-70b-versatile on
+        // 2026-08-16, llama-4-scout on 2026-07-17). qwen3.6-27b leads because it
+        // is the only Groq model that still accepts images, so it covers both the
+        // text and the screenshot paths; the GPT-OSS pair is here so a user who
+        // wants a text-only production-tier model can switch the default.
+        ids: ['qwen/qwen3.6-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+        names: ['Groq Qwen 3.6', 'Groq GPT-OSS 120B', 'Groq GPT-OSS 20B'],
+        descs: ['Ultra Fast • Multimodal', 'Highest Quality • Text-only', 'Fastest • Text-only'],
         pmKey: 'groqPreferredModel'
     },
     deepseek: {
@@ -39,6 +44,30 @@ export const STANDARD_CLOUD_MODELS: Record<string, {
         names: ['DeepSeek V4 Flash', 'DeepSeek V4 Pro'],
         descs: ['Fast • Text-only', 'Reasoning • Text-only'],
         pmKey: 'deepseekPreferredModel'
+    },
+    nvidia_nim: {
+        hasKeyCheck: (creds) => !!creds?.hasNvidiaNimKey,
+        // NVIDIA retired BOTH ids this list used to offer — z-ai/glm4.7 on
+        // 2026-05-14 and meta/llama-3.1-8b-instruct in the 2026-08-26 batch EOL
+        // that also took every meta/* chat id — so the picker was offering two
+        // models that answer 410 Gone to any request. The retired set itself
+        // lives in electron/llm/nvidiaNimModels.ts.
+        //
+        // These presets are BEST-EFFORT, and cannot be more than that: NVIDIA's
+        // catalogue lists ids that /chat/completions refuses, `GET /v1/models`
+        // answers 200 to an invalid key, and there is no public signal for which
+        // ids a given account may actually call. "Refresh" on the provider card
+        // reads the account's own catalogue and is the authoritative list; a
+        // preset that turns out to be unservable is handled at runtime, where a
+        // 404/410 classifies as model_gone.
+        ids: [
+            'nvidia_nim/nvidia/llama-3.1-nemotron-70b-instruct',
+            'nvidia_nim/nvidia/nemotron-3-super-120b-a12b',
+            'nvidia_nim/openai/gpt-oss-20b',
+        ],
+        names: ['Llama 3.1 Nemotron 70B (Nvidia Nim)', 'Nemotron 3 Super (Nvidia Nim)', 'GPT-OSS 20B (Nvidia Nim)'],
+        descs: ['Llama • Nvidia hosted', 'Reasoning • Nvidia hosted', 'Open weights • Nvidia hosted'],
+        pmKey: 'nvidia_nimPreferredModel'
     },
 };
 

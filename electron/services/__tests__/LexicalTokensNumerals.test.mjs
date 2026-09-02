@@ -13,12 +13,17 @@
 // functional drift would have silently mis-fused FTS and vector scores.
 
 import { test, describe } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 
-const { wordsOf, numeralTokens } = await import(
-  path.resolve(process.cwd(), 'dist-electron/electron/services/modes/lexicalTokens.js')
-);
+// WINDOWS (2026-08-29): `await import()` needs a file:// URL, not a bare
+// absolute path. On POSIX `import('/Users/…')` happens to resolve; on Windows
+// `import('C:\\…')` throws ERR_UNSUPPORTED_ESM_URL_SCHEME, and because these
+// imports run at MODULE LOAD the whole file fails before a single test runs —
+// which is why this file showed up as one opaque file-level ✖ in the Windows
+// leg rather than as a failing assertion. `pathToFileURL` is the fix.
+const { wordsOf, numeralTokens } = await import(pathToFileURL(path.resolve(process.cwd(), 'dist-electron/electron/services/modes/lexicalTokens.js')).href);
 
 describe('numeral equivalence', () => {
   const has = (text, tok) => wordsOf(text).includes(tok);
@@ -67,7 +72,23 @@ describe('numeral equivalence', () => {
     assert.deepEqual(wordsOf("Green's function"), ['green', 'function']);
     assert.deepEqual(wordsOf("don't"), ['dont']);
     assert.deepEqual(wordsOf('a an the of'), ['the'], 'tokens of 1-2 chars are dropped');
-    assert.deepEqual(wordsOf('Mixed-Case Hyphen-Word'), ['mixed-case', 'hyphen-word']);
+    // Hyphenated words now emit the compound AND its parts. That is the deep-test
+    // D2 fix: the keep-set preserves hyphens, so `TECH-SMALL-CANARY-524` was ONE
+    // opaque token and "what is the small technical canary?" shared zero tokens
+    // with the line answering it — fts exactly 0.0000, unrecoverable by any
+    // threshold. Underscored identifiers never had the problem because `_` splits.
+    //
+    // Asserted as a PROPERTY rather than a literal array: the compound must
+    // survive (so retrieval by the full identifier keeps working — the parts are
+    // additive, never replacements) and each part must also be present. A literal
+    // list would break again the next time the tokenizer gains a form.
+    const hyphenTokens = wordsOf('Mixed-Case Hyphen-Word');
+    for (const expected of ['mixed-case', 'hyphen-word']) {
+      assert.ok(hyphenTokens.includes(expected), `compound token ${expected} must survive`);
+    }
+    for (const part of ['mixed', 'case', 'hyphen', 'word']) {
+      assert.ok(hyphenTokens.includes(part), `hyphen sub-token ${part} must be emitted`);
+    }
   });
 
   test('a bare year is not mangled', () => {

@@ -28,31 +28,57 @@ const REQUIRED_MARKDOWN_HEADINGS = CODING_SECTIONS.map(section => `## ${section}
 const sectionHeader = (label: string): RegExp =>
   new RegExp(`^\\s*#{0,3}\\s*(?:\\*\\*)?\\s*(?:${label})\\s*(?:\\*\\*)?\\s*(?::|[-–—])?\\s*$`, 'im');
 
-const SECTION_ALIASES: Record<string, RegExp[]> = {
-  Approach: [sectionHeader('Approach')],
-  'Technique / Data Structure / Algorithm Used': [
-    sectionHeader('Technique|Data Structure|Algorithm Used|Technique \\/ Data Structure \\/ Algorithm Used'),
-  ],
-  Code: [sectionHeader('Code')],
-  'Dry Run': [sectionHeader('Dry Run')],
-  Complexity: [sectionHeader('Complexity')],
-  'Interviewer Follow-up Points': [
-    sectionHeader('Interviewer Follow-up Points|Follow-up Points|Follow-ups'),
-  ],
+// The SAME label alternations as `sectionHeader`, but requiring a real markdown
+// heading (`#`..`###`) and refusing the bold form. Kept beside the aliases so
+// the two cannot drift apart.
+const markdownSectionHeader = (label: string): RegExp =>
+  new RegExp(`^\\s*#{1,3}\\s+(?:${label})\\s*(?::|[-–—])?\\s*$`, 'im');
+
+const SECTION_LABELS: Record<string, string> = {
+  Approach: 'Approach',
+  'Technique / Data Structure / Algorithm Used':
+    'Technique|Data Structure|Algorithm Used|Technique \\/ Data Structure \\/ Algorithm Used',
+  Code: 'Code',
+  'Dry Run': 'Dry Run',
+  Complexity: 'Complexity',
+  'Interviewer Follow-up Points': 'Interviewer Follow-up Points|Follow-up Points|Follow-ups',
 };
+
+const SECTION_ALIASES: Record<string, RegExp[]> = Object.fromEntries(
+  Object.entries(SECTION_LABELS).map(([section, label]) => [section, [sectionHeader(label)]]),
+);
+
+const SECTION_MARKDOWN_HEADERS: Record<string, RegExp[]> = Object.fromEntries(
+  Object.entries(SECTION_LABELS).map(([section, label]) => [section, [markdownSectionHeader(label)]]),
+);
 
 const hasSection = (answer: string, section: string): boolean =>
   SECTION_ALIASES[section]?.some(pattern => pattern.test(answer)) ?? false;
 
-// `sectionHeader` accepts zero hashes on purpose, so `hasSection` recognizes a
-// model's own `**Approach**` as the Approach section for completeness checks.
-// That makes it useless for asking "did the model use OUR heading style?" —
-// which is a different question with a different consumer (the non-destructive
-// exemption). This is the markdown-heading-only test.
-const CANONICAL_HEADING_RE = /^[ \t]*#{1,3}[ \t]+\S/m;
-const stripFencedCode = (answer: string): string => answer.replace(/```[\s\S]*?```/g, ' ');
-const usesCanonicalMarkdownHeadings = (answer: string): boolean =>
-  CANONICAL_HEADING_RE.test(stripFencedCode(answer));
+// Strips CLOSED fences, then any UNTERMINATED trailing fence.
+//
+// Code-review 2026-08-13: the non-greedy `[\s\S]*?` needs a closing ``` to
+// match, so an answer cut off inside its code block kept the whole block. That
+// is not an edge case on this branch — MAX_STREAM_OUTPUT_CHARS (client) and
+// AI_STREAM_MAX_OUTPUT_TOKENS (server) both cut mid-token, and a coding answer
+// is usually inside a fence at that point. Every caller here treats the result
+// as PROSE (complexity extraction, canonical-heading detection), so leaking
+// code into it published a Big-O from a discarded approach — "# brute force is
+// O(n^2), too slow" — as the shipped answer's official Complexity section.
+const stripFencedCode = (answer: string): string =>
+  answer.replace(/```[\s\S]*?```/g, ' ').replace(/```[\s\S]*$/, ' ');
+// "Did the model start OUR canonical scaffold?" — a canonical section LABEL
+// written as a real markdown heading. Both halves must hold on the SAME
+// heading, which is what the previous two-term conjunction (any canonical label
+// anywhere, in any style) AND (any `##` heading anywhere) could not express:
+// a model writing `## Solution` in its own words plus a bold `**Complexity**`
+// satisfied both terms separately and was fed back into the lossy repair.
+const usesCanonicalSectionHeadings = (answer: string): boolean => {
+  const prose = stripFencedCode(answer);
+  return CODING_SECTIONS.some(section =>
+    SECTION_MARKDOWN_HEADERS[section]?.some(pattern => pattern.test(prose)) ?? false,
+  );
+};
 
 const hasCodeBlock = (answer: string): boolean => /```[a-zA-Z0-9+#-]*\n[\s\S]+?```/.test(answer);
 const hasLanguageTaggedCodeBlock = (answer: string): boolean => /```[a-zA-Z0-9+#-]+\n[\s\S]+?```/.test(answer);
@@ -516,10 +542,16 @@ export const validateCodingMarkdown = (response: string): AnswerValidationResult
   // bold-heading answers back into the lossy repair, re-opening the 2026-08-10
   // regression this exemption exists to close. Both halves are required: the
   // answer must carry a real `##` markdown heading AND at least one heading we
-  // recognize as canonical. A model using `## Solution` (its own words, our
-  // syntax) recognizes as neither and stays exempt when complete.
-  const usesCanonicalHeadings = missingSections.length < CODING_SECTIONS.length
-    && usesCanonicalMarkdownHeadings(answer);
+  // recognize as canonical.
+  //
+  // Code-review 2026-08-13: expressing that as two INDEPENDENT terms still
+  // failed, because they could be satisfied by two DIFFERENT lines. Verified:
+  // `## Solution` + `**Complexity**` on its own line makes term 1 true (via the
+  // bold form) and term 2 true (via `## Solution`), so a complete, correctly
+  // formatted answer was sent to `repairCodingMarkdown`, which keeps only the
+  // FIRST fenced block and dropped the user's second code block. Both halves
+  // must hold on the SAME heading — that is `usesCanonicalSectionHeadings`.
+  const usesCanonicalHeadings = usesCanonicalSectionHeadings(answer);
   const substantivelyComplete = codeBlock
     && hasTaggedBlock
     && statesComplexity
@@ -706,6 +738,45 @@ export const hasUnrecoveredScaffoldContamination = (answerType: AnswerType, answ
   return detectAndExtractScaffoldMisfire(answerType, text) === null;
 };
 
+// ── RC-3 (live session C, 2026-08-21) ──────────────────────────────────────
+// Answer types whose legitimate content overlaps the LOOSE scaffold
+// fingerprint (Big-O / complexity notation is their actual subject), so the
+// regeneration repair may only fire on the STRICT signal below. Mirrors the
+// engine's TECHNICAL_ANSWER_TYPES_EXCLUDED_FROM_SCAFFOLD_EXTRACTION — which
+// used to exclude them from repair ENTIRELY, shipping "what's a semaphore?"
+// as a six-section DSA template with three literal "Not applicable,
+// conceptual question." sections while the detector was returning true.
+const STRICT_SCAFFOLD_SIGNAL_TYPES = new Set<AnswerType>([
+  'technical_concept_answer', 'system_design_answer', 'debugging_question_answer',
+]);
+
+/**
+ * STRICT scaffold signal: the coding contract's own unique headings
+ * ("## Dry Run", "## Technique / Data Structure / Algorithm Used") plus the
+ * ≥2-recognized-headings structure. Unlike the loose fingerprint, complexity
+ * notation alone can never trip this — a legitimate technical answer about
+ * Big-O discusses complexity but does not emit the contract's template
+ * headings.
+ */
+export const hasStrictCodingScaffoldSignal = (answer: string): boolean => {
+  const text = String(answer || '');
+  if (!text.trim()) return false;
+  const headingMatches = [...text.matchAll(new RegExp(SCAFFOLD_MISFIRE_HEADING_RE.source, 'gim'))];
+  return headingMatches.length >= 2 && CODING_SCAFFOLD_UNIQUE_HEADING_RE.test(text);
+};
+
+/**
+ * Single policy point for the engine's scaffold-regeneration repair: should a
+ * completed non-coding answer of this type be regenerated for scaffold
+ * contamination? Technical types require the strict signal; everything else
+ * keeps the historical loose eligibility.
+ */
+export const isScaffoldRegenerationEligible = (answerType: AnswerType, answer: string): boolean => {
+  if (!hasUnrecoveredScaffoldContamination(answerType, answer)) return false;
+  if (STRICT_SCAFFOLD_SIGNAL_TYPES.has(answerType)) return hasStrictCodingScaffoldSignal(answer);
+  return true;
+};
+
 export const validateAnswerStructure = (
   answerType: AnswerType,
   answer: string,
@@ -754,7 +825,27 @@ const validateImplAnswer = (answer: string): AnswerValidationResult => {
     return { ok: false, missingSections: ['Code'], hasCodeBlock: false, hasComplexity: false };
   }
 
-  const isJsx = /\bimport\s+React\b|\buseState\s*\(|\buseEffect\s*\(|\buseRef\s*\(|\bclassName\s*=|<[A-Z][a-zA-Z]*[\s/>]/.test(codeBlock.code);
+  // JSX detection must not fire on GENERICS. `<[A-Z][a-zA-Z]*[\s/>]` matches
+  // `Stack<Character>`, `Map<Integer, Integer>`, `vector<int>` and `List<String>`,
+  // so a correct Java or C++ answer had its fence rewritten to ```tsx by the
+  // repair below (live benchmark 2026-08-18: Java isBalanced returned tagged
+  // ```tsx). A statically-typed non-JS language is excluded outright, and the
+  // bare-tag heuristic now requires a tag that actually opens or closes an
+  // element rather than any `<Word`.
+  const looksStaticallyTypedNonJs =
+    /\bimport\s+java\.|\bpublic\s+(?:static\s+)?(?:class|int|void|boolean|String)\b|#include\s*<|\bstd::|\busing\s+namespace\b|\bfunc\s+\w+\s*\(|\bfn\s+\w+\s*\(|\bpackage\s+main\b/.test(codeBlock.code);
+  const isJsx = !looksStaticallyTypedNonJs && (
+    /\bimport\s+React\b|\buseState\s*\(|\buseEffect\s*\(|\buseRef\s*\(|\bclassName\s*=/.test(codeBlock.code)
+    // A real element: `<Foo />`, `<Foo attr={x} />`, or a closing `</Foo>`.
+    // Attributes are allowed between the name and `/>` (code review
+    // 2026-08-19): requiring `/>` to follow the name immediately missed every
+    // component that takes props — `<Clock time={now} />`, `<Button onClick={fn} />`
+    // — so an attribute-bearing JSX answer mis-fenced as ```python kept the
+    // wrong fence, which is the exact bug this repair exists for. The inner
+    // `[^<>]*` cannot span a tag boundary, so Java/C++ generics
+    // (`Stack<Character>`, `Map<Integer, Integer>`) stay excluded.
+    || /<[A-Z][A-Za-z0-9]*(?:\s[^<>]*?)?\s*\/>|<\/[A-Z][A-Za-z0-9]*>/.test(codeBlock.code)
+  );
   // Note: codeBlock.language defaults to 'python' when the fence had no tag
   // (see extractFirstCodeBlock). Treat empty/undefined as "no tag" so an
   // untagged JSX fence still triggers repair — empty-tag is as wrong as

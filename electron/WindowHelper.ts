@@ -269,14 +269,27 @@ export class WindowHelper {
   }
 
   private applyContentProtection(enable: boolean): void {
-    const windows = [
-      this.launcherWindow,
-      this.overlayWindow,
-      this.pillWindow,
-      this.toggleWindow,
-      this.popoverCatcher,
-    ];
-    windows.forEach((win) => {
+    // The meeting overlay chrome (overlay body + pill + toggle) is a ghost
+    // surface: it must NEVER appear in a screen capture, independent of
+    // undetectable/dock mode. "Undetectable mode" governs Dock/taskbar
+    // masquerading and the launcher's capture visibility — NOT the overlay's
+    // screen-share invisibility, which is the app's core promise and is always
+    // wanted while a meeting overlay is up. Coupling the two let the overlay
+    // leak into a shared screen whenever undetectable mode was off (its
+    // default), re-exposing it via `NSWindowSharingReadOnly` and overriding the
+    // unconditional `NSWindowSharingNone` the native stealth module applies to
+    // exactly these three windows. Force it on for them regardless of `enable`.
+    const overlayChrome = [this.overlayWindow, this.pillWindow, this.toggleWindow];
+    overlayChrome.forEach((win) => {
+      if (win && !win.isDestroyed()) {
+        win.setContentProtection(true);
+      }
+    });
+    // The launcher and popover catcher are not meeting chrome; they follow the
+    // undetectable-mode toggle (the launcher is the main window shown outside a
+    // meeting, and the native module deliberately does NOT force-hide it).
+    const undetectableFollowers = [this.launcherWindow, this.popoverCatcher];
+    undetectableFollowers.forEach((win) => {
       if (win && !win.isDestroyed()) {
         win.setContentProtection(enable);
       }
@@ -403,8 +416,21 @@ export class WindowHelper {
   // EDGE CASE: if the grown window would overflow the work area's right edge,
   // the X clamp below shifts the window left — that one case can show a
   // one-frame shift, same as any clamped move always could.
-  public setOverlayDimensionsAnchored(width: number, height: number): void {
-    if (!this.overlayWindow || this.overlayWindow.isDestroyed()) return;
+  //
+  // RETURNS the size actually APPLIED after clamping. The renderer needs this:
+  // it mirrors the same floor(workArea * 0.9) clamp locally, but the display it
+  // measures (window.screen.availWidth) and the one this method measures
+  // (the work area of the display the window sits on) can disagree — on a
+  // multi-monitor setup they routinely do. Adopting the echoed value keeps the
+  // renderer's panel width, the toggle anchor and the hover-gate margin locked
+  // to the window that actually exists, instead of the one it asked for.
+  public setOverlayDimensionsAnchored(
+    width: number,
+    height: number,
+  ): { width: number; height: number } {
+    if (!this.overlayWindow || this.overlayWindow.isDestroyed()) {
+      return { width, height };
+    }
 
     const currentBounds = this.overlayWindow.getBounds();
     const currentContentSize = this.overlayWindow.getContentSize();
@@ -443,7 +469,7 @@ export class WindowHelper {
         currentContentSize,
         computed: { x: newX, y: newY, width: newWidth, height: newHeight },
       });
-      return;
+      return { width: currentContentSize[0], height: currentContentSize[1] };
     }
 
     // Atomic frame change: a single setBounds avoids the 1-frame split where
@@ -451,19 +477,25 @@ export class WindowHelper {
     // is what causes the shell to visibly slide and snap during code-expansion.
     this.overlayWindow.setBounds({ x: newX, y: newY, width: newWidth, height: newHeight });
     this.overlayBounds = this.overlayWindow.getBounds();
+    const appliedContentSize = this.overlayWindow.getContentSize();
     traceOverlayResize('setOverlayDimensionsAnchored:applied', {
       requested: { width, height },
       appliedBounds: this.overlayBounds,
-      contentSizeAfter: this.overlayWindow.getContentSize(),
+      contentSizeAfter: appliedContentSize,
     });
+    return { width: appliedContentSize[0], height: appliedContentSize[1] };
   }
 
-  // NOTE: the overlay window is a FIXED WIDTH (OVERLAY_DEFAULT_WIDTH = 732)
-  // for its entire visible lifetime; the renderer always reports that fixed
-  // width, so every report here is height-only (width delta 0) — top-anchored,
-  // X never moves, no width setBounds ever. The expand/contract animation is
-  // CSS-only in the renderer (panel tweens 600↔732 centered inside the fixed
-  // window). See NativelyInterface.startTransition for the renderer side.
+  // NOTE: the overlay window's width is FIXED FOR THE WHOLE LIFETIME OF AN
+  // ANIMATION. It is born at OVERLAY_DEFAULT_WIDTH (732) and only ever changes
+  // when the USER drags a resize handle (or on restore of a previously dragged
+  // size) — never during the expand/contract spring, which stays CSS-only in
+  // the renderer (the panel tweens collapsed↔expanded centered inside the
+  // window). So every report arriving here DURING an animation is still
+  // height-only (width delta 0): top-anchored, X never moves, no width
+  // setBounds. See NativelyInterface.startTransition for the renderer side and
+  // src/lib/overlayCustomSize.mjs for why the invariant is per-animation
+  // rather than per-lifetime.
 
   public createWindow(): void {
     if (this.launcherWindow !== null) return; // Already created
@@ -788,7 +820,12 @@ export class WindowHelper {
       // "still steals focus" reports — the bundle is only read at launch).
       console.log('[WindowHelper] Windows no-activate policy applied to overlay');
     }
-    this.overlayWindow.setContentProtection(this.contentProtection);
+    // Always protected: the overlay is a ghost surface that must never show in a
+    // screen capture, regardless of undetectable/dock mode (see
+    // applyContentProtection). This mirrors the native module's unconditional
+    // NSWindowSharingNone and closes the leak on builds where that native binary
+    // is unavailable (e.g. an Intel prebuild mismatch).
+    this.overlayWindow.setContentProtection(true);
     // Apply the current mouse-interaction policy to the NEW window. Without
     // this, a window (re)created while stealth passthrough is ON would start
     // fully interactive — silently breaking passthrough until the next toggle.
@@ -1166,6 +1203,13 @@ export class WindowHelper {
       }
 
       this.overlayWindow.on('close', (e) => {
+        // During app quit this close comes from Electron's CloseAllWindows
+        // sweep (before-quit has already run the destructive teardown).
+        // Preventing it would CANCEL the quit and leave a windowless,
+        // post-teardown process alive on macOS — so let it proceed.
+        if (this.appState.isQuitting()) {
+          return;
+        }
         if (this.overlayWindow?.isVisible()) {
           e.preventDefault();
           if (this.appState.getIsMeetingActive()) {
@@ -1367,12 +1411,22 @@ export class WindowHelper {
     this.repositionOverlayPopovers();
   }
 
-  // The panel's live LEFT margin inside the fixed window: (732 - panelW)/2,
-  // derived from the streamed togglePanelRight = (732 + panelW)/2. Popover
+  // The panel's live LEFT margin inside the window: (windowW - panelW)/2,
+  // derived from the streamed togglePanelRight = (windowW + panelW)/2. Popover
   // anchors are stored relative to the panel, not the window, so they follow
   // the symmetric width spring.
+  //
+  // Reads the window's LIVE width rather than OVERLAY_DEFAULT_WIDTH: the user
+  // can now resize the overlay, and the renderer streams togglePanelRight
+  // against whatever width the window actually has. Using the constant here
+  // while the renderer used the live width would offset every popover by
+  // (732 - actualWidth) / 2.
   public getOverlayPanelLeftMargin(): number {
-    return Math.max(0, WindowHelper.OVERLAY_DEFAULT_WIDTH - this.togglePanelRight);
+    const windowWidth =
+      this.overlayWindow && !this.overlayWindow.isDestroyed()
+        ? this.overlayWindow.getContentSize()[0]
+        : WindowHelper.OVERLAY_DEFAULT_WIDTH;
+    return Math.max(0, windowWidth - this.togglePanelRight);
   }
 
   // Re-anchor any open overlay popovers (settings / model-selector) to the
@@ -1586,7 +1640,10 @@ export class WindowHelper {
       [this.toggleWindow, 'overlay-toggle'],
     ];
     for (const [win, name] of auxPairs) {
-      win.setContentProtection(this.contentProtection);
+      // Always protected, like the overlay body — the pill/toggle are the
+      // on-screen meeting chrome and must never leak into a shared screen
+      // regardless of undetectable/dock mode (see applyContentProtection).
+      win.setContentProtection(true);
       if (process.platform === 'darwin') {
         win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
         win.setHiddenInMissionControl(true);
@@ -2236,7 +2293,11 @@ export class WindowHelper {
       });
 
       // Restore opacity before showing (it may have been zeroed by hideMainWindow).
-      if (process.platform === 'win32' && this.contentProtection) {
+      // The overlay is ALWAYS content-protected (see applyContentProtection), so on
+      // Windows the opacity shield must run on every overlay show — not only in
+      // undetectable mode — or the first frame leaks before DWM applies the
+      // capture-exclusion flag.
+      if (process.platform === 'win32') {
         // Opacity Shield: Show at 0 opacity first to prevent frame leak.
         // The aux windows (pill/toggle) show via the overlay's 'show' event,
         // so shield them the same way — they carry the same on-screen chrome.
@@ -2266,20 +2327,18 @@ export class WindowHelper {
           }
         }, 60);
       } else {
+        // macOS / Linux path (Windows always takes the shielded branch above).
         // Restore opacity (may have been zeroed pre-screenshot by hideMainWindow)
         this.overlayWindow.setOpacity(1);
         this.pillWindow?.setOpacity(1);
         this.toggleWindow?.setOpacity(1);
-        this.overlayWindow.setContentProtection(this.contentProtection);
-        // Re-assert z-order BEFORE show on Windows — DWM processes setAlwaysOnTop
-        // synchronously, so calling it before show() ensures the window lands at the
-        // correct z-level on first paint. Calling it after focus() would leave a brief
-        // window where the HWND is focused at the wrong z-level (issue #136).
-        // Skipped on macOS — calling setAlwaysOnTop triggers [NSApp activate] which
-        // steals focus from Zoom/browser even when showInactive() was used.
-        if (process.platform === 'win32') {
-          this.overlayWindow.setAlwaysOnTop(true, 'screen-saver');
-        }
+        // Always protected — the overlay must never appear in a screen capture,
+        // regardless of undetectable/dock mode (see applyContentProtection).
+        this.overlayWindow.setContentProtection(true);
+        // No setAlwaysOnTop here: this branch is macOS/Linux only (Windows always
+        // takes the shielded branch above, which re-asserts z-order itself). On
+        // macOS calling setAlwaysOnTop would trigger [NSApp activate] and steal
+        // focus from Zoom/browser even when showInactive() was used.
         if (inactive) this.overlayWindow.showInactive();
         else this.overlayWindow.show();
         // Same synchronous block as the body's show (see the win32 branch) so

@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import { DatabaseManager } from '../db/DatabaseManager';
+import { isRetrievalFixEnabled } from '../context-intelligence/contracts/retrieval-flags';
 import type { EmbeddingPipeline } from '../rag/EmbeddingPipeline';
 import { ModeContextRetriever, type ModeRetrievalOptions, type RetrieveOptions } from './ModeContextRetriever';
 import type { ModeRetrievedContext as HybridContext } from './modes/ModeHybridRetriever';
@@ -12,6 +13,7 @@ import {
     type ModeSourceContract,
     type ModeSourceOwner,
     CURRENT_MIGRATION_REVISION,
+    CURRENT_SEED_REVISION,
     defaultSourceContractForNewMode,
     migrateSourceContractFromPrompt,
     parseModeSourceContract,
@@ -44,6 +46,7 @@ import {
     MODE_TECHNICAL_INTERVIEW_PROMPT,
     // Campaign-3 (2026-07-19): 8th built-in mode prompt.
     MODE_SEMINAR_PROMPT,
+    MODE_CALL_CENTER_PROMPT,
     SHARED_MODE_PREFIX,
     SHARED_MODE_PREFIX_SHORT,
 } from '../llm/prompts';
@@ -74,7 +77,12 @@ export type ModeTemplateType =
     // Campaign-3 (fix/answer-policy-engine, 2026-07-19): 8th built-in mode.
     // Strict: evidence required, off-document Qs answered general-labeled
     // with a visible "not from your reference files" preamble.
-    | 'seminar';
+    | 'seminar'
+    // 9th built-in (2026-08-23, user request): support/call-center calls.
+    // Closest prior template was Sales, which frames everything as pipeline
+    // (pain points / buying signals) — support calls need issue -> resolution
+    // -> escalation framing instead.
+    | 'call-center';
 
 export interface Mode {
     id: string;
@@ -143,6 +151,10 @@ export const MODE_TEMPLATES: Array<{
     // general-labeled with a visible "not from your reference files" preamble
     // (NEVER a refusal — even strict profiles answer; they just label honestly).
     { type: 'seminar',              label: 'Seminar',              description: 'Strict file-grounded Q&A: answer from your reference files; off-file questions get a visible "general knowledge" label, never a refusal.' },
+    // 9th built-in (2026-08-23): support / call-center calls — issue ->
+    // resolution -> escalation framing (Sales was the closest template and it
+    // frames everything as pipeline, which support notes must not).
+    { type: 'call-center',          label: 'Call Center',          description: 'Support-call notes: customer issue, questions asked, resolution given, and escalations.' },
 ];
 
 // Default note sections seeded when a mode is created from a template
@@ -219,6 +231,15 @@ export const TEMPLATE_NOTE_SECTIONS: Record<ModeTemplateType, Array<{ title: str
         { title: 'If not in your files', description: 'A short, labeled "not from your reference files" note from general knowledge — never fabricated as if from the files.' },
         { title: 'Follow-up you might be asked', description: 'Likely follow-up questions on the same topic the audience or panel could ask next.' },
     ],
+    'call-center': [
+        { title: 'Customer issue', description: 'The problem the customer called about, in their own terms — symptoms, product area, and impact.' },
+        { title: 'Customer context', description: 'Account, plan, environment, versions, prior tickets, and anything identifying the setup.' },
+        { title: 'Questions asked', description: 'Questions the customer asked, including ones answered and ones deferred.' },
+        { title: 'Troubleshooting done', description: 'Steps attempted during the call and their results, in order.' },
+        { title: 'Resolution', description: 'What was resolved on the call and how; state plainly if the issue remains open.' },
+        { title: 'Escalation needed', description: 'Anything requiring escalation, a specialist, engineering, or a callback — with urgency if stated.' },
+        { title: 'Follow-up promised', description: 'Commitments made to the customer: callbacks, emails, refunds, timelines.' },
+    ],
 };
 
 // Campaign-3 (2026-07-19): exported (was `const`) so tests + future UI
@@ -235,6 +256,8 @@ export const TEMPLATE_SYSTEM_PROMPTS: Record<ModeTemplateType, string> = {
     lecture: MODE_LECTURE_PROMPT,
     // Campaign-3 (2026-07-19): 8th built-in mode — file-grounded Q&A.
     seminar: MODE_SEMINAR_PROMPT,
+    // 9th built-in (2026-08-23): support / call-center.
+    'call-center': MODE_CALL_CENTER_PROMPT,
 };
 
 // Startup invariant: every MODE_*_PROMPT must begin with one of the two shared
@@ -556,6 +579,8 @@ export class ModesManager {
         'team-meet',
         'lecture',
         'seminar',
+        // Support calls are not salary negotiations (2026-08-23).
+        'call-center',
     ]);
 
     /**
@@ -798,7 +823,36 @@ export class ModesManager {
         const isInterviewPrep = input.templateType === 'looking-for-work'
             || input.templateType === 'technical-interview';
         const switches = input.switches.filter((s) => s !== 'transcript');
-        const defaultOwner: ModeSourceOwner = isInterviewPrep ? 'profile' : 'reference_files';
+        // Interview-prep modes are profile-first BY DEFAULT — but not when the
+        // user has explicitly said otherwise (2026-08-29).
+        //
+        // THE GAP THIS CLOSES. T8 gave technical-interview a reference pool and
+        // put `reference_files` in its permitted switches, so the "Primary
+        // knowledge source" control offers it and the file is now REACHABLE.
+        // But this function pinned `defaultOwner: 'profile'` for interview-prep
+        // regardless of what the user ticked, so the contract still resolved
+        // `profile_only`, `documentGroundedFromContract` still returned false,
+        // and `forceDocumentGrounding` stayed OFF. Measured: ticking "Reference
+        // files" in Technical Interview produced sourceAuthority=profile_only
+        // and docGrounded=false, while the identical selection in General
+        // produced reference_files_primary / true.
+        //
+        // Everything gated on that switch therefore stayed off in the one mode
+        // whose users are most likely to upload project documents: topK 6 and a
+        // 1800-token budget instead of 12/3600, no per-file floor, no
+        // answerability scoring, no section-target or positional restore, no
+        // identity block, no query normalization. The user could ask for their
+        // reference files and be given a materially weaker retrieval than the
+        // same files in General.
+        //
+        // The upload-is-not-consent rule is untouched: this reads the user's
+        // EXPLICIT switch, not the presence of a file. A mode with no
+        // `reference_files` tick keeps `profile` and behaves exactly as before.
+        const userChoseReferenceFiles = switches.includes('reference_files')
+            && isRetrievalFixEnabled('interviewPrepHonorsReferenceSwitch');
+        const defaultOwner: ModeSourceOwner = (isInterviewPrep && !userChoseReferenceFiles)
+            ? 'profile'
+            : 'reference_files';
         return buildUserSelectedSourceContract({
             defaultOwner,
             allowedExplicitSwitches: switches as any,
@@ -852,11 +906,37 @@ export class ModesManager {
         // `reference_files_primary`. This NEVER touches a `user_selected`
         // contract (the user's explicit choice); only `migrated_from_prompt`
         // contracts carry a migrationRevision and are eligible.
+        // The `general` exemption has to sit OUTSIDE the branch. It was written
+        // only into the second clause (the no-`seededForTemplateType` fallback),
+        // so once seeds started carrying `seededForTemplateType` — which they now
+        // all do — a `general` mode matched the FIRST clause
+        // (`seededForTemplateType === templateType`) and was treated as a stable
+        // template-aware seed. That is the exact opposite of the rule stated
+        // three paragraphs above: `general` is the "I'll decide later" template,
+        // its seed carries no user intent, and it is the ONE template whose
+        // default_new_mode contract must re-migrate once a prompt or file
+        // arrives. Frozen, a general mode kept the blank seed's authority
+        // forever no matter what the user later wrote or uploaded.
         const isTemplateAwareSeed = mode.sourceContract?.origin === 'default_new_mode'
+            && mode.templateType !== 'general'
             && (mode.sourceContract.seededForTemplateType === mode.templateType
-                || (!mode.sourceContract.seededForTemplateType && mode.templateType !== 'general'));
+                || !mode.sourceContract.seededForTemplateType);
         const staleMigration = mode.sourceContract?.origin === 'migrated_from_prompt'
             && (mode.sourceContract.migrationRevision ?? 1) < CURRENT_MIGRATION_REVISION;
+        // Seed revision (T8, 2026-08-28). A SEEDED contract could not previously
+        // pick up a later change to the seed rules at all -- `staleMigration`
+        // above tests `migrated_from_prompt` only -- so an existing Technical
+        // Interview mode would have kept its pre-T8 permission set forever and
+        // the fix would have reached newly-created modes alone.
+        //
+        // Its own counter, NOT a bump of CURRENT_MIGRATION_REVISION: that would
+        // re-run the prompt-heuristic migration over every migrated contract in
+        // every user's database, and break the standing invariant that a
+        // prompt-migrated contract is never overwritten by a template switch.
+        // A seed carries no user intent by definition (see `isTemplateAwareSeed`
+        // above), so re-seeding it loses nothing; `user_selected` is untouched.
+        const staleSeedRevision = mode.sourceContract?.origin === 'default_new_mode'
+            && (mode.sourceContract.seedRevision ?? 1) < CURRENT_SEED_REVISION;
         // Stale-seed detection (Knowledge Source canonical-gate repair, 2026-07-16):
         // a default_new_mode contract whose seededForTemplateType differs from the
         // mode's current templateType was created for the wrong template (someone
@@ -870,6 +950,7 @@ export class ModesManager {
         const needsMigration = !mode.sourceContract
             || (mode.sourceContract.origin === 'default_new_mode' && !isTemplateAwareSeed && (hasCustomPrompt || hasReferenceFiles))
             || staleMigration
+            || staleSeedRevision
             || staleSeedForCurrentTemplate;
         if (!needsMigration) return mode.sourceContract!;
         // Stale-seed path (Knowledge Source canonical-gate repair, 2026-07-16):
@@ -1509,6 +1590,12 @@ export class ModesManager {
     }
 
     public buildRetrievedActiveModeContextBlock(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean, pinnedModeId?: string, retrievalOptions?: ModeRetrievalOptions): string {
+        // Fail-closed on an empty query (HDFC leak, 2026-08-18): reference
+        // admission is pool-relative, so a queryless retrieval returns
+        // whichever chunk scores best against nothing — content the user never
+        // asked about. Every legitimate caller derives a user-originated query
+        // (retrievalQueryPolicy.ts) before reaching this choke point.
+        if (!query?.trim()) return '';
         const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
 
@@ -1558,6 +1645,11 @@ export class ModesManager {
      * this passthrough exists to prevent a future caller from reintroducing.
      */
     public async retrieveHybridRaw(mode: Mode, files: ModeReferenceFile[], options: RetrieveOptions): Promise<HybridContext> {
+        // Fail-closed on an empty query — same choke-point rule as the
+        // buildRetrievedActiveModeContextBlock* twins; see retrievalQueryPolicy.ts.
+        if (!options?.query?.trim()) {
+            return { formattedContext: '', chunks: [], usedFallback: true, usedHybrid: false };
+        }
         return this.modeContextRetriever.retrieveHybrid(mode, files, options);
     }
 
@@ -1569,6 +1661,9 @@ export class ModesManager {
      * never breaks. Telemetry distinguishes hybrid hits from lexical fallback.
      */
     public async buildRetrievedActiveModeContextBlockHybrid(query: string, transcript?: string, tokenBudget?: number, answerType?: AnswerType, excludeCustomContext?: boolean, pinnedModeId?: string, allowRerank?: boolean, retrievalOptions?: ModeRetrievalOptions): Promise<string> {
+        // Fail-closed on an empty query — same choke-point rule (and reason)
+        // as the sync twin above; see retrievalQueryPolicy.ts.
+        if (!query?.trim()) return '';
         const mode = this.resolveMode(pinnedModeId);
         if (!mode) return '';
         const files = this.getReferenceFiles(mode.id);
@@ -1613,7 +1708,7 @@ export class ModesManager {
                 );
             } catch (err) {
                 // Don't let a hybrid outage block a document-grounded answer.
-                console.warn('[ModesManager] hybrid forceDocumentGrounding failed, falling back to lexical:', err?.message);
+                console.warn('[ModesManager] hybrid forceDocumentGrounding failed, falling back to lexical:', (err as { message?: string })?.message);
                 return this.buildRetrievedActiveModeContextBlock(
                     query, transcript, tokenBudget, answerType, excludeCustomContext, pinnedModeId, retrievalOptions,
                 );

@@ -2,7 +2,7 @@ import type { IntentResult } from './IntentClassifier';
 import type { ExtractedQuestion } from './transcriptQuestionExtractor';
 import { CODING_CONTRACT, CODING_CONTRACT_IMPL, CODING_VERIFICATION_INSTRUCTION } from './codingContract';
 import { detectAnswerStyle, type AnswerStyle } from './answerStyle';
-import { classifyTargetSpeakability, classifyShortBand, shortBandTargetWords } from './speakability';
+import { classifyTargetSpeakability, classifyShortBand, shortBandTargetWords, HARD_MAX_WORDS, SPOKEN_FULL_MAX_WORDS } from './speakability';
 import { applyModeFallback, type ActiveModeInfo } from './modeProfiles';
 import { classifyDocumentQuestionShape } from './documentGroundedPrompt';
 import { includesPlannerTerm } from '../services/modes/retrievalTextMatch';
@@ -202,6 +202,17 @@ export interface AnswerPlan {
    *  prompt, the routing, the forced retrieval and the post-stream validator
    *  cannot disagree about whether a turn is document-grounded. */
   docGroundedEnforcementActive?: boolean;
+  /** STRICT on the AUTHORITY ALONE — `activeMode.strictDocumentGroundedActive`
+   *  verbatim, with no files check folded in. Deliberately separate from
+   *  `strictDocumentGroundedActive` above (which falls back to the broad flag
+   *  for legacy callers) because the refusal gate needs the un-fallen-back
+   *  value: strictDocumentGroundedFromContract returns true for
+   *  `reference_files_only` before anything is uploaded. */
+  documentGroundedStrict?: boolean;
+  /** Whether the active mode actually has at least one reference file. Paired
+   *  with `documentGroundedStrict` so the prompt can distinguish "bounded
+   *  universe exists" from "authority says documents, but there are none". */
+  documentGroundedFilesPresent?: boolean;
 }
 
 export interface PlanAnswerInput {
@@ -652,16 +663,41 @@ export const isStealthEvasionQuestion = (question: string): boolean => {
   if (/\b(use|using|run|running)\s+(it|this|natively|nativley|the (?:app|tool|overlay))\b/.test(t)
     && /\b(without (?:them|the interviewer|anyone|him|her|people|him\/her) (?:know|notic|see|find|realiz|realis)\w*|secretly|covertly|on the (?:sly|dl|down[- ]?low)|so (?:nobody|no one|they) (?:know|notic|see)\w*|undetect\w*|without being (?:caught|seen|noticed))\b/.test(t)) return true;
   // (b) soft visibility verb aimed at an interview/proctor/screen-share object.
-  // EXCLUDE a candidate-possessive object ("will the interviewer see MY code/
-  // portfolio/answer/screen?") — that's a benign visibility question, not an ask to
-  // hide the TOOL. Only fire when there's no "my/mine" object the candidate owns
-  // (code-review 2026-06-07 false-positive-refusal fix).
-  const candidatePossessiveVisibility = /\b(see|view|notice|read|watch)\b[^.?!]{0,30}\bmy\b/.test(t)
-    || /\bmy (code|portfolio|answer|screen|solution|work|repo|link|profile)\b/.test(t);
-  if (hasObject && STEALTH_SOFT_VISIBILITY_RE.test(t) && !candidatePossessiveVisibility
+  // SENTENCE-SCOPED (RC-1a, live session C 2026-08-21): the verb and the object
+  // must co-occur in ONE sentence. Tested whole-string, a long multi-question
+  // turn paired "the call" from the interviewer's opener with "noticeably" from
+  // a performance question ~700 chars later, routing 17 real technical answers
+  // into the safe-decline contract. A genuine stealth ask ("can the interviewer
+  // see this overlay?") always keeps verb and object in the same sentence.
+  // Branch (a) above deliberately stays whole-string — explicit evasion intent
+  // is a strong signal and over-coverage there is the documented safety posture.
+  // Newlines count as sentence boundaries too: an UNPUNCTUATED transcript
+  // (local STT emits no punctuation) would otherwise be one giant "sentence"
+  // and reopen the cross-match this scoping exists to close (review pass,
+  // 2026-08-22).
+  for (const sentence of t.split(/[.?!…\n]+/)) {
+    if (!STEALTH_SOFT_VISIBILITY_RE.test(sentence)) continue;
     // require the object to be an interviewer/proctor/screen-share (not a bare
     // "monitor" hardware word) so "does it work with a second monitor" is safe.
-    && /\b(interview\w*|proctor\w*|invigilat\w*|recruiter|examiner|screen[- ]?shar\w*|screenshar\w*|share my screen|sharing my screen|the (?:call|meeting|assessment|exam|test))\b/.test(t)) return true;
+    if (!/\b(interview\w*|proctor\w*|invigilat\w*|recruiter|examiner|screen[- ]?shar\w*|screenshar\w*|share my screen|sharing my screen|the (?:call|meeting|assessment|exam|test))\b/.test(sentence)) continue;
+    // EXCLUDE a candidate-possessive object ("will the interviewer see MY code/
+    // portfolio/answer/screen?") — a benign visibility question, not an ask to
+    // hide the TOOL (code-review 2026-06-07 false-positive-refusal fix)...
+    const candidatePossessiveVisibility = /\b(see|view|notice|read|watch)\b[^.?!]{0,30}\bmy\b/.test(sentence)
+      || /\bmy (code|portfolio|answer|screen|solution|work|repo|link|profile)\b/.test(sentence);
+    // ...UNLESS the same sentence ALSO aims a visibility verb at the TOOL
+    // itself ("if I share my screen on the call, will they detect the tool?") —
+    // then the possessive is incidental and the tool-visibility ask wins.
+    // Code-review 2026-08-22: bare "it" removed from the tool-noun set —
+    // an anaphoric "it" ("will they see my screen when I share it?") sat
+    // within 40 chars of the verb and overrode the possessive exemption,
+    // refusing a benign question. An explicit tool noun is required; a
+    // genuine "will they detect it?" with a possessive nearby is the
+    // benign shape, and without one, branch (b)'s object test still fires.
+    const toolVisibility = /\b(see|sees|notice\w*|detect\w*|spot|catch\w*|find)\b[^.?!]{0,40}\b(the (?:tool|app|overlay|window|ui)|natively|nativley)\b/.test(sentence);
+    if (candidatePossessiveVisibility && !toolVisibility) continue;
+    return true;
+  }
   return false;
 };
 
@@ -1477,7 +1513,17 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
   const textNoTechStack = text
     .replace(/\b(tech|technology|technical)\s+stack\b/g, 'techstack')
     .replace(/\bfull[- ]?stack\b/g, 'fullstack')
-    .replace(/\bstack(s|ed)?\s+up\b/g, 'measure$1 up');
+    .replace(/\bstack(s|ed)?\s+up\b/g, 'measure$1 up')
+    // WTA audit F1 (2026-08-18): a demonstrative/possessive "stack" ("that
+    // stack", "your stack") is a tech-stack reference — the data-structure
+    // noun is never referred to that way in an interviewer ask. Without this,
+    // "Why did you choose that stack?" fails the project-followup branch's
+    // DSA negation guard and lands on dsa_question_answer (profile forbidden
+    // + six-section coding repair). Choice-verb + "the stack" is the same
+    // tech-stack sense; bare "a stack"/"the stack" elsewhere ("difference
+    // between the stack and the heap") stays a data-structure term.
+    .replace(/\b(that|this|your|our|their|my)\s+stack\b/g, '$1 techstack')
+    .replace(/\b(chose|choose|chosen|choosing|pick|picked|picking|selected|select|use|used|using|went with|decided? on)\s+the\s+stack\b/g, '$1 the techstack');
   const extractedType = input.extractedQuestion?.questionType;
   // Defect C split: prefer the EXPLICIT strictness flag when the snapshot
   // carries it (live snapshots always do since 2026-08-12); fall back to the
@@ -1788,9 +1834,14 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     // coding verb, or a technical-concept subject; those fall through to the
     // technical/DSA/coding cluster below (profileContextPolicy = forbidden). This
     // keeps the "coding answers never use resume" invariant intact. ("what tech
-    // STACK did you use?" survives: `stack` here is matched by the followup
-    // pattern, and DSA's bare `stack` is gated by this being a personal "did you
-    // use" phrasing — verified by ProfileRoutingMatrix over-capture guards.)
+    // STACK did you use?" survives because the textNoTechStack rewrite above
+    // neutralizes "tech/technology/technical stack", "full-stack",
+    // "stack(s|ed) up", and — WTA audit F1, 2026-08-18 — demonstrative/
+    // possessive "that/this/your/our/their/my stack" plus choice-verb + "the
+    // stack" BEFORE the DSA/technical patterns see the text. There is no
+    // "personal did-you-use" gate; the rewrite is the ONLY protection, so any
+    // new tech-stack phrasing must be added there. Pinned by
+    // ProfileRoutingMatrix + WtaBareStackRouting2026_08_18.)
     answerType = 'project_followup_answer';
   } else if (
     // HIGH-CONFIDENCE JD-FIT BRIDGE — the interviewer challenges that the
@@ -2104,6 +2155,14 @@ export const planAnswer = (input: PlanAnswerInput): AnswerPlan => {
     documentGroundedCustomModeActive: broadDocumentGroundedActive,
     strictDocumentGroundedActive: documentGroundedCustomModeActive,
     docGroundedEnforcementActive,
+    // Kept as two separate facts rather than one pre-combined boolean. The
+    // refusal gate needs BOTH, and the two previous attempts at this each
+    // failed by collapsing them: keying on strict alone let a fileless
+    // `reference_files_only` mode refuse against material the user never
+    // provided; keying on enforcement alone made a template-seeded mode refuse
+    // even though its retrieval was never forced.
+    documentGroundedStrict: input.activeMode?.strictDocumentGroundedActive === true,
+    documentGroundedFilesPresent: input.activeMode?.hasReferenceFiles === true,
   };
 };
 
@@ -2178,6 +2237,46 @@ const SPEAKABLE_RENDERING_DIRECTIVE =
   `Cover the same substance — lead with the direct answer, ground every claim, close naturally. ` +
   `Never print "Speakable Final Answer", "Direct Answer", "The Honest Gap", "Short Fit Summary", or any other label.`;
 
+/**
+ * The adaptive per-turn LENGTH directive as a bare line ('' when the plan's
+ * speakability tier doesn't warrant one). Extracted (RC-5, session C
+ * 2026-08-21) so the V3 prompt path can deliver it too: V3's composed user
+ * message replaces the whole <answer_contract>, and with it the only length
+ * target the model ever saw — measured live, 73/85 answers overshot the
+ * contract's own 60-word target (median 155, p90 310) because no per-turn
+ * length line was delivered at all on V3-owned turns.
+ */
+export const renderLengthDirectiveForPlan = (plan: AnswerPlan): string => {
+  if (plan.answerStyle && plan.answerStyle !== 'default') return '';
+  // Coding output owns its own length (the contract's sections + code).
+  if (isCodingAnswerType(plan.answerType)) return '';
+  const tier = classifyTargetSpeakability(plan.answerType, plan.answerStyle, plan.question);
+  // STRUCTURED_FULL is INTENTIONALLY long (speakability.ts: "must never be
+  // length-trimmed" — code, system design, lecture notes, evidence quotes,
+  // explicit step-by-step asks). Code-review 2026-08-23: the first ceiling
+  // draft capped these at 130 words, contradicting the module contract and
+  // self-contradicting on exactly the "walk me through it step by step"
+  // questions that select the tier. No directive here, by design.
+  if (tier === 'STRUCTURED_FULL') return '';
+  if (tier === 'SPOKEN_FULL') {
+    // A fuller spoken answer (STAR story, multi-part, pressured negotiation)
+    // has its own budget — SPOKEN_FULL_MAX_WORDS, the same number
+    // speakability's telemetry classifies against. Cap-first framing chosen
+    // by paired live A/B (155w -> 131w on the equivalent outer-cap test).
+    return `LENGTH LIMIT: at most ${SPOKEN_FULL_MAX_WORDS} words (~60 seconds spoken) — a hard cap, not a target. This is a LIVE spoken answer: tell the story or make the case completely, then stop — do not enumerate every angle. If your draft runs past ${SPOKEN_FULL_MAX_WORDS} words, cut whole branches, not adjectives.`;
+  }
+  const band = classifyShortBand(plan.answerType, plan.answerStyle, plan.question);
+  const t = shortBandTargetWords(band);
+  // The "aim for" phrasing alone was overshot ~50-100% live (sessions D/E:
+  // 124w against a 60w band). The band stays the target; the ceiling gives
+  // the model a hard number to cut against — clamped to HARD_MAX_WORDS so
+  // the prompt can never instruct the model into the range speakability's
+  // telemetry classifies as over_budget (code-review 2026-08-23: 85x1.25=106
+  // crossed the 100-word line and would have corrupted the tuning signal).
+  const ceiling = Math.min(Math.round(t.max * 1.25), HARD_MAX_WORDS);
+  return `LENGTH: aim for about ${t.seconds}s spoken — roughly ${t.min} to ${t.max} words (${t.guidance}). Use fewer if the question is fully answered in fewer; never pad to reach the number. Hard ceiling: never go past ${ceiling} words — if your draft runs longer, cut examples and caveats, keep the point.`;
+};
+
 export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationSpec = false): string => {
   const verificationBlock = (includeVerificationSpec && isCodingAnswerType(plan.answerType))
     ? `\n\n${CODING_VERIFICATION_INSTRUCTION}`
@@ -2202,8 +2301,30 @@ export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationS
   // 2026-08-13: keyed on ENFORCEMENT, so the instruction the model receives
   // matches the retrieval and validation it is actually subject to. Older
   // plans that predate the field fall back to the previous behaviour.
-  const policyLine = (plan.docGroundedEnforcementActive
-    ?? plan.strictDocumentGroundedActive ?? plan.documentGroundedCustomModeActive)
+  // 2026-08-16: the doc-grounding policy line additionally requires FILES.
+  //
+  // R1 (`docGroundedEnforcementActive`) is what sets forceDocumentGrounding on
+  // the retrieval call (LLMHelper.ts:2299, IntelligenceEngine.ts:1179), so
+  // wherever it is true the model really is answering over retrieved documents
+  // and the honesty mandate is honest — that is the F9 dissolution, pinned by
+  // F9PurposeHonestyUnderR1_2026_08_15.
+  //
+  // But enforcement is ALSO true on the authority alone:
+  // strictDocumentGroundedFromContract returns true for `reference_files_only`
+  // before anything is uploaded, and its hasReferenceFiles check guards only the
+  // reference_files_primary/_plus_transcript branch. A mode with nothing
+  // uploaded — or whose last file was deleted — was therefore told to say the
+  // answer "is not in the uploaded material" when there was no uploaded material
+  // to be absent from. Requiring files closes exactly that hole and nothing else.
+  //
+  // Plans predating documentGroundedFilesPresent keep the old predicate.
+  const _docEnforcement = (plan.docGroundedEnforcementActive
+    ?? plan.strictDocumentGroundedActive ?? plan.documentGroundedCustomModeActive) === true;
+  const _docPolicyActive = plan.documentGroundedFilesPresent === undefined
+    ? _docEnforcement
+    : (_docEnforcement && plan.documentGroundedFilesPresent === true);
+
+  const policyLine = _docPolicyActive
     ? 'Ground every concrete claim in the uploaded/reference files for this custom mode. If the answer is not supported by the uploaded material, say plainly that the requested information is not in the uploaded material. Do not reconstruct it from general knowledge, prior assistant answers, profile, resume, JD, or persona context.'
     : plan.profileContextPolicy === 'required'
       ? 'Ground every concrete claim in the provided profile facts. Never invent names, numbers, metrics, companies, or technologies that are not in those facts.'
@@ -2224,15 +2345,8 @@ export const formatAnswerPlanForPrompt = (plan: AnswerPlan, includeVerificationS
   // cue — SPOKEN_FULL / STRUCTURED_FULL and explicit styles own their own length, so emit
   // nothing for them (additive, non-conflicting). Prompt-guidance only; the deterministic
   // trimmer is unchanged.
-  let lengthDirective = '';
-  if (!plan.answerStyle || plan.answerStyle === 'default') {
-    const tier = classifyTargetSpeakability(plan.answerType, plan.answerStyle, plan.question);
-    if (tier === 'SPOKEN_SHORT') {
-      const band = classifyShortBand(plan.answerType, plan.answerStyle, plan.question);
-      const t = shortBandTargetWords(band);
-      lengthDirective = `\n\nLENGTH: aim for about ${t.seconds}s spoken — roughly ${t.min} to ${t.max} words (${t.guidance}). Use fewer if the question is fully answered in fewer; never pad to reach the number.`;
-    }
-  }
+  const _lengthLine = renderLengthDirectiveForPlan(plan);
+  const lengthDirective = _lengthLine ? `\n\n${_lengthLine}` : '';
   // Speakable-by-default (manual regression 2026-06-12): scaffolded profile
   // templates become internal thinking structure; the rendered answer is
   // natural prose unless the user explicitly asked for structure.

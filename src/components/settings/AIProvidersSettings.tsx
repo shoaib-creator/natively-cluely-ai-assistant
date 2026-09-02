@@ -17,17 +17,14 @@ import { useToggleInit } from './useToggleInit';
 // is a separate document context, so those would render black and disappear
 // against the dark theme. Inlining lets them inherit the tile's colour and
 // adapt to both themes for free.
-import geminiMark from '../../assets/provider-logos/gemini.svg?raw';
-import claudeMark from '../../assets/provider-logos/claude.svg?raw';
-import deepseekMark from '../../assets/provider-logos/deepseek.svg?raw';
-import groqMark from '../../assets/provider-logos/groq.svg?raw';
-import openaiMark from '../../assets/provider-logos/openai.svg?raw';
-import ollamaMark from '../../assets/provider-logos/ollama.svg?raw';
-// LiteLLM ships its mark only as a raster favicon (160x160 PNG), so this one is a
-// URL rather than inlined markup. No currentColor to resolve in a PNG, so <img>
-// loses nothing here. Vendored from BerriAI/litellm — MIT, and outside the
-// `enterprise/` directory that their LICENSE carves out.
-import litellmMark from '../../assets/provider-logos/litellm.png';
+// The marks themselves live in ../ui/aiProviderMarks so the overlay's model
+// picker can render the same registry without pulling this panel in. Re-exported
+// below under their original AIP_* names.
+import {
+    AI_PROVIDER_BRANDS,
+    AI_PROVIDER_MARKS,
+    AI_PROVIDER_MARK_IMAGES,
+} from '../ui/aiProviderMarks';
 import { useResolvedTheme } from '../../hooks/useResolvedTheme';
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -93,6 +90,9 @@ export const AIP_CSS = `
     --aip-accent-muted:      color-mix(in srgb, var(--aip-accent) 14%, transparent);
     --aip-accent-border:     color-mix(in srgb, var(--aip-accent) 22%, transparent);
     --aip-accent-ring:       color-mix(in srgb, var(--aip-accent) 12%, transparent);
+    /* Stroked X, used as a mask so it can be tinted by whatever colour the rule
+       sets. Single-quoted attrs and %23 for '#' keep it legal inside url(). */
+    --aip-x-glyph: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 3 9 9M9 3 3 9' stroke='%23000' stroke-width='1.7' stroke-linecap='round'/%3E%3C/svg%3E");
 
     --aip-hero:      #ffffff;
     --aip-primary:   rgba(255,255,255,0.86);
@@ -788,6 +788,55 @@ export const AIP_CSS = `
    or active, not for things that merely have the caret. Shares .aip-field's token so
    the two focus treatments cannot drift apart. */
 .aip-input:focus { border-color: var(--aip-input-border-focus); }
+/* ...and the border must be the ONLY indicator, which means suppressing the panel's
+   global ":focus-visible" accent outline here, exactly as ".aip-field > .aip-input"
+   already does. Two reasons, both of which this rule was previously only half
+   winning — the brightened border was applied but the accent outline still painted
+   on top of it:
+     CLIPPING. The models filter sits directly inside ".aip-reveal > div", which
+     carries overflow:hidden for the collapse animation. An outline at
+     "outline-offset: 2px" is drawn 4px OUTSIDE the border box, and the filter is
+     flex-1 with its left edge flush to that clip box — so the ring's left arc was
+     sliced off square while the right stayed round.
+     GRAMMAR. ":focus-visible" matches POINTER focus on text inputs, so a 2px solid
+     accent rectangle fired on every click into the field, not on keyboard nav —
+     the same "alarm around a field you merely clicked into" the .aip-field comment
+     above rejects.
+   Keyboard affordance is not lost: --aip-input-border-focus is tuned per theme to
+   clear SC 1.4.11's 3:1, which is what the outline was there to guarantee. Nothing
+   paints outside the border box now, so no ancestor's overflow can clip it. */
+.aip-root .aip-input:focus-visible { outline: none; }
+
+/* Same clip box, the other half of the toolbar. The buttons beside the filter
+   (Refresh, Select all, Reset…) sit in the same overflow:hidden row, and the
+   last one is flush with its right edge — so the outward outline loses its
+   right arc exactly as the input lost its left one.
+   Buttons are NOT given the input's treatment: ":focus-visible" does not match
+   pointer clicks on a <button>, so here the accent ring is real keyboard
+   affordance and removing it would cost a11y for no reason. It is drawn INSIDE
+   the border box instead, which is how ".aip-field-seg" and ".aip-tab" already
+   solve this — 0,4,0 to beat ".aip-root :focus-visible" (0,2,0).
+   Rows inside ".aip-models-well" need no such rule: its padding:4px already
+   leaves room for the 2px offset + 2px outline. */
+.aip-root .aip-reveal .aip-btn:focus-visible { outline-offset:-2px; }
+/* The clear control on the models filter. Chrome's native
+   "::-webkit-search-cancel-button" is a fixed raster glyph — a chunky grey
+   pill-with-X that ignores colour, sizing and theme, and reads as a much
+   heavier control than the hairline field it sits in. Replaced with a plain
+   stroked X.
+   Drawn as a MASK rather than a background image so the colour comes from
+   --aip-danger, which is theme-split; a background SVG would hardcode one red
+   and go wrong in the light theme. -webkit-appearance:none is what removes the
+   native glyph — without it the mask paints on top of it. */
+.aip-input[type='search']::-webkit-search-cancel-button {
+    -webkit-appearance: none; appearance: none;
+    width:11px; height:11px; cursor:pointer;
+    background-color: var(--aip-danger);
+    -webkit-mask: var(--aip-x-glyph) center / 11px 11px no-repeat;
+            mask: var(--aip-x-glyph) center / 11px 11px no-repeat;
+    opacity:0.8; transition: opacity var(--aip-dur-state) var(--aip-ease-out);
+}
+.aip-input[type='search']::-webkit-search-cancel-button:hover { opacity:1; }
 .aip-input[data-mono='true'] { font-family: var(--aip-mono); font-size:11.5px; }
 textarea.aip-input { height:auto; padding:10px; line-height:1.5; resize:none; }
 select.aip-input { cursor:pointer; }
@@ -1031,7 +1080,7 @@ export const AipSwitch: React.FC<AipSwitchProps> = ({
 
 /** Per-provider brand hues for the monogram tile. */
 /**
- * The five cloud providers, in render order. One table drives all five cards — they
+ * The cloud providers, in render order. One table drives all cards — they
  * were 28 near-identical props copy-pasted five times, so a new prop meant five edits
  * and a missed one was invisible.
  */
@@ -1042,19 +1091,11 @@ export const CLOUD_PROVIDERS = [
     { id: 'claude'   as const, name: 'Claude',   placeholder: 'sk-ant-...', url: 'https://console.anthropic.com/settings/keys' },
     // Text-only; intentionally NOT part of the screenshot/vision fallback chain.
     { id: 'deepseek' as const, name: 'DeepSeek', placeholder: 'sk-...',     url: 'https://platform.deepseek.com/api_keys' },
+    { id: 'nvidia_nim' as const, name: 'Nvidia Nim', placeholder: 'nvapi-...', url: 'https://build.nvidia.com' },
 ];
 export type CloudProviderId = (typeof CLOUD_PROVIDERS)[number]['id'];
 
-export const AIP_PROVIDER_BRANDS: Record<string, { mono: string; brand: string }> = {
-    gemini:   { mono: 'GE', brand: '#7C9CF5' },
-    groq:     { mono: 'GQ', brand: '#F2755C' },
-    openai:   { mono: 'OA', brand: '#10A37F' },
-    claude:   { mono: 'CL', brand: '#D97757' },
-    deepseek: { mono: 'DS', brand: '#4D6BFE' },
-    codex:    { mono: 'CX', brand: '#10A37F' },
-    litellm:  { mono: 'LL', brand: '#8B5CF6' },
-    ollama:   { mono: 'OL', brand: '#9CA3AF' },
-};
+export const AIP_PROVIDER_BRANDS = AI_PROVIDER_BRANDS;
 
 interface AipMonogramProps {
     /** Two letters. Longer strings are clipped to two. */
@@ -1081,20 +1122,9 @@ export const AipMonogram: React.FC<AipMonogramProps> = ({ mono, brand, className
  * `codex` maps to the OpenAI mark because it is the same brand.
  */
 /** Raster marks, rendered as <img>. See AIP_PROVIDER_LOGOS for the inlined SVGs. */
-export const AIP_PROVIDER_LOGO_IMAGES: Record<string, string> = {
-    litellm: litellmMark,
-};
+export const AIP_PROVIDER_LOGO_IMAGES = AI_PROVIDER_MARK_IMAGES;
 
-export const AIP_PROVIDER_LOGOS: Record<string, string> = {
-    gemini: geminiMark,
-    claude: claudeMark,
-    anthropic: claudeMark,
-    deepseek: deepseekMark,
-    groq: groqMark,
-    openai: openaiMark,
-    codex: openaiMark,
-    ollama: ollamaMark,
-};
+export const AIP_PROVIDER_LOGOS = AI_PROVIDER_MARKS;
 
 interface AipProviderMarkProps {
     /** Provider id. Falls back to a monogram when no mark is vendored. */
@@ -1170,7 +1200,7 @@ interface AipModelListProps {
      * exists only to stop an un-check from silently re-lighting every row.
      */
     optIn?: boolean;
-    /** Tick/clear every currently VISIBLE row (filter + Previews applied). */
+    /** Tick/clear every currently VISIBLE row (typed filter applied). */
     onBulkToggle?: (ids: string[], enable: boolean) => void;
     /** Set while a write is in flight so the header can report a failure. */
     error?: string | null;
@@ -1186,10 +1216,8 @@ interface AipModelListProps {
     onFirstOpen?: () => void;
 }
 
-/** Above this many models, a filter field and the Previews toggle appear. */
+/** Above this many models, a filter field appears. */
 const AIP_MODEL_FILTER_THRESHOLD = 12;
-/** Preview/experimental/date-stamped variants — matched on the ID, never the label. */
-const AIP_PREVIEW_RE = /preview|exp(erimental)?\b|-latest$|-\d{4}-\d{2}-\d{2}$|-\d{2}-\d{2}$/i;
 
 /**
  * The model allow-list: a summary row that discloses a vertical list.
@@ -1214,7 +1242,6 @@ export const AipModelList: React.FC<AipModelListProps> = ({
     const t = useT();
     const [open, setOpen] = useState(false);
     const [query, setQuery] = useState('');
-    const [hidePreviews, setHidePreviews] = useState(models.length > AIP_MODEL_FILTER_THRESHOLD);
     const [activeIndex, setActiveIndex] = useState(0);
     const firstOpenFired = useRef(false);
     const listRef = useRef<HTMLDivElement>(null);
@@ -1226,22 +1253,20 @@ export const AipModelList: React.FC<AipModelListProps> = ({
     const isOn = (id: string) => optIn ? enabled.includes(id) : (enabled.length === 0 || enabled.includes(id));
     const enabledCount = (!optIn && enabled.length === 0) ? models.length : enabled.length;
 
-    // Threshold keys off the UNFILTERED count. Keying it off visible rows would make
-    // the filter field appear and vanish as you toggle Previews — exactly the jank
-    // the threshold exists to prevent.
+    // Threshold keys off the UNFILTERED count. Keying it off visible rows would
+    // make the filter field appear and vanish as you type — exactly the jank the
+    // threshold exists to prevent.
     const showFilterBar = models.length > AIP_MODEL_FILTER_THRESHOLD;
 
+    // Every model the provider reports is listed. The typed filter is the ONLY
+    // thing that can hide a row — there is deliberately no category the UI
+    // suppresses on the user's behalf, so a model that exists upstream is always
+    // reachable here.
     const visible = useMemo(() => {
         const q = query.trim().toLowerCase();
-        return models.filter(m => {
-            // An allow-listed model is NEVER hidden by a view filter, or the visible
-            // list would disagree with the count in the header.
-            const listed = enabled.length > 0 && enabled.includes(m.id);
-            if (hidePreviews && !listed && AIP_PREVIEW_RE.test(m.id)) return false;
-            if (!q) return true;
-            return m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q);
-        });
-    }, [models, query, hidePreviews, enabled]);
+        if (!q) return models;
+        return models.filter(m => m.id.toLowerCase().includes(q) || m.label.toLowerCase().includes(q));
+    }, [models, query]);
 
     const moveTo = useCallback((index: number) => {
         if (visible.length === 0) return;
@@ -1329,16 +1354,6 @@ export const AipModelList: React.FC<AipModelListProps> = ({
                                     className="aip-input flex-1"
                                     data-mono="true"
                                 />
-                                <button
-                                    type="button"
-                                    onClick={() => setHidePreviews(v => !v)}
-                                    aria-pressed={hidePreviews}
-                                    className="aip-chip shrink-0"
-                                    title={t('Hide preview, experimental and dated variants')}
-                                >
-                                    <Check size={9} strokeWidth={2.5} className="aip-chip-check" aria-hidden="true" />
-                                    {t('Previews')}
-                                </button>
                                 {/* Reset means "back to no filter" = ALL, which is incoherent
                                     for an opt-in provider — there Clear above is the real
                                     control and this would just be a second, wrong-labelled one. */}
@@ -1358,8 +1373,7 @@ export const AipModelList: React.FC<AipModelListProps> = ({
                             They act on the VISIBLE rows, so with 300+ models the filter scopes
                             a family ("gpt" -> Select all); a button that ignored the filter
                             would be a 300-model foot-gun sitting right next to it. With no
-                            filter typed, `visible` is everything — and a SELECTED model is
-                            never hidden by the Previews toggle (see the `listed` check), so
+                            filter typed, `visible` is every model the provider reports, so
                             Deselect all can always reach every selection. */}
                         {onBulkToggle && visible.length > 0 && (
                             <>
@@ -1367,7 +1381,7 @@ export const AipModelList: React.FC<AipModelListProps> = ({
                                     type="button"
                                     onClick={() => onBulkToggle(visible.map(m => m.id), true)}
                                     className="aip-btn aip-btn-sm shrink-0"
-                                    title={query.trim() || hidePreviews
+                                    title={query.trim()
                                         ? t('Select the models currently listed')
                                         : t('Select every model')}
                                 >
@@ -1382,7 +1396,7 @@ export const AipModelList: React.FC<AipModelListProps> = ({
                                         type="button"
                                         onClick={() => onBulkToggle(visible.map(m => m.id), false)}
                                         className="aip-btn aip-btn-sm shrink-0"
-                                        title={query.trim() || hidePreviews
+                                        title={query.trim()
                                             ? t('Deselect the models currently listed')
                                             : t('Deselect every model')}
                                     >
@@ -1839,6 +1853,124 @@ interface AIProvidersSettingsProps {
     aiLangDropdownRef: React.RefObject<HTMLDivElement | null>;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   R-10 resolution card (§19.1). Rendered only while the main process reports
+   two credential stores that cannot be ordered (a whole-profile restore left a
+   newer app-managed backup beside the OS-keyring file). Until the user answers,
+   the app runs from the union of both sets and refuses to overwrite either
+   file — safe, but every new key lands in the weaker app-managed store, so the
+   state should be ENDED deliberately, here, where keys are managed.
+   Shows key NAMES and last-4 only; the main process never sends values.
+   ═══════════════════════════════════════════════════════════════════════════ */
+type AmbiguousStores = {
+    keyring: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
+    fallback: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
+};
+
+const AmbiguousStoresCard: React.FC = () => {
+    const t = useT();
+    const [stores, setStores] = useState<AmbiguousStores | null>(null);
+    const [busy, setBusy] = useState<'keyring' | 'fallback' | 'merge' | null>(null);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        const fetch = () => {
+            window.electronAPI?.getAmbiguousCredentialStores?.()
+                .then((v) => { if (!cancelled) setStores(v); })
+                .catch(() => { /* absent API (older main) → render nothing */ });
+        };
+        fetch();
+        // Re-fetch on credential changes so the card tracks reality: it must
+        // disappear if another window resolved the state, and a mount-only
+        // fetch would show stale data forever (adversarial review 2026-08-19).
+        const unsubscribe = window.electronAPI?.onCredentialsChanged?.(fetch);
+        return () => { cancelled = true; unsubscribe?.(); };
+    }, []);
+
+    if (!stores) return null;
+
+    const resolve = async (choice: 'keyring' | 'fallback' | 'merge') => {
+        setBusy(choice);
+        setError(null);
+        try {
+            const res = await window.electronAPI?.resolveAmbiguousCredentialStores?.(choice);
+            if (res?.ok) {
+                setStores(null);   // state ended; the card disappears
+            } else {
+                setError(res?.error === 'snapshot_failed'
+                    ? t('Could not back up the current files first, so nothing was changed. Check disk space and try again.')
+                    : t('Could not apply the choice. Nothing was changed.'));
+            }
+        } catch {
+            setError(t('Could not apply the choice. Nothing was changed.'));
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const when = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : t('unknown time'));
+    const keyList = (keys: { name: string; last4: string }[]) => (
+        keys.length === 0
+            ? <span className="opacity-60">{t('(unreadable or empty)')}</span>
+            : keys.map((k) => `${k.name} (…${k.last4})`).join(', ')
+    );
+
+    return (
+        <div
+            className="flex flex-col gap-3 p-4 rounded-lg text-xs"
+            style={{ background: 'var(--aip-warn-bg)', border: '1px solid var(--aip-warn-border)' }}
+            data-testid="ambiguous-stores-card"
+        >
+            <div className="flex items-start gap-2">
+                <AlertCircle size={14} strokeWidth={1.75} className="shrink-0 mt-0.5" style={{ color: 'var(--aip-warn)' }} />
+                <div className="space-y-1">
+                    <div className="font-medium">{t('Two saved credential sets were found')}</div>
+                    <div className="opacity-80">
+                        {t('This usually happens after restoring a backup or migrating machines. Until you choose, both files are kept and new keys are saved to the weaker backup store.')}
+                    </div>
+                </div>
+            </div>
+            <div className="space-y-1 pl-6">
+                <div><span className="font-medium">{t('System keychain')}</span> ({when(stores.keyring.mtimeIso)}): {keyList(stores.keyring.keys)}</div>
+                <div><span className="font-medium">{t('App backup')}</span> ({when(stores.fallback.mtimeIso)}): {keyList(stores.fallback.keys)}</div>
+            </div>
+            <div className="flex flex-wrap gap-2 pl-6">
+                <button
+                    className="px-3 py-1.5 rounded-md border text-xs font-medium disabled:opacity-50"
+                    style={{ borderColor: 'var(--aip-warn-border)' }}
+                    disabled={busy !== null}
+                    onClick={() => resolve('keyring')}
+                >
+                    {busy === 'keyring' ? t('Applying…') : t('Keep system keychain')}
+                </button>
+                <button
+                    className="px-3 py-1.5 rounded-md border text-xs font-medium disabled:opacity-50"
+                    style={{ borderColor: 'var(--aip-warn-border)' }}
+                    disabled={busy !== null}
+                    onClick={() => resolve('fallback')}
+                >
+                    {busy === 'fallback' ? t('Applying…') : t('Keep app backup')}
+                </button>
+                <button
+                    className="px-3 py-1.5 rounded-md border text-xs font-medium disabled:opacity-50"
+                    style={{ borderColor: 'var(--aip-warn-border)' }}
+                    disabled={busy !== null}
+                    onClick={() => resolve('merge')}
+                >
+                    {busy === 'merge' ? t('Applying…') : t('Keep both (backup wins on conflict)')}
+                </button>
+            </div>
+            {error && <div className="pl-6 aip-danger-fg">{error}</div>}
+            <div className="pl-6 opacity-60">
+                {t('Whatever you pick, both current files are first copied aside, so this is reversible.')}
+            </div>
+        </div>
+    );
+};
+
+export const AmbiguousCredentialStoresCard = AmbiguousStoresCard;
+
 export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     aiResponseLanguage,
     availableAiLanguages,
@@ -1857,6 +1989,14 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     const [openaiApiKey, setOpenaiApiKey] = useState('');
     const [claudeApiKey, setClaudeApiKey] = useState('');
     const [deepseekApiKey, setDeepseekApiKey] = useState('');
+    const [nvidiaNimApiKey, setNvidiaNimApiKey] = useState('');
+    /**
+     * The active speech provider, so the remove-key confirmation can warn when
+     * the NVIDIA key it is about to delete is ALSO the one speech is using —
+     * one nvapi- credential authenticates both.
+     */
+    const [activeSttProvider, setActiveSttProvider] = useState<string>('none');
+
 
     // Binds the five key fields to the CLOUD_PROVIDERS table. The useState calls stay
     // separate (they are read individually elsewhere); this is only the lookup the
@@ -1867,6 +2007,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         openai: [openaiApiKey, setOpenaiApiKey],
         claude: [claudeApiKey, setClaudeApiKey],
         deepseek: [deepseekApiKey, setDeepseekApiKey],
+        nvidia_nim: [nvidiaNimApiKey, setNvidiaNimApiKey],
     };
 
     // --- LiteLLM proxy (OpenAI-compatible gateway: baseURL + optional virtual key) ---
@@ -1966,7 +2107,10 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     const [codexOauthInProgress, setCodexOauthInProgress] = useState(false);
 
     // --- Default Model ---
-    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.6-flash');
+    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.7-flash');
+    const [directAssistEnabled, setDirectAssistEnabled] = useState(false);
+    const [directAssistBusy, setDirectAssistBusy] = useState(false);
+    const [directAssistError, setDirectAssistError] = useState('');
     const [fastResponseMode, setFastResponseMode] = useState(false);
     const [credentialsLoaded, setCredentialsLoaded] = useState(false);
     const canUseFastMode = !!(hasStoredKey.groq || hasStoredKey.natively || (codexCliConfig.enabled && codexOauthStatus.signedIn));
@@ -2010,7 +2154,12 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     // stored field, which the enum deliberately does not have.
     const requiredBeforeLocalOnly = useRef<boolean | null>(null);
 
-    const applyVisionMode = (localOnly: boolean, required: boolean) => {
+    const applyVisionMode = async (localOnly: boolean, required: boolean) => {
+        // Snapshot what a refused write has to be rolled back TO. Both of these
+        // are mutated below, so capture before, not after.
+        const previousMode = screenUnderstandingMode;
+        const previousRequiredBefore = requiredBeforeLocalOnly.current;
+
         let effectiveRequired = required;
         if (localOnly && !visionLocalOnly) {
             // Entering local-only: stash what "Require" really was, since the
@@ -2024,7 +2173,30 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         }
         const mode = localOnly ? 'private_vision' : (effectiveRequired ? 'vision_only' : 'vision_first');
         setScreenUnderstandingMode(mode);
-        window.electronAPI?.setScreenUnderstandingMode?.(mode);
+
+        // CR-04 follow-up: the handler refuses when the settings store is degraded
+        // and — correctly — no longer broadcasts, so the
+        // onScreenUnderstandingModeChanged subscription that normally re-converges
+        // this component never fires. Setting local state optimistically and
+        // ignoring the result therefore left THIS window showing a privacy mode
+        // that was never saved, while main and disk held the old one. On a setting
+        // whose copy promises "cloud vision is never called", a mode the UI only
+        // THINKS it is in is not cosmetic. Roll back on refusal.
+        try {
+            const res = await window.electronAPI?.setScreenUnderstandingMode?.(mode);
+            if (res && res.success === false) {
+                setScreenUnderstandingMode(previousMode);
+                requiredBeforeLocalOnly.current = previousRequiredBefore;
+                console.warn('[AIProviders] screen-understanding mode was not saved:', res.error);
+            }
+        } catch (e) {
+            // Now that this is awaited, a rejected IPC would surface as an
+            // unhandled rejection from an onChange handler. A failed write must
+            // roll the switch back for the same reason a refused one does.
+            setScreenUnderstandingMode(previousMode);
+            requiredBeforeLocalOnly.current = previousRequiredBefore;
+            console.warn('[AIProviders] screen-understanding mode write failed:', e);
+        }
     };
 
     // Where a disabled scope's data actually goes. Must match ENFORCEMENT
@@ -2065,9 +2237,11 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                         openai: creds.hasOpenaiKey,
                         claude: creds.hasClaudeKey,
                         deepseek: creds.hasDeepseekKey || false,
+                        nvidia_nim: creds.hasNvidiaNimKey || false,
                         litellm: creds.hasLitellmBaseURL || false,
                         natively: creds.hasNativelyKey || false
                     });
+                    setActiveSttProvider((creds as any).sttProvider || 'none');
                     // Prefill stored LiteLLM config so re-saving doesn't silently reset it.
                     // (baseURL is config, not a secret; the key stays masked/blank = keep.)
                     // Also clear the fields when another window removes the proxy.
@@ -2080,6 +2254,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     if (creds.openaiPreferredModel) pm.openai = creds.openaiPreferredModel;
                     if (creds.claudePreferredModel) pm.claude = creds.claudePreferredModel;
                     if (creds.deepseekPreferredModel) pm.deepseek = creds.deepseekPreferredModel;
+                    if (creds.nvidia_nimPreferredModel) pm.nvidia_nim = creds.nvidia_nimPreferredModel;
                     // Already prefixed on disk (`litellm/<model>`), which is the id the
                     // LiteLLM model list renders — no re-prefixing here or the star lands
                     // on no row at all.
@@ -2126,6 +2301,9 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     setDefaultModel(result.model);
                 }
 
+                const directEnabled = await window.electronAPI?.getDirectAssistEnabled?.();
+                setDirectAssistEnabled(directEnabled === true);
+
                 // Check Ollama
                 checkOllama();
 
@@ -2148,6 +2326,12 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             unsubs.push(window.electronAPI.onGroqFastTextChanged((enabled: boolean) => {
                 setFastResponseMode(enabled);
                 localStorage.setItem('natively_groq_fast_text', String(enabled));
+            }));
+        }
+        if (window.electronAPI?.onDirectAssistEnabledChanged) {
+            unsubs.push(window.electronAPI.onDirectAssistEnabledChanged((enabled: boolean) => {
+                setDirectAssistEnabled(enabled === true);
+                setDirectAssistError('');
             }));
         }
         if (window.electronAPI?.onCredentialsChanged) {
@@ -2364,7 +2548,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
      *
      * Exists because an opt-in provider can front 300+ models: selecting a family
      * of them one checkbox at a time is not a real option. `ids` is whatever the
-     * list is CURRENTLY showing (filter + Previews applied), so "gpt" → Select all
+     * list is CURRENTLY showing (typed filter applied), so "gpt" → Select all
      * ticks the matches and leaves the other 290 alone.
      *
      * Shares handleToggleModel's normalisation rules exactly — including the
@@ -2590,8 +2774,16 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     const ensureOllamaStartup = async () => {
         setOllamaStatus('checking');
         try {
-            // @ts-ignore
-            const result = await window.electronAPI?.invoke?.('ensure-ollama-running');
+            // electronAPI.ensureOllamaRunning, NOT a generic `invoke`.
+            //
+            // This called `window.electronAPI?.invoke?.('ensure-ollama-running')`
+            // behind a @ts-ignore, and this preload exposes NO generic `invoke`
+            // (the only passthrough, e2eInvoke, is undefined unless
+            // NATIVELY_E2E=1). So the optional call short-circuited, `result`
+            // was always undefined, and the branch below reported 'not-found'
+            // WITHOUT EVER TRYING TO START THE DAEMON. The @ts-ignore is what
+            // let it typecheck.
+            const result = await window.electronAPI?.ensureOllamaRunning?.();
             if (result && result.success) {
                 // It's running (or just started), now fetch models
                 checkOllama(true);
@@ -2658,8 +2850,9 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
     const handleFixOllama = async () => {
         setOllamaStatus('fixing');
         try {
-            // @ts-ignore
-            const result = await window.electronAPI?.invoke?.('force-restart-ollama');
+            // Same defect: forceRestartOllama IS bridged, but reaching it
+            // through the nonexistent generic `invoke` silently did nothing.
+            const result = await window.electronAPI?.forceRestartOllama?.();
             if (result && result.success) {
                 setOllamaRestarted(true);
                 // Wait for server to be ready
@@ -2815,6 +3008,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             if (provider === 'claude') result = await window.electronAPI.setClaudeApiKey(key);
             // @ts-ignore
             if (provider === 'deepseek') result = await window.electronAPI.setDeepseekApiKey(key);
+            if (provider === 'nvidia_nim') result = await window.electronAPI.setNvidiaNimApiKey(key);
 
             if (result && result.success) {
                 setSavedStatus(prev => ({ ...prev, [provider]: true }));
@@ -2887,6 +3081,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         }
     };
 
+
     const handleRemoveKey = (provider: string, setter: (val: string) => void) => {
         setPendingConfirm({ kind: 'providerKey', provider, setter });
     };
@@ -2904,10 +3099,18 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
             if (provider === 'claude') result = await window.electronAPI.setClaudeApiKey('');
             // @ts-ignore
             if (provider === 'deepseek') result = await window.electronAPI.setDeepseekApiKey('');
+            if (provider === 'nvidia_nim') result = await window.electronAPI.setNvidiaNimApiKey('');
 
             if (result && result.success) {
                 setHasStoredKey(prev => ({ ...prev, [provider]: false }));
                 setter('');
+                // NVIDIA's one key backs speech recognition too, so the main
+                // process may have switched the speech provider off. The Audio
+                // tab re-reads on the credentials-changed broadcast and will
+                // show it as off; this only records WHY in the log.
+                if (provider === 'nvidia_nim' && (result as { sttProviderCleared?: boolean }).sttProviderCleared) {
+                    console.log('[Settings] NVIDIA key removed — speech recognition switched off (it shared this key)');
+                }
             }
         } catch (e) {
             console.error(`Failed to remove ${provider} key:`, e);
@@ -3026,12 +3229,20 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                     description: t('The proxy URL, virtual key, and token limit will be cleared. Discovered models will no longer appear in the model picker.'),
                     confirmLabel: t('Remove'),
                 };
-            case 'providerKey':
+            case 'providerKey': {
+                // NVIDIA issues ONE key for both chat and speech, so removing it
+                // here also disables speech recognition if that is what it is
+                // running on. Said before the click, not discovered afterwards.
+                const alsoDisablesSpeech =
+                    pendingConfirm.provider === 'nvidia_nim' && activeSttProvider === 'nvidia_nim';
                 return {
                     title: `${t('Remove the')} ${pendingConfirm.provider} ${t('API key?')}`,
-                    description: t('The stored key is deleted. You will need to paste it again to re-enable this provider.'),
+                    description: alsoDisablesSpeech
+                        ? t('The stored key is deleted. Speech recognition uses this same key, so it will be switched off too — you will need to pick another speech provider under Audio.')
+                        : t('The stored key is deleted. You will need to paste it again to re-enable this provider.'),
                     confirmLabel: t('Remove key'),
                 };
+            }
             case 'customProvider':
                 return {
                     title: t('Delete this custom provider?'),
@@ -3077,6 +3288,7 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
         // in-tab panel switch. `.aip-root`'s own reduced-motion guard (~line 841)
         // already neutralises both.
         <div className="aip-root space-y-5 pb-10" data-theme={theme} data-settings-stagger>
+            <AmbiguousStoresCard />
             {confirmCopy && (
                 <ConfirmDialog
                     open
@@ -3110,6 +3322,48 @@ export const AIProvidersSettings: React.FC<AIProvidersSettingsProps> = ({
                             setDefaultModel(val);
                             // @ts-ignore - persist as default + update runtime + broadcast
                             window.electronAPI?.setDefaultModel(val).catch(console.error);
+                        }}
+                    />
+                </div>
+
+            <div className="aip-card p-5 flex items-center justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                            <label className="block text-xs font-medium uppercase tracking-wide mb-0 aip-hero">{t('Direct Assist')}</label>
+                            <AipBadge tone="info" label={t('Beta')} />
+                        </div>
+                        <p className="text-[10px] aip-muted mt-0.5">
+                            {t('Sends your current typed, spoken, screenshot, and page input straight to the active model without meeting retrieval or answer rewriting.')}
+                        </p>
+                        {directAssistError && (
+                            <p className="text-[10px] aip-danger-fg mt-1" role="alert">{directAssistError}</p>
+                        )}
+                    </div>
+                    <AipSwitch
+                        checked={directAssistEnabled}
+                        disabled={directAssistBusy}
+                        label={t('Direct Assist')}
+                        onChange={async () => {
+                            if (directAssistBusy) return;
+                            const previous = directAssistEnabled;
+                            const next = !previous;
+                            setDirectAssistBusy(true);
+                            setDirectAssistError('');
+                            setDirectAssistEnabled(next);
+                            try {
+                                const result = await window.electronAPI?.setDirectAssistEnabled?.(next);
+                                if (!result?.success) {
+                                    setDirectAssistEnabled(previous);
+                                    setDirectAssistError(result?.error || t('Could not update Direct Assist.'));
+                                }
+                            } catch (error) {
+                                setDirectAssistEnabled(previous);
+                                setDirectAssistError(
+                                    error instanceof Error ? error.message : t('Could not update Direct Assist.'),
+                                );
+                            } finally {
+                                setDirectAssistBusy(false);
+                            }
                         }}
                     />
                 </div>

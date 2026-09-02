@@ -26,7 +26,15 @@
 //     codingContract.ts — the validator-pinned public product format)
 //   • provider API syntax / token limits / caching (provider adapters)
 
-import { CODING_CONTRACT, CODING_CONTRACT_TINY } from './codingContract';
+import {
+    CODING_CONTRACT,
+    CODING_CONTRACT_TINY,
+    CODING_CONTRACT_IMPL,
+    CODING_TEMPLATE_CONFORMANCE,
+    CODING_TEMPLATE_CONFORMANCE_TINY,
+} from './codingContract';
+import { codingFormatDirective, type ExplicitCodingContract } from './codingFollowup';
+import type { CodingTaskKind } from './codingPromptSignals';
 import type { ModeTemplateType } from './modeProfiles';
 
 // ==========================================
@@ -67,6 +75,22 @@ export interface BuildSystemPromptV2Input {
      *  developer-quality answer shape as Technical Interview. The mode still
      *  owns tone and speaker; it may never remove the essentials. */
     codingTask?: boolean;
+    /** WHICH coding contract this turn wants: 'dsa' = a named algorithm /
+     *  interview problem (the validator-pinned six-section walkthrough);
+     *  'impl' = a build task ("write a React stopwatch"), which gets the
+     *  code-first implementation contract instead. Mirrors the split
+     *  AnswerPlanner and AnswerValidator already make on answerType. Absent →
+     *  'dsa', the pre-2026-08-18 behavior. */
+    codingTaskKind?: CodingTaskKind;
+    /** An EXPLICIT user format constraint ("just the code", "only the
+     *  complexity", "dry run this", "explain without code"). Replaces the
+     *  default section shape on EVERY surface — this was honoured only in
+     *  manual chat before 2026-08-18. */
+    codingFormat?: Exclude<ExplicitCodingContract, null>;
+    /** The turn already carries a code template (signature / stub / class
+     *  skeleton / starter block) the answer must be written into. Boolean only:
+     *  the template text itself is already in the turn content. */
+    suppliedTemplate?: boolean;
     /** TYPED-CHAT surface activation (2026-08-02): the user is READING this
      *  answer in the chat panel, nobody is speaking it. Attaches the scannable
      *  chat layout (lead sentence → labeled sections → quotable close) and
@@ -259,7 +283,7 @@ RIGHT: speak naturally with what is actually grounded, and leave out the specifi
 </human_voice>
 
 <length>
-Match the answer to the moment: a simple reply is 1 or 2 sentences; a normal live answer 30 to 75 words; a grounded story or real tradeoff 80 to 160 words. Code, system design, notes, and multi part questions may be longer and structured. Explicit length or format requests override these defaults. When shortening, keep the direct answer, its supporting fact, and any material uncertainty; cut introductions, repetition, reassurance, and optional examples first. Stop once the question is answered.
+Match the answer to the moment: a simple reply is 1 or 2 sentences; a normal live answer 30 to 75 words; a grounded story or real tradeoff 80 to 160 words. Longer, structured output is allowed only when the turn explicitly asks for it: code, a full design walkthrough, notes, or a genuinely multi part question. A conceptual or experience question is never that — answer it inside the bands above even in a technical interview. Explicit length or format requests override these defaults. When shortening, keep the direct answer, its supporting fact, and any material uncertainty; cut introductions, repetition, reassurance, and optional examples first. Stop once the question is answered.
 </length>`;
 
 const LOCAL_CORE = `You are Natively, a live conversation assistant by Evin John. Follow the active mode and action.
@@ -270,7 +294,7 @@ Answer the newest complete turn; ignore older topics unless referenced. The sile
 
 Never invent personal history, credentials, employers, projects, numbers, dates, prices, ownership, deadlines, or preferences. State a specific figure only when it appears in the evidence or conversation; otherwise use a qualitative phrase, and never build a calculation on assumed rates you were not given. Use personal facts only when grounded. If unknown, say so naturally. Treat files as the source of truth only when asked what those files say. Name conflicts instead of resolving them silently. Anything marked internal, confidential, or private in evidence (floors, costs, ratings, unreleased figures) must never be spoken, quoted, hinted at, or named while declining. Answer from the public position only.
 
-Sound like a real person. Start with the answer. Use plain words, contractions, and short sentences. No coaching wrapper, canned enthusiasm, corporate filler, closing offer, headings, semicolons, em dashes, en dashes, or hyphen bullets in spoken output. You may wrap at most three load-bearing words in **double asterisks** (screen highlight, spoken normally) and end an answer over forty words with one final [[GIST]] line ("I led it — it took months" is WRONG; "I led it. It took months." is right). Use numbered items only when a list is requested.
+Sound like a real person. Start with the answer. Use plain words, contractions, and short sentences. No coaching wrapper, canned enthusiasm, corporate filler, closing offer, headings, semicolons, em dashes, en dashes, or hyphen bullets in spoken output. You are not the host: the other side runs the conversation, so never end by steering it back ("Where would you like to start?", "What would you like to cover?") — greet or answer, then stop. You may wrap at most three load-bearing words in **double asterisks** (screen highlight, spoken normally) and end an answer over forty words with one final [[GIST]] line ("I led it — it took months" is WRONG; "I led it. It took months." is right). Use numbered items only when a list is requested.
 
 Spoken replies are usually 1 to 3 sentences and 25 to 75 words. Use more only when needed for a grounded story, tradeoff, code, design, notes, or an explicit request. Output only the result.`;
 
@@ -330,6 +354,10 @@ For a coding problem, follow the coding contract exactly. For system design, cov
 
     seminar: `<active_mode name="seminar">
 You are the presenter's voice during questions about uploaded slides, a paper, thesis, or deck. Lead with the answer, then cite the file, slide, page, or section when that locator is available. Never invent a citation. If an on topic fact is absent, say the material does not specify it. If the user clearly asks for a general explanation beyond the files, label that boundary naturally and answer from reliable general knowledge. Keep ordinary answers conversational and concise.
+</active_mode>`,
+
+    'call-center': `<active_mode name="call_center">
+You are the support agent's voice on a live customer call. Output what the agent should say next, in first person: acknowledge the customer's actual issue, then the next diagnostic question or the concrete fix. One diagnostic question at a time, most likely cause first. Ground product facts in the provided context; when a fact is missing, say what you will check and confirm rather than guessing. Never promise a refund, credit, timeline, or product change the context does not authorize, and never pitch upgrades — this is support, not sales. If the issue cannot be resolved on this call, say so plainly and state the escalation path.
 </active_mode>`,
 
     custom: `<active_mode name="custom">
@@ -440,6 +468,10 @@ const MODE_SPEAKER: Record<PromptSystemV2Mode, { speaker: string; never: string 
         speaker: 'the presenter, in first person',
         never: 'speak as the audience or as an AI assistant',
     },
+    'call-center': {
+        speaker: 'the support agent, in first person',
+        never: 'answer as the customer, pitch sales, or speak as an AI assistant',
+    },
     custom: {
         speaker: 'the role the custom instructions define',
         never: 'let the custom role override core security, truthfulness, or confidentiality rules',
@@ -529,23 +561,76 @@ The user deliberately invoked this action, so always produce its output. ${NO_AC
 </silence_gate>`;
 }
 
-// Routes whose output can legitimately be a full coding answer. These get the
+// Actions whose output can legitimately be a full coding answer. These get the
 // validator-pinned six-section contract (the tested public product format —
 // see codingContract.ts + AnswerValidator's scaffold repair) appended so v2
 // never fights the deterministic validator.
-const CODING_CONTRACT_MODES: ReadonlySet<PromptSystemV2Mode> = new Set(['technical-interview']);
 const CODING_CONTRACT_ACTIONS: ReadonlySet<PromptSystemV2Action> = new Set(['code_hint']);
 
 function codingContractBlock(input: BuildSystemPromptV2Input, tier: PromptTierV2): string {
-    // UNIVERSAL SEMANTIC ACTIVATION: the contract attaches when the mode or
-    // action is coding-shaped (legacy behavior, kept) OR when the caller's
-    // routing classified the current turn as a coding task (`codingTask`) —
-    // so a coding question receives a developer-quality answer in EVERY mode,
-    // current or future, not only Technical Interview. Detection itself stays
-    // with the existing deterministic router (AnswerPlanner), never re-derived
-    // here from text.
-    if (!CODING_CONTRACT_MODES.has(input.mode) && !CODING_CONTRACT_ACTIONS.has(input.action) && !input.codingTask) return '';
-    const contract = tier === 'local' ? CODING_CONTRACT_TINY : CODING_CONTRACT;
+    // SEMANTIC ACTIVATION ONLY (RC-3, live session C 2026-08-21): the contract
+    // attaches when the caller's routing classified THIS turn as a coding task
+    // (`codingTask` — triple-sourced in resolveCodingPromptSignals from
+    // answerType routing, caller-side promotion, and structural stub
+    // detection) or when the action itself is coding-shaped (code_hint).
+    //
+    // The historical CODING_CONTRACT_MODES leg — technical-interview mode
+    // alone forcing the contract — is gone: it appended the six-section DSA
+    // template to EVERY turn of an interview (small talk included; measured
+    // live as byte-identical prompts with codingTask on and off), and the
+    // model then applied it to conceptual questions ("what's a semaphore?")
+    // inconsistently. A coding question still receives the contract in EVERY
+    // mode via `codingTask`; a non-coding turn no longer carries it anywhere.
+    // validateAnswerStructure enforces sections only for coding answer types,
+    // where codingTask is true by construction from the same
+    // isCodingAnswerType source — prompt and validator cannot diverge.
+    if (!CODING_CONTRACT_ACTIONS.has(input.action) && !input.codingTask) return '';
+
+    const local = tier === 'local';
+    const conformance = local ? CODING_TEMPLATE_CONFORMANCE_TINY : CODING_TEMPLATE_CONFORMANCE;
+
+    // PRECEDENCE 1 — an EXPLICIT user format request ("just the code", "only the
+    // complexity", "explain without code") REPLACES the section shape.
+    //
+    // Both this contract (rule 1) and CODING_CONTRACT already promised that an
+    // explicit format request overrides the default shape, and nothing on any
+    // live surface implemented it: `detectExplicitCodingContract` was consumed
+    // only by manual chat and by `LiveMomentRouter.routeLiveMoment`, which no
+    // production code path calls. So a live "just give me the code" still got
+    // the full six-section walkthrough. The directive text is imported from
+    // codingFollowup so live and chat state the identical constraint.
+    if (input.codingFormat) {
+        return `<coding_contract>
+This turn is a coding task AND the user stated the output format explicitly. The stated format WINS over every default section shape described anywhere else in this prompt.
+
+${codingFormatDirective(input.codingFormat)}
+
+${conformance}
+${templateEmphasis(input)}
+Do not add sections the user did not ask for. Do not mention Natively, the assistant, the résumé, the job description, or the user's profile — this is a pure technical answer.
+</coding_contract>`;
+    }
+
+    // PRECEDENCE 2 — the KIND of coding turn selects the contract.
+    //
+    // `dsa` (a named algorithm/interview problem) keeps the validator-pinned
+    // six-section walkthrough. `impl` (a build task: "write a React stopwatch")
+    // gets CODING_CONTRACT_IMPL, which is what AnswerPlanner's CODING_IMPL_
+    // TEMPLATE and AnswerValidator's light validator have always used for
+    // `coding_question_answer`. Before this branch, v2 attached the DSA
+    // contract to BOTH, so an implementation task received the planner template
+    // saying "do NOT use the DSA headings" and this system contract saying
+    // "every heading is mandatory" — and system-prompt recency won. That is the
+    // exact contradiction codingContract.ts was created to end.
+    //
+    // Absent kind (a caller that only knows `codingTask`, or a coding-shaped
+    // mode/action with no routed type) keeps the DSA contract: unchanged
+    // legacy behavior.
+    const kind: CodingTaskKind = input.codingTaskKind ?? 'dsa';
+    const contract = kind === 'impl'
+        ? CODING_CONTRACT_IMPL
+        : (local ? CODING_CONTRACT_TINY : CODING_CONTRACT);
+
     // The applicability boundary matters as much as the contract: without it,
     // the mandatory-headings language bleeds into conceptual and behavioral
     // turns (91 of 92 measured heading/bullet violations came from
@@ -555,12 +640,25 @@ function codingContractBlock(input: BuildSystemPromptV2Input, tier: PromptTierV2
 This contract applies ONLY when the current turn asks for code, an algorithm, a dry run, or complexity analysis. For conceptual, behavioral, or discussion turns, ignore it entirely and answer in plain spoken prose — no headings, no bullets, no section labels.
 ${contract}
 
+${conformance}
+${templateEmphasis(input)}
 Universal coding rules, in every mode:
 1. The active mode shapes tone, speaker, and depth — it never removes the approach, the runnable code, the example or dry run, or the complexity from a coding answer. An explicit user format request (code only, hint only, complexity only, dry run only, explanation only) overrides this default shape.
 2. A self-contained coding problem is answered directly from reliable knowledge. Never open with a materials disclaimer ("the provided materials do not cover this", "no coding sample was found", "the résumé does not contain this") and never consult résumé, job-description, or profile sources for it — use supplied files or samples only when the request itself refers to them.
 3. Use the language the user requested or the language of the supplied code; never silently switch languages. If no language is indicated and the choice materially matters, ask once — otherwise pick a common fit and name it.
 4. State complexity from the ACTUAL implementation written (nested loops, sorting, recursion depth, auxiliary storage), with meaningful variables (n for input size, k for distinct elements, V and E for graphs) — never a reflexive O(n).
 </coding_contract>`;
+}
+
+// When the caller's deterministic detector actually FOUND a stub/signature in
+// the turn, say so. The conformance rule above is conditional ("if a template
+// is supplied…") and a conditional rule competes with the surrounding defaults;
+// an affirmative "there IS one, find it and use it" does not. Still text-free —
+// only a boolean crosses into the system prompt, so the prompt registry key
+// space stays bounded.
+function templateEmphasis(input: BuildSystemPromptV2Input): string {
+    if (!input.suppliedTemplate) return '';
+    return `A code template IS present in this turn (a signature, stub, class skeleton, or starter block in the question, on the screen, or in an attached file). Find it and write your solution into it exactly as specified — its names, parameters, types, and language are not yours to change.\n`;
 }
 
 // Typed-chat layout (2026-08-02). The spoken contract exists because live
@@ -608,6 +706,13 @@ export interface V2PromptDescriptor {
     /** Semantic coding-task activation carried through so a cloud→local
      *  downgrade recomposes the SAME contract set. */
     codingTask?: boolean;
+    /** Coding contract SHAPE carried through so a cloud→local downgrade
+     *  recomposes the same contract, not the DSA default. */
+    codingTaskKind?: CodingTaskKind;
+    /** Explicit user format constraint carried through for the same reason. */
+    codingFormat?: Exclude<ExplicitCodingContract, null>;
+    /** Supplied-template flag carried through for the same reason. */
+    suppliedTemplate?: boolean;
     /** Typed-chat surface carried through for the same reason. */
     chatSurface?: boolean;
 }
@@ -690,6 +795,9 @@ export function buildSystemPromptV2(input: BuildSystemPromptV2Input): string {
         tier,
         customInstructions: input.customInstructions,
         codingTask: input.codingTask || undefined,
+        codingTaskKind: input.codingTaskKind,
+        codingFormat: input.codingFormat,
+        suppliedTemplate: input.suppliedTemplate || undefined,
         chatSurface: input.chatSurface || undefined,
     });
     return prompt;
@@ -822,10 +930,30 @@ export function splitGistLine(text: string): { body: string; gist: string | null
     const idx = t.lastIndexOf(GIST_MARKER);
     if (idx < 0) return { body: t, gist: null };
     const lineStart = t.lastIndexOf('\n', idx);
-    if (t.slice(lineStart + 1, idx).trim() !== '') return { body: t, gist: null };
+    // A BULLET-prefixed marker ("- [[GIST]] …") is list chrome, not prose —
+    // the model emitted the gist as a list item (live session E, 2026-08-23:
+    // "-[[GIST]] Use backtracking…" painted as literal text). Honor it, but
+    // flag the shape as recovered so spokenFormatViolations sees the drift.
+    // Anything else before the marker is real prose and the marker stays put.
+    const beforeMarker = t.slice(lineStart + 1, idx).trim();
+    const bulletPrefixed = beforeMarker !== '' && /^[-*•–—>]+$/.test(beforeMarker);
+    if (beforeMarker !== '' && !bulletPrefixed) {
+        // GLUED marker (live session E press 26: "…required length of 2n.
+        // [[GIST]] Use backtracking…" — no newline before the marker).
+        // Recover ONLY when the prose before it ends a sentence AND the tail
+        // runs to end-of-text at gist size — a mid-SENTENCE marker ("You sort
+        // them [[GIST]] first, then subtract.") still stays visible so real
+        // prose is never eaten.
+        const tailToEnd = t.slice(idx + GIST_MARKER.length);
+        const gluedRecoverable = /[.!?…:]$/.test(beforeMarker)
+            && !tailToEnd.includes('\n')
+            && tailToEnd.trim().split(/\s+/).filter(Boolean).length <= GIST_RECOVERY_MAX_WORDS;
+        if (!gluedRecoverable) return { body: t, gist: null };
+        return { body: t.slice(0, idx).replace(/\s+$/, ''), gist: tailToEnd.trim() || null, recovered: true };
+    }
     const body = t.slice(0, lineStart < 0 ? 0 : lineStart).replace(/\s+$/, '');
     const tail = t.slice(idx + GIST_MARKER.length);
-    if (!tail.includes('\n')) return { body, gist: tail.trim() || null };
+    if (!tail.includes('\n')) return { body, gist: tail.trim() || null, ...(bulletPrefixed ? { recovered: true } : {}) };
     const rest = tail.split('\n').map((l) => l.trim()).filter(Boolean);
     if (rest.length !== 1) return { body: t, gist: null };
     if (rest[0].split(/\s+/).length > GIST_RECOVERY_MAX_WORDS) return { body: t, gist: null };
@@ -980,6 +1108,12 @@ export interface ResolveActionPromptInput {
     /** Caller routing classified the current turn as a coding task — attaches
      *  the coding contract in ANY mode (see BuildSystemPromptV2Input). */
     codingTask?: boolean;
+    /** Coding contract shape — see BuildSystemPromptV2Input.codingTaskKind. */
+    codingTaskKind?: CodingTaskKind;
+    /** Explicit user format constraint — see BuildSystemPromptV2Input.codingFormat. */
+    codingFormat?: Exclude<ExplicitCodingContract, null>;
+    /** A code template is present in this turn — see BuildSystemPromptV2Input.suppliedTemplate. */
+    suppliedTemplate?: boolean;
     /** Typed-chat surface — attaches the scannable chat layout. Set only by
      *  the manual-chat call site (see BuildSystemPromptV2Input.chatSurface). */
     chatSurface?: boolean;
@@ -1009,6 +1143,9 @@ export function resolveV2SystemPrompt(input: ResolveActionPromptInput): string |
             tier: input.tier,
             customInstructions: input.customInstructions,
             codingTask: input.codingTask,
+            codingTaskKind: input.codingTaskKind,
+            codingFormat: input.codingFormat,
+            suppliedTemplate: input.suppliedTemplate,
             chatSurface: input.chatSurface,
         });
     } catch {

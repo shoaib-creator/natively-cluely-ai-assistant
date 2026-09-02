@@ -12,7 +12,7 @@ export declare class MicrophoneCapture {
    * diagnostics and HFP/Bluetooth-degradation detection only.
    */
   getNativeSampleRate(): number
-  start(callback: ((err: Error | null, arg: Buffer) => any), onSpeechEnded?: (((err: Error | null, arg: boolean) => any)) | undefined | null): void
+  start(callback: ((err: Error | null, arg: Buffer) => any), onSpeechEnded?: (((err: Error | null, arg: boolean) => any)) | undefined | null, onSpeechEdge?: (((err: Error | null, arg: SpeechEdgeEvent) => any)) | undefined | null): void
   stop(): void
 }
 
@@ -30,7 +30,7 @@ export declare class StealthKeyboardTap {
    *
    * Idempotent: repeated `start()` calls while active are no-ops.
    */
-  start(callback: ((err: Error | null, arg: CapturedKey) => any), overlayBounds?: OverlayBoundsInput | undefined | null): boolean
+  start(callback: ((err: Error | null, arg: CapturedKey) => any), appChords: Array<AppChordInput>, shortcutOnly: boolean, overlayBounds?: OverlayBoundsInput | undefined | null): boolean
   /**
    * Push fresh overlay bounds into the live tap. Required when the
    * OS window moves or resizes mid-session: without this, the start()
@@ -69,8 +69,22 @@ export declare class SystemAudioCapture {
    * HFP/Bluetooth-degradation detection only. NOT the rate of emitted bytes.
    */
   getNativeSampleRate(): number
-  start(callback: ((err: Error | null, arg: Buffer) => any), onSpeechEnded?: (((err: Error | null, arg: boolean) => any)) | undefined | null): void
+  start(callback: ((err: Error | null, arg: Buffer) => any), onSpeechEnded?: (((err: Error | null, arg: boolean) => any)) | undefined | null, onSpeechEdge?: (((err: Error | null, arg: SpeechEdgeEvent) => any)) | undefined | null): void
   stop(): void
+}
+
+/**
+ * napi input mirror of `AppChord`, passed from JS into `start()`. Defined here
+ * (unconditionally compiled) so BOTH the macOS `keyboard_tap` and the Windows
+ * `keyboard_hook_windows` modules — which each expose the identical
+ * `StealthKeyboardTap.start` surface — can reference one napi object with a
+ * single generated TS type. `vk`/`mods` come from
+ * `electron/services/winChord.ts` (which owns the accelerator→VK translation).
+ */
+export interface AppChordInput {
+  vk: number
+  mods: number
+  id: string
 }
 
 /**
@@ -124,6 +138,13 @@ export interface CapturedKey {
   isKeyDown: boolean
   /** True for a pass-through mouse down outside the overlay bounds. */
   isOutsideMouseDown: boolean
+  /**
+   * Non-empty ⟹ an app hotkey chord fired (Windows hook only). Always empty
+   * on macOS, where the app's shortcuts are consumed by Carbon/IOKit before
+   * the tap; present here only to keep the CapturedKey napi shape identical
+   * across platforms.
+   */
+  appChordId: string
 }
 
 /**
@@ -172,6 +193,24 @@ export interface OverlayBoundsInput {
   y: number
   width: number
   height: number
+}
+
+/**
+ * One joint-state transition from the dual-channel tracker
+ * (`channel_state.rs`), delivered to JS through the optional third `start()`
+ * callback of both captures. `atMs` is epoch ms (Date.now() timeline).
+ */
+export interface SpeechEdgeEvent {
+  /** "interviewer" | "user" */
+  channel: string
+  speaking: boolean
+  /** "neither" | "interviewer_speaking" | "user_speaking" | "both" */
+  joint: string
+  atMs: number
+  /** ms since the OTHER channel's last edge; -1 when it has none yet. */
+  msSinceOtherEdge: number
+  /** false on Windows (mic is RMS-only, PR #497): user edges are weak evidence. */
+  userEdgesVadBacked: boolean
 }
 
 /**

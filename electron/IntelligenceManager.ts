@@ -20,7 +20,7 @@ export type { TranscriptSegment, SuggestionTrigger, ContextItem } from './Sessio
 export type { IntelligenceMode, IntelligenceModeEvents } from './IntelligenceEngine';
 export type { DynamicAction } from './services/dynamic-actions/DynamicAction';
 
-export const GEMINI_FLASH_MODEL = "gemini-3.6-flash";
+export const GEMINI_FLASH_MODEL = "gemini-3.7-flash";
 export const GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite";
 
 /**
@@ -70,6 +70,9 @@ export class IntelligenceManager extends EventEmitter {
     private forwardEngineEvents(): void {
         const events = [
             'assist_update', 'suggested_answer', 'suggested_answer_token', 'suggested_answer_discard',
+            // Planner declined to answer a trigger (cooldown dedup) — forwarded so
+            // a skip is observable rather than silent.
+            'suggestion_skipped',
             // Verified code execution (background): ✓ badge + corrected message.
             'code_verified', 'code_correction',
             'refined_answer', 'refined_answer_token',
@@ -157,6 +160,23 @@ export class IntelligenceManager extends EventEmitter {
         this.session.logUsage(type, question, answer);
     }
 
+    /**
+     * Raw usage-entry passthrough, for callers that must set fields `logUsage`
+     * does not expose — today only `synthetic`, which excludes an entry from
+     * `SessionTracker.getRecentManualTurn` (and therefore from
+     * `buildRecentManualContext`'s prompt injection) while still persisting it
+     * to the Meeting Notes usage panel.
+     *
+     * Added 2026-08-14: a truncated manual-chat turn needs exactly that split —
+     * the call was made and must be billed/shown, but its partial answer must
+     * never be replayed into the next prompt as context. Without this proxy the
+     * call site's `im?.pushUsage?.(…)` optional-chained into a silent no-op and
+     * dropped the usage row altogether.
+     */
+    pushUsage(entry: any): void {
+        this.session.pushUsage(entry);
+    }
+
     // ============================================
     // Transcript Handling (delegates to engine)
     // ============================================
@@ -168,6 +188,66 @@ export class IntelligenceManager extends EventEmitter {
     async handleSuggestionTrigger(trigger: import('./SessionTracker').SuggestionTrigger): Promise<void> {
         return this.engine.handleSuggestionTrigger(trigger);
     }
+
+    /** Mode + cooldown gate for the Auto Answer trigger. See IntelligenceEngine.canAutoAnswer. */
+    canAutoAnswer(): boolean {
+        return this.engine.canAutoAnswer();
+    }
+
+    /** Barge-in: abort the streaming AUTOMATIC answer only. See IntelligenceEngine.cancelAutomaticAnswer. */
+    cancelAutomaticAnswer(reason: 'user_barge_in'): boolean {
+        return this.engine.cancelAutomaticAnswer(reason);
+    }
+
+    /** Auto Answer V3 offer card: register an externally built action so accept/dismiss IPC resolves it. */
+    registerDynamicAction(action: import('./services/dynamic-actions/DynamicAction').DynamicAction): void {
+        this.engine.registerDynamicAction(action);
+    }
+
+    // ── Auto Answer V3 narrow APIs (V2 §43) ──
+    isManualAnswerActive(): boolean { return this.engine.isManualAnswerActive(); }
+    /** A What-to-Answer stream is live (any kind: manual, automatic, speculative). */
+    isAnswerStreaming(): boolean { return this.engine.isAnswerStreaming(); }
+    noteAutoAnswerCandidate(questionId: string, candidateGeneration: number): void {
+        this.engine.noteAutoAnswerCandidate(questionId, candidateGeneration);
+    }
+    getSpeculativeSnapshot(): { questionId: string | null; text: string | null } {
+        return this.engine.getSpeculativeSnapshot();
+    }
+    /**
+     * Start the answer while the judge is still deciding.
+     *
+     * This delegation was missing from the moment the prefetch landed
+     * (0d5bf7fb): main.ts called it on the MANAGER while it only ever existed
+     * on the ENGINE, so every call threw `is not a function` straight into the
+     * defensive catch in SimpleAutoAnswer.maybePrefetch — which is exactly the
+     * kind of "optimisation is never allowed to break the pipeline" guard that
+     * turns a hard failure into a silent one. The feature has therefore never
+     * run: no `Auto Answer prefetch fired` line appears in any captured log.
+     */
+    prefetchAutoAnswer(questionId: string, text: string): void {
+        this.engine.prefetchAutoAnswer(questionId, text);
+    }
+    runAutoAnswer(
+        question: Parameters<IntelligenceEngine['runAutoAnswer']>[0],
+        options: { reuseSpeculative: boolean },
+    ): Promise<void> {
+        return this.engine.runAutoAnswer(question, { ...options, context: this.getFormattedContext(120) });
+    }
+    /**
+     * The ONE canonical live read surface (V2 §11/§27). Lazily built over the
+     * manager's session with the deterministic extractor; the session instance
+     * is stable for the manager's lifetime.
+     */
+    getLiveTranscriptBrain(): import('./intelligence/LiveTranscriptBrain').LiveTranscriptBrain {
+        if (!this.liveTranscriptBrain) {
+            const { LiveTranscriptBrain } = require('./intelligence/LiveTranscriptBrain') as typeof import('./intelligence/LiveTranscriptBrain');
+            const { extractLatestQuestion } = require('./llm/transcriptQuestionExtractor') as typeof import('./llm/transcriptQuestionExtractor');
+            this.liveTranscriptBrain = new LiveTranscriptBrain(this.session as any, extractLatestQuestion as any);
+        }
+        return this.liveTranscriptBrain;
+    }
+    private liveTranscriptBrain: import('./intelligence/LiveTranscriptBrain').LiveTranscriptBrain | null = null;
 
     // ============================================
     // Mode Executors (delegates to engine)

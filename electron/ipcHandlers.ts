@@ -2,6 +2,7 @@
 
 import * as crypto from 'crypto';
 import { app, BrowserWindow, dialog, desktopCapturer, ipcMain, shell, systemPreferences } from 'electron';
+import { micSettingsUri } from '../src/lib/micPermissionPolicy.mjs';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,7 +24,9 @@ import { DEFAULT_BUILTIN_SKILL_IDS, type SkillUploadPayload } from './services/s
 
 import { TRIAL_SENTINEL_KEY, DOM_CONTEXT_MAX_CHARS } from './config/constants';
 import { AI_RESPONSE_LANGUAGES, RECOGNITION_LANGUAGES } from './config/languages';
-import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, isRefinementFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, acceptRepairedAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError, detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode, CODING_VERIFICATION_INSTRUCTION, humanizeDirectiveFor, detectCorporateFiller, humanizeForAnswerType, applySpeakabilityBudget, compressTechnicalConcept, checkCodeCompleteness, varySpokenOpening, type ExplicitCodingContract, type AnswerType } from './llm';
+import { resolveCodingPromptSignals } from './llm/codingPromptSignals';
+import { isBareCodeRequest, looksLikeCodingAnswer, buildPriorCodingContextBlock as buildPriorCodingBlockForV3 } from './llm/codingFollowup';
+import { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, validateAnswerStructure, validateProfileOutput, validateProfileEvidence, buildProfileRepairInstruction, raceStreamWithDeadline, firstUsefulDeadlineMs, LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, CODING_REGEN_ABORT_CHARS, isStealthEvasionQuestion, stripProfileTokensFromCoding, isBareFollowUp, isRefinementFollowUp, buildContextFreeClarification, sanitizeCandidateAnswer, acceptRepairedAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES, piTelemetry, classifyProviderError, detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode, CODING_VERIFICATION_INSTRUCTION, humanizeDirectiveFor, detectCorporateFiller, humanizeForAnswerType, applySpeakabilityBudget, compressTechnicalConcept, checkCodeCompleteness, varySpokenOpening, type ExplicitCodingContract, type AnswerType } from './llm';
 import { stripPriorAssistantTurns } from './llm/conversationHistoryPolicy';
 import { mintTurnId } from './llm/turnIdentity';
 import type { StreamRouteOptions } from './llm/streamContextPolicy';
@@ -48,7 +51,10 @@ import { CHAT_MODE_PROMPT } from './llm/prompts';
 // byte-for-byte the legacy behavior.
 function resolveManualChatBasePrompt(
   llmHelper?: { getPromptTier?: () => string } | null,
-  opts?: { codingTask?: boolean },
+  // Accepts the full CodingPromptSignals shape so every chat call site can hand
+  // over the resolver's output verbatim — contract shape, explicit format, and
+  // supplied template — instead of degrading it to a bare boolean.
+  opts?: import('./llm/codingPromptSignals').CodingPromptSignals,
 ): string {
   try {
     const { resolveV2SystemPrompt, v2TierForPromptTier } = require('./llm/promptSystemV2');
@@ -58,6 +64,9 @@ function resolveManualChatBasePrompt(
       // Semantic coding activation: a coding turn gets the coding contract in
       // ANY mode (universal coding-answer contract, 2026-08-02).
       codingTask: opts?.codingTask,
+      codingTaskKind: opts?.codingTaskKind,
+      codingFormat: opts?.codingFormat,
+      suppliedTemplate: opts?.suppliedTemplate,
       // This is the TYPED chat panel — the one surface where the user reads
       // the answer instead of speaking it. Attaches the scannable chat layout
       // (lead sentence → labeled sections → quotable close); every live and
@@ -76,6 +85,67 @@ import { detectIncompleteNumericAnswer, completenessRegenFabricates, isDocGround
 // to carry its own copy, which had already drifted and was erasing an enforced
 // scope on every write.
 import { mergeProviderDataScopes } from './llm/ProviderRouter';
+import {
+  DirectAssistService,
+  buildDirectAssistReferenceContext,
+  type DirectAssistRequestInput,
+  type DirectAssistStreamEvent,
+} from './direct-assist';
+
+type DirectAssistSource = 'typed' | 'stt' | 'screenshot';
+
+interface DirectAssistRendererRequest {
+  requestId: string;
+  source: DirectAssistSource;
+  currentRequest: string;
+  skillId?: string;
+  manualContext?: string;
+  referenceContext?: string;
+  pageContext?: {
+    dom?: string;
+    ocr?: string;
+    url?: string;
+    title?: string;
+  } | null;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  transcript?: string;
+  imagePaths?: string[];
+  requestedLanguage?: string;
+  requestedFormat?: string;
+  maxContextChars?: number;
+}
+
+interface DirectAssistIpcError {
+  code: string;
+  message: string;
+  retryable: boolean;
+}
+
+const DIRECT_ASSIST_REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DIRECT_ASSIST_MAX_CURRENT_REQUEST_CHARS = 100_000;
+const DIRECT_ASSIST_MAX_CONTEXT_FIELD_CHARS = 200_000;
+const DIRECT_ASSIST_MAX_HISTORY_TURNS = 64;
+const DIRECT_ASSIST_MAX_IMAGES = 5;
+const DIRECT_ASSIST_MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const DIRECT_ASSIST_IMAGE_MIMES: Readonly<Record<string, string>> = Object.freeze({
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+});
+
+/**
+ * Both arguments must already be canonical real paths. `path.relative` uses
+ * the host platform's path rules, including case-insensitive root comparison
+ * on Windows. An alternate drive/UNC root remains absolute and is rejected.
+ */
+function isDirectAssistCanonicalPathInsideRoot(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+}
 
 // Generic tokens excluded when splitting OKF entity names / card titles into
 // distinctive words for the document-grounded false-refusal gate (2026-07-02).
@@ -144,14 +214,20 @@ export function initializeIpcHandlers(appState: AppState): void {
       } catch { /* optional */ }
 
       const has = (value?: string) => !!(value && value.trim().length > 0);
-      const isKnownGroqModel = (modelId: string): boolean => {
-        return modelId.startsWith('llama-')
-          || modelId.startsWith('mixtral-')
-          || modelId.startsWith('gemma-')
-          || modelId.startsWith('meta-llama/')
-          || modelId.startsWith('qwen/')
-          || modelId.startsWith('openai/gpt-oss-'); // Groq-hosted OpenAI OSS models, not OpenAI API models.
-      };
+      // THE shared predicate (groqModels.ts) — the three hand-synced copies
+      // had drifted (code-review 2026-08-23).
+      const { isGroqModelId: isKnownGroqModel, isRetiredModelId: _isRetiredGroqId } =
+        require('./llm/groqModels') as typeof import('./llm/groqModels');
+      // Same hazard, different vendor: an NVIDIA key makes ANY nvidia_nim/ id
+      // "available" (see modelAvailable below), so a default persisted from an
+      // earlier build — the picker offered meta/llama-3.1-8b-instruct and
+      // z-ai/glm4.7, both since retired — passed the availability check and
+      // 410'd on every call. Repair it the same way.
+      const { isNvidiaNimRetiredModelId } =
+        require('./llm/nvidiaNimModels') as typeof import('./llm/nvidiaNimModels');
+      const isRetiredId = (modelId: string): boolean =>
+        _isRetiredGroqId(modelId) ||
+        (!!modelId && modelId.startsWith('nvidia_nim/') && isNvidiaNimRetiredModelId(modelId));
       // Which provider a model id belongs to. Mirrors the family checks below, kept
       // as one helper so the disabled-provider test and the credential test can
       // never disagree about what a given id is. The renderer's
@@ -160,6 +236,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (modelId === 'natively') return 'natively';
         if (modelId.startsWith('codex-cli')) return 'codex-cli';
         if (modelId.startsWith('litellm/')) return 'litellm';
+        if (modelId.startsWith('nvidia_nim/')) return 'nvidia_nim';
         if (modelId.startsWith('ollama-')) return 'ollama';
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return 'gemini';
         if (isKnownGroqModel(modelId)) return 'groq';
@@ -211,6 +288,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (modelId === 'natively') return has(cm.getNativelyApiKey());
         if (modelId.startsWith('codex-cli')) return codexConfig.enabled === true && codexSignedIn;
         if (modelId.startsWith('litellm/')) return has(cm.getLitellmBaseURL());
+        if (modelId.startsWith('nvidia_nim/')) return has(cm.getNvidiaNimApiKey());
         if (modelId.startsWith('ollama-')) return true; // live Ollama probe happens at execution time
         if (allProviders.some((p: any) => p?.id === modelId)) return true;
         if (modelId.startsWith('gemini-') || modelId.startsWith('models/')) return has(cm.getGeminiApiKey());
@@ -226,7 +304,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         return true;
       };
 
-      if (modelAvailable(defaultModel)) return null;
+      // RETIRED-DEFAULT REPAIR (code-review 2026-08-23): a Groq key makes any
+      // Groq-prefixed id "available", so a persisted default that Groq has
+      // SHUT DOWN (llama-3.3-70b-versatile, scout — the auto-installed
+      // defaults of earlier builds) passed the availability check and 404'd
+      // forever; groqFallbackFor deliberately refuses off-ladder ids, so the
+      // runtime ladder couldn't heal it either. A retired id is never
+      // available, whatever keys exist — fall through to the repair logic.
+      if (!isRetiredId(defaultModel) && modelAvailable(defaultModel)) return null;
 
       let litellmFallbackModel: string | null = null;
       if (has(cm.getLitellmBaseURL())) {
@@ -255,10 +340,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       // so a provider the user switched off (or a model they filtered out) is never
       // installed as the fallback.
       const next = modelAvailable('natively') ? 'natively'
-        : modelAvailable('gemini-3.6-flash') ? 'gemini-3.6-flash'
+        : modelAvailable('gemini-3.7-flash') ? 'gemini-3.7-flash'
         : modelAvailable('gpt-5.4') ? 'gpt-5.4'
         : modelAvailable('claude-sonnet-4-6') ? 'claude-sonnet-4-6'
-        : modelAvailable('llama-3.3-70b-versatile') ? 'llama-3.3-70b-versatile'
+        : modelAvailable('qwen/qwen3.6-27b') ? 'qwen/qwen3.6-27b'
         : modelAvailable('deepseek-v4-flash') ? 'deepseek-v4-flash'
         : (codexConfig.enabled === true && codexSignedIn && modelAvailable('codex-cli')) ? 'codex-cli'
         : (litellmFallbackModel && modelAvailable(litellmFallbackModel)) ? litellmFallbackModel
@@ -273,7 +358,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       }
       cm.setDefaultModel(next);
       llmHelper.setModel(next, allProviders);
-      appState.broadcast('model-changed', next);
+      // Same two listeners as every other model change. Converted alongside the
+      // rest rather than left as the one surviving broadcast — an untargeted
+      // straggler is how this class of fix keeps coming back.
+      appState.sendModelChanged(next);
       return next;
     } catch (error: any) {
       console.warn('[IPC] default model availability refresh failed:', error?.message || error);
@@ -568,15 +656,19 @@ export function initializeIpcHandlers(appState: AppState): void {
     },
   );
 
-  // X-anchored variant: the window's X origin never moves. The overlay window
-  // is a FIXED WIDTH (WindowHelper.OVERLAY_DEFAULT_WIDTH = 732) and the
-  // renderer always reports that width, so in practice this is a pure
-  // height-only, top-anchored resize. Channel name is historical (it used to
-  // keep the center fixed across width changes).
+  // X-anchored variant: the window's X origin never moves. The renderer reports
+  // the WINDOW width (which only changes when the user drags a resize handle),
+  // so during an expand/collapse animation this is a pure height-only,
+  // top-anchored resize. Channel name is historical (it used to keep the center
+  // fixed across width changes).
+  //
+  // RESOLVES with the size actually applied after the main-process clamp, so
+  // the renderer can adopt it instead of drifting from the real window. See
+  // WindowHelper.setOverlayDimensionsAnchored.
   safeHandle(
     'update-content-dimensions-centered',
     async (event, { width, height }: { width: number; height: number }) => {
-      if (!width || !height) return;
+      if (!width || !height) return undefined;
       const senderWebContents = event.sender;
       const overlayWin = appState.getWindowHelper().getOverlayWindow();
       if (
@@ -584,8 +676,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         !overlayWin.isDestroyed() &&
         overlayWin.webContents.id === senderWebContents.id
       ) {
-        appState.getWindowHelper().setOverlayDimensionsAnchored(width, height);
+        return appState.getWindowHelper().setOverlayDimensionsAnchored(width, height);
       }
+      return undefined;
     },
   );
 
@@ -689,11 +782,11 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.getWindowHelper().isOverlayGroupDragManaged(),
   );
 
-  // (Removed) 'animate-overlay-width' — the overlay window is a FIXED WIDTH
-  // (WindowHelper.OVERLAY_DEFAULT_WIDTH = 732) and is NEVER width-resized.
-  // The expand/contract animation is CSS-only in the renderer (the panel
-  // tweens 600↔732 centered inside the fixed window), so every
-  // 'update-content-dimensions-centered' report is height-only — a
+  // (Removed) 'animate-overlay-width' — the overlay window's width changes ONLY
+  // on an explicit user resize, never as part of the expand/contract animation.
+  // That animation is CSS-only in the renderer (the panel tweens
+  // collapsed↔expanded centered inside the window), so every
+  // 'update-content-dimensions-centered' report during it is height-only — a
   // top-anchored resize that does not move X. No sideways jump, no per-frame
   // transparent-window re-raster. See NativelyInterface.startTransition.
 
@@ -993,6 +1086,75 @@ export function initializeIpcHandlers(appState: AppState): void {
         myController = new AbortController();
         _chatStreamsBySender.set(senderId, { streamId: myStreamId, controller: myController });
 
+        // Skill invocation parsed EARLY (PR #429 Bug 003). It used to live ~35k
+        // characters below, after the Context Intelligence V3 short-circuit had
+        // already returned — so under V3 (default ON since 2026-07-30) the
+        // `/skill-name` prefix reached the model as literal text and the skill
+        // instructions were never injected anywhere.
+        //
+        // Only the PARSE moved. `message` itself is still mutated at the original
+        // boundary below, so every existing reader in between is untouched.
+        let skillStrippedMessage: string | null = null;
+        // Skill invocation: /skill-name or $skill-name prefix (issue #303).
+        // Strip the prefix from message before planAnswer so routing sees the
+        // bare user query, then inject the skill's instructions into context
+        // right before streamChat so the model follows them for this turn only.
+        let skillPromptBlock = '';
+        const skillPrefixMatch = typeof message === 'string'
+          ? message.match(/^[/$]([A-Za-z0-9_-]+)\s*(.*)$/s)
+          : null;
+        // Defensive: strip any embedded <answer_contract>...</answer_contract>
+        // block from the user-visible message. See stripEmbeddedAnswerContract
+        // for the contract-block leak rationale (grounding campaign H4, 2026-07-18).
+        // MEDIUM #2: placed at the planAnswer boundary so upstream routing
+        // (skill dispatch, identity probe, source-switch resolution) sees the
+        // user's literal input — error logs and unmatched-skill fallbacks
+        // report the original message, not a stripped variant.
+        if (skillPrefixMatch) {
+          try {
+            const candidateId = skillPrefixMatch[1];
+            const skill = SkillsManager.getInstance().getSkill(candidateId);
+            if (skill) {
+              // Disabled skills still resolve by name but must NOT inject their
+              // instructions into the prompt — the user turned them off in
+              // Settings → Skills. Surface a clear error rather than silently
+              // proceeding (which would invoke the skill anyway).
+              if (skill.enabled === false) {
+                event.sender.send(
+                  'gemini-stream-error',
+                  `Skill "/${skill.id}" is disabled. Enable it in Settings → Skills.`,
+                  { streamId: myStreamId },
+                );
+                return null;  // sibling error paths return null; handler is typed `| null`
+              }
+              skillPromptBlock = SkillsManager.getInstance().buildPromptBlock(skill);
+              const strippedQuery = skillPrefixMatch[2].trim();
+              // Parsed here, APPLIED later (see the deferred assignment at the
+              // original site). Mutating `message` now would change what every
+              // reader between here and there sees — the identity probe, the
+              // source-switch resolution and the error logs all expect the
+              // user's literal input.
+              skillStrippedMessage = strippedQuery || `Please help me with the ${skill.name} skill.`;
+              console.log(`[IPC] Skill activated: ${skill.id}`);
+            } else {
+              const allSkills = SkillsManager.getInstance().listSkills();
+              const available = allSkills.length
+                ? allSkills.map(s => `/${s.id}`).join(', ')
+                : 'none registered';
+              event.sender.send(
+                'gemini-stream-error',
+                `Skill "/${candidateId}" not found. Available: ${available}`,
+                { streamId: myStreamId },
+              );
+              return null;  // sibling error paths return null; handler is typed `| null`
+            }
+          } catch (skillErr: any) {
+            console.warn('[IPC] Skill lookup failed:', skillErr?.message || skillErr);
+            event.sender.send('gemini-stream-error', `Skill lookup failed: ${skillErr?.message || 'unknown error'}`, { streamId: myStreamId });
+            return null;  // sibling error paths return null; handler is typed `| null`
+          }
+        }
+
         // ── CONTEXT INTELLIGENCE V3 — wired manual-chat surface ──────────────
         //
         // Deliberately a SHORT-CIRCUIT, not an interleave. The legacy assembly
@@ -1155,10 +1317,19 @@ export function initializeIpcHandlers(appState: AppState): void {
             // block previously carried its own copy of all of that — two copies
             // of a security-relevant construction is how the tokenizer copies
             // drifted (§2 of the architecture review).
+            // The skill prefix is stripped for V3 too — otherwise the model reads
+            // a literal "/humanize " at the head of the question (PR #429 Bug 003).
+            const v3Question = String((skillStrippedMessage ?? message) || '');
             const composed = await buildV3Prompt({
               surface: 'manual-chat',
               pathTag: 'ipc',
-              question: String(message || ''),
+              question: v3Question,
+              // PR #429 Bug 002: omitted entirely, so it defaulted to false even
+              // when the user attached screenshots — the V3 classifier then never
+              // added SCREEN_SPECIFIC / SCREEN_FACT and the image was not treated
+              // as authoritative evidence. Manual chat has no periodic-capture OCR
+              // object at all, so imagePaths is the only screen signal here.
+              hasScreenContext: (imagePaths?.length ?? 0) > 0,
               // Routed coding verdict, same as the WTA path (see
               // BridgeInput.codingTask). Without it the bridge falls back to its
               // keyword regex, which misses ordinary phrasings like "Write a BFS
@@ -1170,7 +1341,7 @@ export function initializeIpcHandlers(appState: AppState): void {
               codingTask: (() => {
                 try {
                   return isCodingAnswerType(planAnswer({
-                    question: String(message || ''),
+                    question: v3Question,
                     source: 'manual_input',
                     speakerPerspective: 'user',
                     activeMode: modeInfo ?? undefined,
@@ -1214,13 +1385,99 @@ export function initializeIpcHandlers(appState: AppState): void {
               // Mirrors BridgeInput.personaBase in engine-bridge.ts.
               personaBase: ({ codingTask }: { codingTask: boolean }) => {
                 const { resolveV2SystemPrompt, v2TierForPromptTier } = require('./llm/promptSystemV2');
-                return resolveV2SystemPrompt({
+                // BARE CODE REQUEST on the V3 path. The legacy handler's
+                // prior-problem recall lives ~500 lines below and this path
+                // `return null`s long before reaching it, so on the DEFAULT
+                // surface a bare "code?" arrived with no problem attached.
+                // Measured live twice: once it answered a different problem
+                // (binary search) with full confidence, once it replied "please
+                // provide the problem description". Same cause, both times.
+                //
+                // The answer the user is looking at is the subject. It rides the
+                // SYSTEM channel, like the legacy path's own contract block, so
+                // no evidence-scope filter can drop it.
+                // Extended 2026-08-19 from bare-code-only to EVERY coding
+                // continuation ("what's the complexity", "make it iterative",
+                // "dry run it"): after an overlay answer those had no prior
+                // problem either — only the bare-code case was bridged. A
+                // continuation inherits ONLY when the previous answer actually
+                // looks like a coding answer (looksLikeCodingAnswer), so
+                // "what's the complexity" typed after a sales answer cannot
+                // drag that answer in as a "prior coding problem".
+                let priorProblem = '';
+                let bareCode = false;
+                if (isBareCodeRequest(v3Question) || isCodingContinuation(v3Question)) {
+                  try {
+                    // IntelligenceManager exposes getLastAssistantMessage()
+                    // directly (it owns a PRIVATE SessionTracker and has no
+                    // getSessionTracker accessor) — the old chained form was a
+                    // phantom method that `as any` + optional chaining made
+                    // silently return undefined, so this whole guard was dead
+                    // code and every continuation was answered context-free.
+                    // No surface argument: "anywhere" is the point, so an
+                    // overlay answer can ground a chat follow-up.
+                    const lastAnywhere = appState.getIntelligenceManager?.()?.getLastAssistantMessage?.();
+                    bareCode = isBareCodeRequest(v3Question);
+                    if (typeof lastAnywhere === 'string' && lastAnywhere.trim().length > 40
+                        && (bareCode || looksLikeCodingAnswer(lastAnywhere))) {
+                      priorProblem = '\n\n' + buildPriorCodingBlockForV3({
+                        userMessage: '(the question answered just before this one)',
+                        assistantAnswer: lastAnywhere,
+                      });
+                    }
+                  } catch { /* guard only; never blocks the answer */ }
+                }
+                // Contract shape (DSA walkthrough vs implementation), explicit
+                // user format request, and a code template already present in
+                // the message — resolved once, shared with every other surface.
+                const codingSignals = (() => {
+                  try {
+                    const resolved = resolveCodingPromptSignals({
+                      answerType: planAnswer({
+                        question: v3Question,
+                        source: 'manual_input',
+                        speakerPerspective: 'user',
+                        activeMode: modeInfo ?? undefined,
+                      }).answerType,
+                      question: v3Question,
+                      // A recalled prior problem IS a prior coding turn: lets
+                      // the continuation-only formats (complexity_only /
+                      // dry_run_only) fire so "what's the complexity" gets the
+                      // analysis instead of a full re-solve.
+                      priorCodingTurnExists: !!priorProblem,
+                    });
+                    // ATTACHED-SCREENSHOT promotion, mirroring the WTA surface.
+                    // A chat message with an attached screenshot and a question
+                    // that points at it ("solve this", "what about this?", or
+                    // nothing) is about the IMAGE, not about whatever the text
+                    // router inferred — the pinned ScreenCodeAskCodingTask suite
+                    // documents that V3's own classifier never claims
+                    // CODING_TASK for screen asks, so without this the chat
+                    // surface was the last one still answering a screenshotted
+                    // coding problem in prose. The contract's applicability
+                    // boundary skips non-coding screenshots.
+                    if (!resolved.codingTask
+                        && (imagePaths?.length ?? 0) > 0
+                        && (!v3Question.trim() || require('./llm/codingPromptSignals').isDeicticAsk(v3Question))) {
+                      return { codingTask: true, codingTaskKind: 'dsa' } as import('./llm/codingPromptSignals').CodingPromptSignals;
+                    }
+                    return resolved;
+                  } catch { return { codingTask: false } as import('./llm/codingPromptSignals').CodingPromptSignals; }
+                })();
+                const base = resolveV2SystemPrompt({
                   action: 'answer',
                   tier: v2TierForPromptTier(llmHelper?.getPromptTier?.()),
                   activeMode: modeInfo,
-                  codingTask,
+                  codingTask: codingTask || codingSignals.codingTask || !!priorProblem,
+                  codingTaskKind: codingSignals.codingTaskKind,
+                  // A BARE code request forces code_only; a richer continuation
+                  // keeps whatever format the resolver derived (complexity_only,
+                  // dry_run_only, or none for "make it iterative").
+                  codingFormat: (priorProblem && bareCode) ? 'code_only' : codingSignals.codingFormat,
+                  suppliedTemplate: codingSignals.suppliedTemplate,
                   chatSurface: true,
                 });
+                return base ? base + priorProblem : base;
               },
             });
             // Null with the flag on = the bridge caught an error and ALREADY
@@ -1254,11 +1511,14 @@ export function initializeIpcHandlers(appState: AppState): void {
             // ends by returning, so the loop below cannot tell a truncated answer
             // from a complete one. Storing a truncated answer as history makes it
             // the antecedent for the NEXT turn's referent resolution.
+            // Bug 003: V3 owns this turn end to end, so if the skill block is not
+            // appended here it is injected nowhere at all.
+            const v3SystemPrompt = skillPromptBlock ? `${composed.system}\n\n## ACTIVE SKILL\n${skillPromptBlock}` : composed.system;
             const v3Stream = llmHelper.streamChatWithOutcome(
               composed.user,
               imagePaths,
               undefined,
-              composed.system,
+              v3SystemPrompt,
               true,   // ignoreKnowledgeMode — V3 owns evidence; legacy injection must not re-enter
               true,   // skipModeInjection — same reason
               // Declared outbound data scopes. Was `[]`, which told the
@@ -1372,45 +1632,84 @@ export function initializeIpcHandlers(appState: AppState): void {
             let liveModeIdAtRecord: string | null = null;
             try { liveModeIdAtRecord = mm.getActiveMode()?.id ?? null; } catch { /* record-guard only */ }
             if (liveModeIdAtRecord === (manualActiveMode?.id ?? null)) {
-              // A truncated answer must NOT enter conversation state, memory, or
-              // the session transcript. It would become the antecedent for the
-              // next turn's referent resolution and be replayed as if it were a
-              // complete answer — the same class of defect as the
-              // "(referring to: Makefile)" contamination. The user still SEES
-              // the partial text; it just does not become history.
+              // A truncated ANSWER must NOT enter conversation state or memory.
+              // It would become the antecedent for the next turn's referent
+              // resolution and be replayed as if it were a complete answer —
+              // the same class of defect as the "(referring to: Makefile)"
+              // contamination. The user still SEES the partial text; it just
+              // does not become history.
+              //
+              // Code-review 2026-08-13: the guard originally wrapped ALL FOUR
+              // blocks, so a truncated turn also dropped the sinks that record
+              // the USER's side — the question they actually asked. That is
+              // never in doubt just because the answer stopped early, and
+              // suppressing it lost the meeting transcript row, the usage row
+              // (a regression of the very bug the logUsage comment below
+              // documents), and the phone-mirror question. Split by SIDE:
+              // answer-side sinks honor the truncation guard, user-side sinks
+              // always run.
               if (v3Truncated) {
-                console.warn('[IPC] skipping history/memory sinks for a truncated answer', { streamId: myStreamId });
-              } else {
-              try {
-                const { recordAnswerSummary } = require('./context-intelligence/question/conversation-state-store');
-                recordAnswerSummary(String(senderId), finalText);
-              } catch { /* continuity only */ }
-              try {
-                _manualConversationMemory.record({
-                  sessionId: String(senderId),
-                  userMessage: String(message || ''),
-                  assistantAnswer: finalText,
-                  mode: (modeInfo as any)?.templateType,
-                  timestamp: Date.now(),
-                });
-              } catch { /* memory only */ }
+                console.warn('[IPC] truncated answer — recording the user turn but skipping answer-side history/memory sinks', { streamId: myStreamId });
+              }
+              // ── ANSWER-SIDE SINKS (skipped when truncated) ──────────────
+              if (!v3Truncated) {
+                try {
+                  const { recordAnswerSummary } = require('./context-intelligence/question/conversation-state-store');
+                  recordAnswerSummary(String(senderId), finalText);
+                } catch { /* continuity only */ }
+                try {
+                  // The user/answer PAIR is the antecedent unit for follow-up
+                  // referent resolution, so a truncated answer suppresses the
+                  // whole pair — the user turn is still preserved in the
+                  // session transcript below.
+                  _manualConversationMemory.record({
+                    sessionId: String(senderId),
+                    userMessage: String(message || ''),
+                    assistantAnswer: finalText,
+                    mode: (modeInfo as any)?.templateType,
+                    timestamp: Date.now(),
+                  });
+                } catch { /* memory only */ }
+              } // end answer-side sinks
               try {
                 const im = appState.getIntelligenceManager();
                 im?.addTranscript?.({ text: String(message || ''), speaker: 'user', timestamp: Date.now(), final: true, origin: 'manual_chat' }, true);
-                im?.addAssistantMessage?.(finalText, undefined, 'manual_chat');
+                if (!v3Truncated) im?.addAssistantMessage?.(finalText, undefined, 'manual_chat');
                 // Usage too: ai_interactions ("usage" in Meeting Notes) is
                 // populated solely from SessionTracker's usage log at
                 // saveMeeting time. Every legacy exit logs it; without this,
                 // a V3-answered chat during a meeting left the meeting's
                 // usage panel empty (confirmed in the live DB: V3 meetings
-                // had transcript rows but zero usage rows).
-                im?.logUsage?.('chat', String(message || ''), finalText);
+                // had transcript rows but zero usage rows). A truncated turn
+                // still consumed the call, so it is still usage.
+                //
+                // But the usage log is NOT write-only (code-review 2026-08-14):
+                // SessionTracker.getRecentManualTurn reads fullUsage and
+                // IntelligenceEngine.buildRecentManualContext injects the pair
+                // into the NEXT prompt as <previous_assistant_answer_excerpt>.
+                // Plain logUsage would therefore feed the truncated answer back
+                // as conversation context — defeating the answer-side guard
+                // above through a second door. `synthetic: true` is the existing
+                // opt-out: getRecentManualTurn skips those entries (line ~688)
+                // while every persistence path still returns them, so the
+                // Meeting Notes row survives and the replay does not.
+                if (v3Truncated) {
+                  im?.pushUsage?.({
+                    type: 'chat',
+                    timestamp: Date.now(),
+                    question: String(message || ''),
+                    answer: finalText,
+                    source: 'manual_chat',
+                    synthetic: true,
+                  });
+                } else {
+                  im?.logUsage?.('chat', String(message || ''), finalText);
+                }
               } catch { /* session transcript only */ }
               try {
                 PhoneMirrorService.getInstance().publishUserMessage(String(myStreamId), String(message || ''));
-                PhoneMirrorService.getInstance().publishAssistantMessage(String(myStreamId), finalText, 'Chat');
+                if (!v3Truncated) PhoneMirrorService.getInstance().publishAssistantMessage(String(myStreamId), finalText, 'Chat');
               } catch { /* mirror only */ }
-              } // end !v3Truncated
             }
 
             return null;
@@ -1464,7 +1763,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         // loaded — are interview-rehearsal questions about the CANDIDATE and must
         // reach the deterministic profile fast path instead of leaking
         // "I'm Natively, an AI assistant".
-        if (!imagePaths?.length && typeof message === 'string') {
+        // !skillPromptBlock: a skill turn must never be hijacked by the canned
+        // identity reply. This was previously incidental — the probe ran on the raw
+        // "/humanize who are you", which its fully-anchored regexes could not match.
+        // Made explicit so the immunity does not depend on regex anchoring.
+        if (!skillPromptBlock && !imagePaths?.length && typeof message === 'string') {
           const { resolveIdentityProbe } = require('./llm/manualIdentityRouting') as typeof import('./llm/manualIdentityRouting');
           let probeProfileReady = false;
           try {
@@ -1576,59 +1879,11 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Released in the handler's finally below.
         _manualFgToken = ForegroundGate.begin('manual');
 
-        // Skill invocation: /skill-name or $skill-name prefix (issue #303).
-        // Strip the prefix from message before planAnswer so routing sees the
-        // bare user query, then inject the skill's instructions into context
-        // right before streamChat so the model follows them for this turn only.
-        let skillPromptBlock = '';
-        const skillPrefixMatch = typeof message === 'string'
-          ? message.match(/^[/$]([A-Za-z0-9_-]+)\s*(.*)$/s)
-          : null;
-        // Defensive: strip any embedded <answer_contract>...</answer_contract>
-        // block from the user-visible message. See stripEmbeddedAnswerContract
-        // for the contract-block leak rationale (grounding campaign H4, 2026-07-18).
-        // MEDIUM #2: placed at the planAnswer boundary so upstream routing
-        // (skill dispatch, identity probe, source-switch resolution) sees the
-        // user's literal input — error logs and unmatched-skill fallbacks
-        // report the original message, not a stripped variant.
-        if (skillPrefixMatch) {
-          try {
-            const candidateId = skillPrefixMatch[1];
-            const skill = SkillsManager.getInstance().getSkill(candidateId);
-            if (skill) {
-              // Disabled skills still resolve by name but must NOT inject their
-              // instructions into the prompt — the user turned them off in
-              // Settings → Skills. Surface a clear error rather than silently
-              // proceeding (which would invoke the skill anyway).
-              if (skill.enabled === false) {
-                event.sender.send(
-                  'gemini-stream-error',
-                  `Skill "/${skill.id}" is disabled. Enable it in Settings → Skills.`,
-                  { streamId: myStreamId },
-                );
-                return;
-              }
-              skillPromptBlock = SkillsManager.getInstance().buildPromptBlock(skill);
-              const strippedQuery = skillPrefixMatch[2].trim();
-              message = strippedQuery || `Please help me with the ${skill.name} skill.`;
-              console.log(`[IPC] Skill activated: ${skill.id}`);
-            } else {
-              const allSkills = SkillsManager.getInstance().listSkills();
-              const available = allSkills.length
-                ? allSkills.map(s => `/${s.id}`).join(', ')
-                : 'none registered';
-              event.sender.send(
-                'gemini-stream-error',
-                `Skill "/${candidateId}" not found. Available: ${available}`,
-                { streamId: myStreamId },
-              );
-              return;
-            }
-          } catch (skillErr: any) {
-            console.warn('[IPC] Skill lookup failed:', skillErr?.message || skillErr);
-            event.sender.send('gemini-stream-error', `Skill lookup failed: ${skillErr?.message || 'unknown error'}`, { streamId: myStreamId });
-            return;
-          }
+        // Skill stripping APPLIED here, at the original boundary, so upstream
+        // routing (identity probe, source-switch resolution) and error logs keep
+        // seeing the user's literal input exactly as before the parse was hoisted.
+        if (skillStrippedMessage !== null) {
+          message = skillStrippedMessage;
         }
 
         // Active mode as a routing PRIOR (PI v3, W1): an ambiguous manual
@@ -1775,13 +2030,13 @@ export function initializeIpcHandlers(appState: AppState): void {
             hasProfileFacts: _hasProfileFacts,
             turnSourceDecision: manualTurnSourceDecision,
           });
-          if (isIntelligenceFlagEnabled('trace')) {
+          if (isIntelligenceFlagEnabled('trace')) {  // manualOwnership! below: assigned unconditionally at 1790-1797
             console.log('[SOURCE-OWNERSHIP]', JSON.stringify({
-              owner: manualOwnership.owner,
-              profileAllowed: manualOwnership.profileAllowed,
-              explicitProfileAsk: manualOwnership.explicitProfileAsk,
-              shouldClarifyInsteadOfProfile: manualOwnership.shouldClarifyInsteadOfProfile,
-              reason: manualOwnership.reason,
+              owner: manualOwnership!.owner,
+              profileAllowed: manualOwnership!.profileAllowed,
+              explicitProfileAsk: manualOwnership!.explicitProfileAsk,
+              shouldClarifyInsteadOfProfile: manualOwnership!.shouldClarifyInsteadOfProfile,
+              reason: manualOwnership!.reason,
               answerType: answerPlan.answerType,
             }));
           }
@@ -1944,6 +2199,59 @@ export function initializeIpcHandlers(appState: AppState): void {
         let explicitCodingContract: ExplicitCodingContract = detectExplicitCodingContract(message);
         let codingPriorProblemBlock = '';
         let codingFollowupResolved = false;
+        // BARE CODE REQUEST — "code?", "show me the code" — deliberately NOT gated
+        // on conversationMemoryV2 (default OFF). This is not a memory FEATURE, it
+        // is a correctness guard.
+        //
+        // Live repro 2026-08-18: the overlay solved a Trapping Rain Water
+        // screenshot, the user typed "code?" in chat, and the answer was a
+        // complete, confident BINARY SEARCH solution. "code" matches
+        // CODING_PATTERNS, so the turn was routed coding and handed the full
+        // contract — with no problem attached, so the model chose one. Answering
+        // a different question with total confidence is worse than not answering.
+        //
+        // A bare code request has no subject of its own, so the answer the user
+        // is looking at IS the subject. SessionTracker's last assistant message
+        // is cross-surface, which is exactly what the chat-only memory below is
+        // not. Runs first; the flag-gated block then refines it when enabled.
+        // Extended 2026-08-19 to EVERY coding continuation, gated on the prior
+        // answer actually looking like a coding answer — mirrors the V3
+        // personaBase guard above so the two chat paths cannot drift.
+        if (isBareCodeRequest(message) || isCodingContinuation(message)) {
+          try {
+            // Phantom-method fix (code review 2026-08-19): IntelligenceManager
+            // exposes getLastAssistantMessage() directly; getSessionTracker()
+            // does not exist, so the old chained form silently returned
+            // undefined and this guard never ran. See the V3 twin above.
+            const lastAnywhere = appState.getIntelligenceManager?.()?.getLastAssistantMessage?.();
+            const bare = isBareCodeRequest(message);
+            if (typeof lastAnywhere === 'string' && lastAnywhere.trim().length > 40
+                && (bare || looksLikeCodingAnswer(lastAnywhere))) {
+              codingPriorProblemBlock = buildPriorCodingContextBlock({
+                userMessage: '(the question answered just before this one)',
+                assistantAnswer: lastAnywhere,
+              });
+              codingFollowupResolved = true;
+              // Promote to the coding path (code review 2026-08-19). EVERY
+              // consumer of codingPriorProblemBlock sits inside
+              // `if (isCodingChat)` below, and a bare "code?" / "now optimize
+              // it" is planned follow_up_answer — so without this promotion
+              // the block was built and then silently dropped, making this
+              // guard a no-op for exactly the case it exists to fix. Mirrors
+              // the flag-gated recall block's promotion so the two cannot
+              // drift, and matches the V3 twin (which forces its coding task
+              // via `|| !!priorProblem`).
+              if (!isCodingChat) {
+                isCodingChat = true;
+                iTrace.noteContext({ source: 'conversation_history', trustLevel: 'high', requested: true, retrieved: true, included: true, reason: 'coding_followup_prior_problem' });
+              }
+              // Bare requests force code_only; richer continuations keep the
+              // format the detector already derived (complexity_only / dry_run
+              // / null for "make it iterative").
+              if (bare) explicitCodingContract = 'code_only';
+            }
+          } catch { /* guard only; never blocks the answer */ }
+        }
         {
           const looksLikeCodingFollowup = isCodingContinuation(message);
           const convMemOn = isIntelligenceFlagEnabled('conversationMemoryV2');
@@ -3160,7 +3468,22 @@ export function initializeIpcHandlers(appState: AppState): void {
         // docs/answer-pipeline-rebuild/02_STATUS.md Phase 4 for the full writeup.
         const systemPromptOverride: string | undefined = options?.skipSystemPrompt
           ? ''
-          : resolveManualChatBasePrompt(llmHelper, { codingTask: isCodingChat });
+          : resolveManualChatBasePrompt(llmHelper, resolveCodingPromptSignals({
+            answerType: answerPlan.answerType,
+            question: message,
+            // Manual chat is the ONE surface that knows whether a prior coding
+            // turn exists (conversation memory, resolved above). Without it the
+            // continuation-only formats stay suppressed and a "what's the
+            // complexity" follow-up would be re-answered in full.
+            priorCodingTurnExists: codingFollowupResolved,
+            // Restores the promotion the old `codingTask: isCodingChat`
+            // argument carried (code review 2026-08-19). A bare "code?" /
+            // "now optimize it" is PLANNED follow_up_answer, so answerType
+            // alone yields codingTask:false and promptSystemV2's
+            // coding_contract gate drops the block from the SYSTEM prompt
+            // even though the user-channel contract is attached below.
+            codingTurnPromoted: isCodingChat,
+          }));
         // NOTE (audit 2026-06-28): the document-grounded greeting-suppression +
         // question-first restructuring now lives INSIDE LLMHelper._streamChatInner
         // (shapeDocumentGroundedSystemPrompt + buildDocumentGroundedUserContent),
@@ -3223,6 +3546,13 @@ export function initializeIpcHandlers(appState: AppState): void {
             {
               answerType: answerPlan.answerType,
               forbiddenContextLayers: answerPlan.forbiddenContextLayers,
+              // F-502: the t0-pinned mode. streamContextPolicy documents this as
+              // the defence against a mid-request `modes:set-active` leaking a
+              // different mode's documents into an answer whose contract is
+              // scoped to the first mode — but only the WTA path ever set it, so
+              // every mode read inside streamChat after an await resolved the
+              // LIVE singleton instead.
+              pinnedModeId: manualActiveMode?.id ?? null,
               // Surface-scoped (Phase 9, 2026-07-14): the referent hint must come
               // from THIS manual-chat conversation's own last answer, never a
               // WTA/phone-mirror turn that happened to write the shared
@@ -3379,11 +3709,14 @@ export function initializeIpcHandlers(appState: AppState): void {
           // fallback line below. Codex CLI shares the cold-load profile
           // (subprocess spawn → codex CLI loads the model → first delta).
           const usingLocalLlm = llmHelper.isUsingOllama() || llmHelper.isUsingCodexCli();
+          // F-301: on the natively-api route the server rotates providers at
+          // 10s; give it room to rescue the turn instead of aborting at 7s.
+          const viaServerCascade = llmHelper.isUsingNativelyServerCascade?.() === true;
           let manualFirstUseful = false;
           let manualSuperseded = false;
           await raceStreamWithDeadline({
             stream: stream as AsyncGenerator<string>,
-            firstUsefulDeadlineMs: firstUsefulDeadlineMs(answerPlan.answerType, usingLocalLlm),
+            firstUsefulDeadlineMs: firstUsefulDeadlineMs(answerPlan.answerType, usingLocalLlm, viaServerCascade),
             isUsefulYet: () => manualFirstUseful,
             shouldAbort: () => {
               if (_chatStreamsBySender.get(senderId)?.streamId !== myStreamId) {
@@ -3400,7 +3733,20 @@ export function initializeIpcHandlers(appState: AppState): void {
               try { myController?.abort(); } catch { /* noop */ }
             },
             onToken: (token: string) => {
-              manualFirstUseful = true;
+              // F-302: "useful" must mean USER-USEFUL CONTENT, not "a token
+              // object arrived". raceStreamWithDeadline forwards every yielded
+              // value unfiltered, so a leading "\n\n" used to flip this flag —
+              // which (a) swapped the 7s first-useful budget for the 8s
+              // inter-token stall guard, and (b) made the blank-answer fallback
+              // below unreachable for a whitespace-only response, committing an
+              // EMPTY bubble. Every other call site in the repo already uses a
+              // content threshold (>=5/8/10 chars); this primary manual-chat
+              // path was the sole outlier.
+              // R-09: concatenate THEN trim once — trimming each side separately
+              // loses the interior whitespace ("a b" + " c" counted 4, not 5).
+              if ((fullResponse + token).trim().length >= 5) {
+                manualFirstUseful = true;
+              }
               // First token back from the provider — the gap from
               // provider_request_started is pre-work + provider TTFT (the real cost).
               chatTrace.markFirstUseful({ via: codingGate ? 'gated' : 'stream' });
@@ -3526,12 +3872,41 @@ export function initializeIpcHandlers(appState: AppState): void {
                   stream: llmHelper.streamChat(regenPrompt, undefined, codingPriorProblemBlock || undefined, undefined, true, true, [], regenAbort.signal) as AsyncGenerator<string>,
                   firstUsefulDeadlineMs: usingLocalLlm ? LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS : 8000,
                   isUsefulYet: () => regen.length >= 10,
-                  shouldAbort: () => regen.length > 4000,
+                  shouldAbort: () => regen.length > CODING_REGEN_ABORT_CHARS,
                   onToken: (tok: string) => { regen += tok; },
                   onCleanup: () => { try { regenAbort.abort(); } catch { /* best effort */ } },
                 });
                 const regenTrim = regen.trim();
-                if (regenTrim.length >= 20 && /```[a-zA-Z0-9_+\-]*\n[\s\S]*?```/.test(regenTrim)) {
+                // F-305: a closed code fence is NOT proof the answer is whole.
+                // shouldAbort cuts this regen at 4000 chars while liveDeadlines
+                // sizes the very artifact it asks for — a six-section coding
+                // answer — at ~8000, so a correct answer whose fence closes
+                // early (## Approach, fenced code, then ## Complexity / ## Edge
+                // cases) is routinely truncated mid-sentence AFTER the fence.
+                // The old test passed on that truncation and then atomically
+                // REPLACED the streamed row with it, so the user's final answer
+                // ended mid-word. The sibling regen ~80 lines below already
+                // guards with checkCodeCompleteness; use the same bar here.
+                //
+                // R-06: that change REPLACED the closed-fence test instead of ADDING
+                // to it, which made the gate strictly WEAKER. extractFencedCodeBlocks
+                // requires a CLOSING fence, so an answer with no fences — or with an
+                // unterminated one — yields zero blocks and checkCodeCompleteness
+                // returns ok:true vacuously. Two regressions followed:
+                //   - another meta-reply (>=20 chars, no code at all) was accepted,
+                //     directly violating the invariant stated at the top of this block
+                //     ("only accept if the regen actually contains a code fence; never
+                //     overwrite with another meta-reply") and emitting a bogus
+                //     retry-succeeded telemetry event;
+                //   - raising CODING_REGEN_ABORT_CHARS to 8000 made the unclosed-fence
+                //     case REACHABLE: when shouldAbort fires mid-code-block the regen
+                //     ends on a dangling fence, and accepting it atomically replaces
+                //     the streamed answer with one whose fence never closes, so
+                //     markdown swallows everything after it.
+                // Both bars are required: the fence must close AND its contents must
+                // be complete.
+                const regenHasClosedFence = /```[a-zA-Z0-9_+\-]*\n[\s\S]*?```/.test(regenTrim);
+                if (regenTrim.length >= 20 && regenHasClosedFence && checkCodeCompleteness(regenTrim).ok) {
                   fullResponse = regenTrim;
                   finalText = regenTrim;
                   // Re-strip <verification_spec>: the regen prompt includes the
@@ -3606,7 +3981,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                   stream: llmHelper.streamChat(regenPrompt, undefined, codingPriorProblemBlock || undefined, undefined, true, true, [], regenAbort.signal) as AsyncGenerator<string>,
                   firstUsefulDeadlineMs: usingLocalLlm ? LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS : 8000,
                   isUsefulYet: () => regen.length >= 10,
-                  shouldAbort: () => regen.length > 4000,
+                  shouldAbort: () => regen.length > CODING_REGEN_ABORT_CHARS,
                   onToken: (tok: string) => { regen += tok; },
                   onCleanup: () => { try { regenAbort.abort(); } catch { /* best effort */ } },
                 });
@@ -4390,7 +4765,37 @@ export function initializeIpcHandlers(appState: AppState): void {
                   // confident/synthesis-tier verdict, OR'd in as an additional
                   // signal. matchedHighSignalEntity is a whole-entity hit that
                   // is also present in the retrieved context.
-                  const hasStrongEvidence = hasRealEvidence || Boolean(matchedHighSignalEntity) || isTier1Or2Evidence;
+                  // F-412: the tier signal is deliberately NOT consulted here.
+                  //
+                  // EvidenceAssembler.computeTier is TOPIC-BLIND — it returns
+                  // tier 2 for ANY synthesis-classified question as soon as the
+                  // pack yields >=1 card, and OkfRetriever's type boost still
+                  // clears the score floor with ZERO query-word overlap (that is
+                  // its purpose: surface the one `result` card for a `result`
+                  // question worded differently). R-04 narrowed this — confidence
+                  // ALONE no longer admits on the document path — but a card can
+                  // still be admitted without any topical overlap, so the tier
+                  // remains topic-blind. As an independent disjunct it therefore
+                  // made the off-topic gate above unable to veto anything: an
+                  // off-topic synthesis question ("What is the key takeaway for
+                  // the Kyoto Protocol?" against a robotics thesis) produced
+                  // hasEntityEvidence=false yet still repaired, discarding an
+                  // honest "not in the document" refusal and re-prompting the
+                  // model with a stronger-synthesis instruction — the exact
+                  // hallucination pressure this gate exists to prevent.
+                  //
+                  // HONESTY NOTE (self-review): the first version of this fix
+                  // wrote `|| (isTier1Or2Evidence && hasEntityEvidence)` and
+                  // described the tier as a "corroborating signal". That was
+                  // false. `hasRealEvidence` IS `hasEntityEvidence` (see its
+                  // assignment above), so that disjunct could only ever be true
+                  // when the first disjunct had already fired — provably dead
+                  // code. The real, and correct, effect is that the tier no
+                  // longer participates at all; the expression now says so.
+                  // isTier1Or2Evidence is still COMPUTED above and reported in
+                  // the diagnostic below, which is where its value belongs.
+                  const hasStrongEvidence =
+                    hasRealEvidence || Boolean(matchedHighSignalEntity);
                   // GOVERNANCE INTEGRITY (2026-07-13): when EvidenceResolver
                   // GOVERNED this turn and its typed pack's policy is an explicit
                   // refusal, that decision is authoritative — it already ran
@@ -4424,6 +4829,9 @@ export function initializeIpcHandlers(appState: AppState): void {
                       tokenHits: [...tokenHits].slice(0, 8),
                       isSystemOwnRefusalPhrase,
                       matchedHighSignalEntity: matchedHighSignalEntity || null,
+                      // F-412: reported for explainability only — the tier is
+                      // topic-blind and deliberately does NOT gate this decision.
+                      isTier1Or2Evidence,
                     });
                     piTelemetry.emit('pi_doc_grounded_false_refusal_repair_attempted', {
                       isSystemOwnRefusalPhrase,
@@ -4440,6 +4848,7 @@ export function initializeIpcHandlers(appState: AppState): void {
                       wholeNameHit,
                       tokenHits: [...tokenHits].slice(0, 8),
                       isSystemOwnRefusalPhrase,
+                      isTier1Or2Evidence,
                     });
                   }
                 }
@@ -5461,6 +5870,23 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  safeHandle('get-stealth-shortcut-guard', async () => {
+    return appState.getStealthShortcutGuardEnabled();
+  });
+
+  safeHandle('set-stealth-shortcut-guard', async (_, enabled: boolean) => {
+    appState.setStealthShortcutGuardEnabled(!!enabled);
+    return { success: true };
+  });
+
+  // DEV/TEST ONLY — gated by NATIVELY_DEBUG_HOTKEYS=1 inside KeybindManager.
+  // Simulates the OS dropping a RegisterHotKey registration so a Windows tester
+  // can confirm the hook-level swallow / shortcut-guard still fire the action.
+  safeHandle('debug:drop-hotkey', async (_, id: string) => {
+    const { KeybindManager } = require('./services/KeybindManager');
+    return { dropped: KeybindManager.getInstance().debugDropRegistration(id) };
+  });
+
   safeHandle('get-ambient-chat-enabled', async () => {
     return appState.getAmbientChatEnabled();
   });
@@ -5469,6 +5895,641 @@ export function initializeIpcHandlers(appState: AppState): void {
     appState.setAmbientChatEnabled(enabled);
     return { success: true };
   });
+
+  safeHandle('get-auto-answer-enabled', async () => {
+    return appState.getAutoAnswerEnabled();
+  });
+
+  safeHandle('set-auto-answer-enabled', async (_, enabled: boolean) => {
+    const persisted = appState.setAutoAnswerEnabled(Boolean(enabled));
+    return persisted
+      ? { success: true }
+      : { success: false, error: 'Settings store is unavailable; the change was not saved.' };
+  });
+
+  // ── Direct Assist ────────────────────────────────────────────────────────
+  // Direct Assist is deliberately isolated from gemini-chat-stream, WTA, RAG,
+  // Context V3, planners, validators, and repair passes. The renderer supplies
+  // the current-turn inputs; main resolves the selected model and optional
+  // skill once, validates attachments, and dispatches exactly one backend
+  // stream. `source` is the renderer surface for supersession purposes, so a
+  // new typed request never aborts an independent screenshot request.
+  type ActiveDirectAssistRequest = {
+    requestId: string;
+    source: DirectAssistSource;
+    senderId: number;
+    controller: AbortController;
+  };
+  const activeDirectAssistBySurface = new Map<string, ActiveDirectAssistRequest>();
+  const activeDirectAssistByRequest = new Map<string, ActiveDirectAssistRequest>();
+
+  const directAssistSurfaceKey = (senderId: number, source: DirectAssistSource): string =>
+    `${senderId}:${source}`;
+  const directAssistRequestKey = (senderId: number, requestId: string): string =>
+    `${senderId}:${requestId}`;
+  const directAssistError = (
+    code: string,
+    message: string,
+    retryable = false,
+  ): DirectAssistIpcError => ({ code, message, retryable });
+  const sendDirectAssistEvent = (sender: any, payload: unknown): void => {
+    if (!sender || sender.isDestroyed?.()) return;
+    sender.send('direct-assist-event', payload);
+  };
+  const rejectDirectAssist = (
+    sender: any,
+    requestId: string,
+    error: DirectAssistIpcError,
+  ): { accepted: false; requestId: string; error: DirectAssistIpcError } => {
+    sendDirectAssistEvent(sender, {
+      type: 'error',
+      requestId,
+      sequence: 0,
+      partial: false,
+      error,
+    });
+    return { accepted: false, requestId, error };
+  };
+
+  const sniffDirectAssistImage = (
+    imagePath: string,
+  ): 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | null => {
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(imagePath, 'r');
+      const header = Buffer.alloc(12);
+      const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+      const isPng = bytesRead >= 8
+        && header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      const isJpeg = bytesRead >= 3
+        && header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff;
+      const signature6 = header.subarray(0, 6).toString('ascii');
+      const isGif = bytesRead >= 6 && (signature6 === 'GIF87a' || signature6 === 'GIF89a');
+      const isWebp = bytesRead >= 12
+        && header.subarray(0, 4).toString('ascii') === 'RIFF'
+        && header.subarray(8, 12).toString('ascii') === 'WEBP';
+      if (isPng) return 'image/png';
+      if (isJpeg) return 'image/jpeg';
+      if (isGif) return 'image/gif';
+      if (isWebp) return 'image/webp';
+      return null;
+    } catch {
+      return null;
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* best effort */ }
+      }
+    }
+  };
+
+  const normalizeDirectAssistRequest = (
+    raw: unknown,
+  ): { request?: DirectAssistRendererRequest; error?: DirectAssistIpcError; requestId: string } => {
+    const candidate = raw && typeof raw === 'object'
+      ? raw as Record<string, unknown>
+      : null;
+    const requestId = typeof candidate?.requestId === 'string' ? candidate.requestId : 'invalid';
+    if (!candidate || !DIRECT_ASSIST_REQUEST_ID_RE.test(requestId)) {
+      return {
+        requestId,
+        error: directAssistError('INVALID_REQUEST', 'A valid renderer-generated request ID is required.'),
+      };
+    }
+    if (candidate.source !== 'typed' && candidate.source !== 'stt' && candidate.source !== 'screenshot') {
+      return {
+        requestId,
+        error: directAssistError('INVALID_REQUEST', 'Direct Assist source is invalid.'),
+      };
+    }
+    if (
+      typeof candidate.currentRequest !== 'string'
+      || candidate.currentRequest.trim().length === 0
+      || candidate.currentRequest.length > DIRECT_ASSIST_MAX_CURRENT_REQUEST_CHARS
+    ) {
+      return {
+        requestId,
+        error: directAssistError(
+          candidate.currentRequest && String(candidate.currentRequest).length > DIRECT_ASSIST_MAX_CURRENT_REQUEST_CHARS
+            ? 'CONTEXT_TOO_LARGE'
+            : 'INVALID_REQUEST',
+          'The current Direct Assist request is missing or too large.',
+        ),
+      };
+    }
+
+    const optionalTextFields = [
+      'skillId',
+      'manualContext',
+      'referenceContext',
+      'transcript',
+      'requestedLanguage',
+      'requestedFormat',
+    ] as const;
+    for (const key of optionalTextFields) {
+      const value = candidate[key];
+      if (value !== undefined && typeof value !== 'string') {
+        return {
+          requestId,
+          error: directAssistError('INVALID_REQUEST', `Direct Assist field "${key}" is invalid.`),
+        };
+      }
+    }
+    for (const key of ['manualContext', 'referenceContext', 'transcript'] as const) {
+      const value = candidate[key] as string | undefined;
+      if (value && value.length > DIRECT_ASSIST_MAX_CONTEXT_FIELD_CHARS) {
+        return {
+          requestId,
+          error: directAssistError('CONTEXT_TOO_LARGE', `Direct Assist field "${key}" is too large.`),
+        };
+      }
+    }
+    if ((candidate.skillId as string | undefined)?.length && (candidate.skillId as string).length > 128) {
+      return { requestId, error: directAssistError('INVALID_REQUEST', 'Direct Assist skill ID is invalid.') };
+    }
+    if ((candidate.requestedLanguage as string | undefined)?.length && (candidate.requestedLanguage as string).length > 64) {
+      return { requestId, error: directAssistError('INVALID_REQUEST', 'Requested language is invalid.') };
+    }
+    if ((candidate.requestedFormat as string | undefined)?.length && (candidate.requestedFormat as string).length > 128) {
+      return { requestId, error: directAssistError('INVALID_REQUEST', 'Requested format is invalid.') };
+    }
+
+    let pageContext: DirectAssistRendererRequest['pageContext'];
+    if (candidate.pageContext !== undefined && candidate.pageContext !== null) {
+      if (typeof candidate.pageContext !== 'object' || Array.isArray(candidate.pageContext)) {
+        return { requestId, error: directAssistError('INVALID_REQUEST', 'Page context is invalid.') };
+      }
+      const rawPage = candidate.pageContext as Record<string, unknown>;
+      for (const key of ['dom', 'ocr', 'url', 'title'] as const) {
+        if (rawPage[key] !== undefined && typeof rawPage[key] !== 'string') {
+          return { requestId, error: directAssistError('INVALID_REQUEST', `Page context field "${key}" is invalid.`) };
+        }
+      }
+      if (
+        ((rawPage.dom as string | undefined)?.length ?? 0) > DOM_CONTEXT_MAX_CHARS
+        || ((rawPage.ocr as string | undefined)?.length ?? 0) > DOM_CONTEXT_MAX_CHARS
+      ) {
+        return { requestId, error: directAssistError('CONTEXT_TOO_LARGE', 'Page context is too large.') };
+      }
+      if (((rawPage.url as string | undefined)?.length ?? 0) > 4096
+          || ((rawPage.title as string | undefined)?.length ?? 0) > 1024) {
+        return { requestId, error: directAssistError('CONTEXT_TOO_LARGE', 'Page metadata is too large.') };
+      }
+      pageContext = Object.freeze({
+        dom: rawPage.dom as string | undefined,
+        ocr: rawPage.ocr as string | undefined,
+        url: rawPage.url as string | undefined,
+        title: rawPage.title as string | undefined,
+      });
+    } else if (candidate.pageContext === null) {
+      pageContext = null;
+    }
+
+    let history: DirectAssistRendererRequest['history'];
+    if (candidate.history !== undefined) {
+      if (!Array.isArray(candidate.history) || candidate.history.length > DIRECT_ASSIST_MAX_HISTORY_TURNS) {
+        return { requestId, error: directAssistError('INVALID_REQUEST', 'Direct Assist history is invalid.') };
+      }
+      history = [];
+      let historyChars = 0;
+      for (const rawTurn of candidate.history) {
+        if (
+          !rawTurn
+          || typeof rawTurn !== 'object'
+          || ((rawTurn as any).role !== 'user' && (rawTurn as any).role !== 'assistant')
+          || typeof (rawTurn as any).content !== 'string'
+        ) {
+          return { requestId, error: directAssistError('INVALID_REQUEST', 'Direct Assist history contains an invalid turn.') };
+        }
+        historyChars += (rawTurn as any).content.length;
+        if (historyChars > DIRECT_ASSIST_MAX_CONTEXT_FIELD_CHARS) {
+          return { requestId, error: directAssistError('CONTEXT_TOO_LARGE', 'Direct Assist history is too large.') };
+        }
+        history.push(Object.freeze({
+          role: (rawTurn as any).role,
+          content: (rawTurn as any).content,
+        }));
+      }
+      Object.freeze(history);
+    }
+
+    let imagePaths: string[] | undefined;
+    if (candidate.imagePaths !== undefined) {
+      if (
+        !Array.isArray(candidate.imagePaths)
+        || candidate.imagePaths.length > DIRECT_ASSIST_MAX_IMAGES
+        || candidate.imagePaths.some((value) => typeof value !== 'string' || value.trim().length === 0)
+      ) {
+        return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'Image attachment payload is invalid.') };
+      }
+      const { validateImagePath } = require('./utils/curlUtils') as typeof import('./utils/curlUtils');
+      const userDataDir = app.getPath('userData');
+      let canonicalUserDataDir: string;
+      try {
+        canonicalUserDataDir = fs.realpathSync.native(userDataDir);
+      } catch {
+        return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'The app attachment directory is unavailable.') };
+      }
+      imagePaths = [];
+      for (const rendererPath of candidate.imagePaths as string[]) {
+        try {
+          // Do not trust validateImagePath's original-path fallback: a path can
+          // look allowlisted while a symlink/junction resolves outside userData.
+          // Canonical containment is the authoritative Direct Assist boundary.
+          const canonicalPath = fs.realpathSync.native(rendererPath);
+          if (!isDirectAssistCanonicalPathInsideRoot(canonicalUserDataDir, canonicalPath)) {
+            return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'An image attachment was rejected.') };
+          }
+          const validation = validateImagePath(rendererPath, userDataDir);
+          if (!validation.isValid) {
+            return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'An image attachment was rejected.') };
+          }
+          const stat = fs.statSync(canonicalPath);
+          if (!stat.isFile() || stat.size <= 0 || stat.size > DIRECT_ASSIST_MAX_IMAGE_BYTES) {
+            return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'An image attachment has an invalid size or type.') };
+          }
+          const detectedMime = sniffDirectAssistImage(canonicalPath);
+          if (
+            !detectedMime
+            || DIRECT_ASSIST_IMAGE_MIMES[path.extname(canonicalPath).toLowerCase()] !== detectedMime
+          ) {
+            return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'An attachment is not a supported image.') };
+          }
+          imagePaths.push(canonicalPath);
+        } catch {
+          return { requestId, error: directAssistError('INVALID_ATTACHMENT', 'An image attachment is unavailable.') };
+        }
+      }
+      Object.freeze(imagePaths);
+    }
+
+    let maxContextChars: number | undefined;
+    if (candidate.maxContextChars !== undefined) {
+      if (
+        typeof candidate.maxContextChars !== 'number'
+        || !Number.isInteger(candidate.maxContextChars)
+        || candidate.maxContextChars < 4_000
+        || candidate.maxContextChars > 500_000
+      ) {
+        return { requestId, error: directAssistError('INVALID_REQUEST', 'Direct Assist context limit is invalid.') };
+      }
+      maxContextChars = candidate.maxContextChars;
+    }
+
+    const request: DirectAssistRendererRequest = Object.freeze({
+      requestId,
+      source: candidate.source as DirectAssistSource,
+      currentRequest: candidate.currentRequest,
+      skillId: candidate.skillId as string | undefined,
+      manualContext: candidate.manualContext as string | undefined,
+      referenceContext: candidate.referenceContext as string | undefined,
+      pageContext,
+      history,
+      transcript: candidate.transcript as string | undefined,
+      imagePaths,
+      requestedLanguage: candidate.requestedLanguage as string | undefined,
+      requestedFormat: candidate.requestedFormat as string | undefined,
+      maxContextChars,
+    });
+    return { requestId, request };
+  };
+
+  const resolveDirectAssistSkill = (
+    request: DirectAssistRendererRequest,
+  ): {
+    currentRequest?: string;
+    skill?: DirectAssistRequestInput['skill'];
+    error?: DirectAssistIpcError;
+  } => {
+    const prefix = request.currentRequest.match(/^\s*[/$]([a-z0-9][a-z0-9_-]{0,127})(?:\s+([\s\S]*))?$/i);
+    const prefixSkillId = prefix?.[1];
+    const explicitSkillId = request.skillId?.trim();
+    if (
+      prefixSkillId
+      && explicitSkillId
+      && prefixSkillId.toLowerCase() !== explicitSkillId.toLowerCase()
+    ) {
+      return { error: directAssistError('INVALID_REQUEST', 'Conflicting Direct Assist skill selections were supplied.') };
+    }
+    const requestedSkillId = prefixSkillId || explicitSkillId;
+    if (!requestedSkillId) return { currentRequest: request.currentRequest, skill: null };
+
+    const skill = SkillsManager.getInstance().getSkill(requestedSkillId);
+    if (!skill) {
+      // A slash/dollar-prefixed leading word that doesn't resolve to a real
+      // skill is ordinary text far more often than an intended skill
+      // invocation ("$50 is that a fair price...", "/explain this regex") —
+      // the renderer's matching detector (directAssistSkillId) is advisory
+      // only, main is authoritative. Only hard-fail when a skill was
+      // explicitly selected via the UI's skill picker (explicitSkillId),
+      // where there is no ambiguity about intent; a bare text-prefix guess
+      // that misses just falls back to plain text.
+      if (!explicitSkillId) return { currentRequest: request.currentRequest, skill: null };
+      return { error: directAssistError('SKILL_NOT_FOUND', 'The requested Direct Assist skill was not found.') };
+    }
+    if (skill.enabled === false) {
+      return { error: directAssistError('SKILL_DISABLED', 'The requested Direct Assist skill is disabled.') };
+    }
+    const currentRequest = prefix ? (prefix[2] ?? '').trim() : request.currentRequest;
+    if (!currentRequest) {
+      return { error: directAssistError('INVALID_REQUEST', 'A request is required after the skill name.') };
+    }
+    return {
+      currentRequest,
+      skill: Object.freeze({
+        id: skill.id,
+        name: skill.name,
+        instructions: skill.instructions,
+      }),
+    };
+  };
+
+  safeHandle('get-direct-assist-enabled', async () => {
+    return SettingsManager.getInstance().getDirectAssistEnabled();
+  });
+
+  safeHandle('set-direct-assist-enabled', async (_, enabled: unknown) => {
+    if (typeof enabled !== 'boolean') {
+      return { success: false, error: 'invalid_type' };
+    }
+    const settings = SettingsManager.getInstance();
+    if (enabled && settings.isDirectAssistKilledByOperator()) {
+      return { success: false, error: 'operator_kill_switch' };
+    }
+    if (!settings.set('directAssistEnabled', enabled)) {
+      return { success: false, error: 'settings_store_degraded' };
+    }
+    const effective = settings.getDirectAssistEnabled();
+    if (!effective) {
+      for (const active of new Set(activeDirectAssistByRequest.values())) {
+        active.controller.abort();
+      }
+    }
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send('direct-assist-enabled-changed', effective);
+    });
+    return { success: true };
+  });
+
+  safeHandle('direct-assist-stream', async (event, rawRequest: unknown) => {
+    const normalized = normalizeDirectAssistRequest(rawRequest);
+    if (normalized.error || !normalized.request) {
+      return rejectDirectAssist(
+        event.sender,
+        normalized.requestId,
+        normalized.error ?? directAssistError('INVALID_REQUEST', 'Direct Assist request is invalid.'),
+      );
+    }
+    const request = normalized.request;
+    const settings = SettingsManager.getInstance();
+    if (!settings.getDirectAssistEnabled()) {
+      return rejectDirectAssist(
+        event.sender,
+        request.requestId,
+        directAssistError(
+          settings.isDirectAssistKilledByOperator() ? 'DIRECT_ASSIST_KILLED' : 'DIRECT_ASSIST_DISABLED',
+          settings.isDirectAssistKilledByOperator()
+            ? 'Direct Assist is disabled by the operator kill switch.'
+            : 'Direct Assist is disabled in Settings.',
+        ),
+      );
+    }
+
+    const resolvedSkill = resolveDirectAssistSkill(request);
+    if (resolvedSkill.error || !resolvedSkill.currentRequest) {
+      return rejectDirectAssist(
+        event.sender,
+        request.requestId,
+        resolvedSkill.error ?? directAssistError('INVALID_REQUEST', 'Direct Assist request is invalid.'),
+      );
+    }
+
+    const senderId = Number(event.sender?.id);
+    if (!Number.isFinite(senderId)) {
+      return rejectDirectAssist(
+        event.sender,
+        request.requestId,
+        directAssistError('INVALID_REQUEST', 'Direct Assist sender is invalid.'),
+      );
+    }
+    const requestKey = directAssistRequestKey(senderId, request.requestId);
+    if (activeDirectAssistByRequest.has(requestKey)) {
+      return rejectDirectAssist(
+        event.sender,
+        request.requestId,
+        directAssistError('INVALID_REQUEST', 'Direct Assist request ID is already active.'),
+      );
+    }
+
+    let service: DirectAssistService;
+    let selection: DirectAssistRequestInput['selection'];
+    try {
+      const llmHelper = appState.processingHelper.getLLMHelper();
+      const selected = llmHelper.getDirectAssistSelection();
+      if (!selected || typeof selected.provider !== 'string' || typeof selected.model !== 'string') {
+        throw new Error('selection_unavailable');
+      }
+      selection = Object.freeze({ provider: selected.provider, model: selected.model });
+      service = new DirectAssistService(llmHelper);
+    } catch {
+      return rejectDirectAssist(
+        event.sender,
+        request.requestId,
+        directAssistError('NO_PROVIDER_CONFIGURED', 'No usable Direct Assist provider is configured.'),
+      );
+    }
+
+    const surfaceKey = directAssistSurfaceKey(senderId, request.source);
+    const prior = activeDirectAssistBySurface.get(surfaceKey);
+    if (prior) prior.controller.abort();
+
+    const controller = new AbortController();
+    const active: ActiveDirectAssistRequest = {
+      requestId: request.requestId,
+      source: request.source,
+      senderId,
+      controller,
+    };
+    activeDirectAssistBySurface.set(surfaceKey, active);
+    activeDirectAssistByRequest.set(requestKey, active);
+
+    const onSenderDestroyed = (): void => controller.abort();
+    event.sender.once?.('destroyed', onSenderDestroyed);
+
+    // referenceContext and meetingTranscript are always server-computed, not
+    // taken from the renderer (which never sends either): raw, unchunked,
+    // unranked — every attached reference file's full text (capped only by a
+    // total-size safety ceiling, see buildDirectAssistReferenceContext), and
+    // the live session's last 180s of transcript (the same window the legacy
+    // live auto-answer path already reads via getFormattedContext). Direct
+    // Assist has no retrieval step of its own; this is the entire "evidence",
+    // left for the model to read itself.
+    //
+    // Both catches fail closed to '' (getActiveModeInfo() has a documented
+    // real throw case — see the FAIL-CLOSED comment ~line 3182 above) rather
+    // than reject the request: a missing mode/session should not block an
+    // otherwise-answerable typed question. Logged, unlike that ~3182 case,
+    // because an empty result here is otherwise indistinguishable from
+    // "nothing to include" — exactly the silent-mystery gap this feature's
+    // trimmedFields notice exists to close, so a load failure should not be
+    // invisible to both the notice AND the logs.
+    let referenceContext = '';
+    try {
+      const { ModesManager } = require('./services/ModesManager');
+      const activeModeId = ModesManager.getInstance().getActiveModeInfo()?.id;
+      if (activeModeId) {
+        referenceContext = buildDirectAssistReferenceContext(ModesManager.getInstance().getReferenceFiles(activeModeId));
+      }
+    } catch (error) {
+      console.warn('[direct-assist] reference files unavailable, proceeding without them:', (error as Error)?.message);
+    }
+
+    let meetingTranscript = '';
+    try {
+      meetingTranscript = appState.getIntelligenceManager()?.getFormattedContext?.(180) ?? '';
+    } catch (error) {
+      console.warn('[direct-assist] live session transcript unavailable, proceeding without it:', (error as Error)?.message);
+    }
+
+    const directRequest: DirectAssistRequestInput = Object.freeze({
+      requestId: request.requestId,
+      source: request.source,
+      selection,
+      currentRequest: resolvedSkill.currentRequest,
+      skill: resolvedSkill.skill ?? null,
+      manualContext: request.manualContext,
+      referenceContext,
+      pageContext: request.pageContext,
+      history: request.history,
+      transcript: request.transcript,
+      meetingTranscript,
+      imagePaths: request.imagePaths,
+      requestedLanguage: request.requestedLanguage,
+      requestedFormat: request.requestedFormat,
+      maxContextChars: request.maxContextChars,
+    });
+
+    void (async () => {
+      let terminalSent = false;
+      let startSent = false;
+      let lastSequence = 0;
+      let fullText = '';
+      const sendTerminal = (
+        payload: DirectAssistStreamEvent | {
+          type: 'error' | 'cancel';
+          requestId: string;
+          sequence: number;
+          partial?: boolean;
+          error?: DirectAssistIpcError;
+        },
+      ): void => {
+        if (terminalSent) return;
+        terminalSent = true;
+        sendDirectAssistEvent(event.sender, payload);
+      };
+
+      try {
+        for await (const streamEvent of service.stream(directRequest, controller.signal)) {
+          if (terminalSent) break;
+          if (streamEvent.requestId !== request.requestId) {
+            throw new Error('request_correlation_failed');
+          }
+          if (streamEvent.type === 'start') {
+            if (startSent) throw new Error('duplicate_start');
+            startSent = true;
+            sendDirectAssistEvent(event.sender, streamEvent);
+            continue;
+          }
+          if (streamEvent.type === 'delta') {
+            if (!startSent || streamEvent.sequence <= lastSequence) {
+              throw new Error('non_monotonic_stream');
+            }
+            lastSequence = streamEvent.sequence;
+            fullText += streamEvent.text;
+            sendDirectAssistEvent(event.sender, streamEvent);
+            continue;
+          }
+          lastSequence = Math.max(lastSequence, streamEvent.sequence);
+          if (streamEvent.type === 'done') {
+            sendTerminal({ ...streamEvent, fullText } as DirectAssistStreamEvent);
+          } else {
+            sendTerminal(streamEvent);
+          }
+          break;
+        }
+        if (!terminalSent) {
+          if (controller.signal.aborted) {
+            sendTerminal({
+              type: 'cancel',
+              requestId: request.requestId,
+              sequence: lastSequence + 1,
+            });
+          } else {
+            sendTerminal({
+              type: 'error',
+              requestId: request.requestId,
+              sequence: lastSequence + 1,
+              partial: lastSequence > 0,
+              error: directAssistError(
+                'INCOMPLETE_STREAM',
+                'The Direct Assist stream ended before completion.',
+                true,
+              ),
+            });
+          }
+        }
+      } catch {
+        if (controller.signal.aborted) {
+          sendTerminal({
+            type: 'cancel',
+            requestId: request.requestId,
+            sequence: lastSequence + 1,
+          });
+        } else {
+          sendTerminal({
+            type: 'error',
+            requestId: request.requestId,
+            sequence: lastSequence + 1,
+            partial: lastSequence > 0,
+            error: directAssistError(
+              'INCOMPLETE_STREAM',
+              'The Direct Assist stream failed before completion.',
+              true,
+            ),
+          });
+        }
+      } finally {
+        event.sender.removeListener?.('destroyed', onSenderDestroyed);
+        if (activeDirectAssistBySurface.get(surfaceKey) === active) {
+          activeDirectAssistBySurface.delete(surfaceKey);
+        }
+        if (activeDirectAssistByRequest.get(requestKey) === active) {
+          activeDirectAssistByRequest.delete(requestKey);
+        }
+      }
+    })();
+
+    return { accepted: true, requestId: request.requestId };
+  });
+
+  safeHandle(
+    'direct-assist-cancel',
+    async (event, requestId: unknown, source?: unknown) => {
+      if (
+        typeof requestId !== 'string'
+        || !DIRECT_ASSIST_REQUEST_ID_RE.test(requestId)
+        || (source !== undefined && source !== 'typed' && source !== 'stt' && source !== 'screenshot')
+      ) {
+        return { success: false, cancelled: false, error: 'invalid_request' };
+      }
+      const senderId = Number(event.sender?.id);
+      const active = activeDirectAssistByRequest.get(directAssistRequestKey(senderId, requestId));
+      if (!active || (source !== undefined && active.source !== source)) {
+        return { success: true, cancelled: false };
+      }
+      active.controller.abort();
+      return { success: true, cancelled: true };
+    },
+  );
 
   safeHandle('get-code-verification', async () => {
     // Default OFF: code verification is currently disabled. Only true when the
@@ -5481,7 +6542,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_type' };
     }
-    SettingsManager.getInstance().set('codeVerificationEnabled', enabled);
+    if (!SettingsManager.getInstance().set('codeVerificationEnabled', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     try {
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
@@ -5500,7 +6566,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (!['forever', '7d', '30d', 'never'].includes(retention)) {
       return { success: false, error: 'invalid_retention' };
     }
-    SettingsManager.getInstance().set('meetingRetention', retention);
+    if (!SettingsManager.getInstance().set('meetingRetention', retention)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('meeting-retention-changed', retention);
@@ -5526,7 +6597,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     // model-generated code to the cloud runner.
     const settings = SettingsManager.getInstance();
     const merged = mergeProviderDataScopes(settings.get('providerDataScopes'), scopes);
-    settings.set('providerDataScopes', merged as any);
+    if (!settings.set('providerDataScopes', merged as any)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         // Broadcast the MERGED object, not the incoming payload: the renderer
@@ -5548,7 +6624,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!['vision_first', 'vision_only', 'private_vision'].includes(mode)) {
         return { success: false, error: 'invalid_mode' };
       }
-      SettingsManager.getInstance().setScreenUnderstandingMode(mode);
+      // CR-04: report the REAL outcome. A refused write used to return success
+      // AND broadcast the change, so every renderer switched mode while disk
+      // still held the old value and the app reverted on restart.
+      if (!SettingsManager.getInstance().setScreenUnderstandingMode(mode)) {
+        return { success: false, error: 'settings_store_degraded' };
+      }
       BrowserWindow.getAllWindows().forEach((win) => {
         if (!win.isDestroyed()) {
           win.webContents.send('screen-understanding-mode-changed', mode);
@@ -5566,7 +6647,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_value' };
     }
-    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    if (!SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('technical-interview-vision-first-changed', enabled);
@@ -5648,16 +6734,24 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('hindsight-config:set', async (_, cfg: { baseUrl?: string; apiKey?: string; autoStart?: boolean; serverCommand?: string; llmProvider?: string }) => {
     try {
       const sm = SettingsManager.getInstance();
-      if (typeof cfg?.baseUrl === 'string') sm.set('hindsightBaseUrl', cfg.baseUrl.trim());
+      // R-24: this handler writes up to six keys. A refused write must not be
+      // reported as success, and must not go on to start() a server against
+      // config that was never persisted. Collect the outcomes and fail as one.
+      let persisted = true;
+      const put = (key: any, value: any): void => { if (!sm.set(key, value)) persisted = false; };
+      if (typeof cfg?.baseUrl === 'string') put('hindsightBaseUrl', cfg.baseUrl.trim());
       // Blank apiKey on resave = KEEP the stored one (don't wipe a saved key with an empty
       // field — the documented blank-key-on-resave gotcha). Only write a non-empty value.
-      if (typeof cfg?.apiKey === 'string' && cfg.apiKey.trim()) sm.set('hindsightApiKey', cfg.apiKey.trim());
-      if (typeof cfg?.autoStart === 'boolean') sm.set('hindsightAutoStart', cfg.autoStart);
-      if (typeof cfg?.serverCommand === 'string') sm.set('hindsightServerCommand', cfg.serverCommand.trim());
-      if (typeof cfg?.llmProvider === 'string') sm.set('hindsightLlmProvider', cfg.llmProvider.trim());
+      if (typeof cfg?.apiKey === 'string' && cfg.apiKey.trim()) put('hindsightApiKey', cfg.apiKey.trim());
+      if (typeof cfg?.autoStart === 'boolean') put('hindsightAutoStart', cfg.autoStart);
+      if (typeof cfg?.serverCommand === 'string') put('hindsightServerCommand', cfg.serverCommand.trim());
+      if (typeof cfg?.llmProvider === 'string') put('hindsightLlmProvider', cfg.llmProvider.trim());
       // Saving ANY config reverses the explicit-opt-out sentinel. The user is engaging
       // with Hindsight again — the override should not silently re-apply.
-      if (sm.get('hindsightExplicitlyDisabled') === true) sm.set('hindsightExplicitlyDisabled', false);
+      if (sm.get('hindsightExplicitlyDisabled') === true) put('hindsightExplicitlyDisabled', false);
+      if (!persisted) {
+        return { success: false, error: 'settings_store_degraded' };
+      }
       // Re-run start() so the auto-spawn fires IN-SESSION — previously the user had to restart
       // the app for the boot-time start() to see the new config. start() is idempotent and a
       // no-op when nothing changed (e.g. user just saved the same baseUrl).
@@ -5739,7 +6833,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('hindsight:disable', async () => {
     try {
       const sm = SettingsManager.getInstance();
-      sm.set('hindsightExplicitlyDisabled', true);
+      if (!sm.set('hindsightExplicitlyDisabled', true)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       const { HindsightManager } = require('./services/HindsightManager') as typeof import('./services/HindsightManager');
       // If we spawned an app-managed server, kill it. Cloud / user-managed servers stay up.
       try { HindsightManager.getInstance().stopSync(); } catch { /* nothing to stop */ }
@@ -5767,7 +6866,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     if (typeof enabled !== 'boolean') {
       return { success: false, error: 'invalid_value' };
     }
-    SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled);
+    if (!SettingsManager.getInstance().set('technicalInterviewVisionFirst', enabled)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
         win.webContents.send('technical-interview-vision-first-changed', enabled);
@@ -5845,7 +6949,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (level !== 'off' && level !== 'standard' && level !== 'verbose') {
         return { ok: false, error: 'invalid_level' };
       }
-      SettingsManager.getInstance().setContextDebugLevel(level);
+      // CR-04: a refused write used to be reported as success.
+      if (!SettingsManager.getInstance().setContextDebugLevel(level)) {
+        return { ok: false, error: 'settings_store_degraded' };
+      }
       // Effective config is re-read per turn, so this applies to the next
       // question without a restart. Env override (if set) still wins.
       return { ok: true };
@@ -6420,6 +7527,45 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle('set-nvidia-nim-api-key', async (_, apiKey: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const cm = CredentialsManager.getInstance();
+      const normalizedKey = (apiKey || '').trim();
+      const keyChanged = cm.getNvidiaNimApiKey() !== normalizedKey;
+      cm.setNvidiaNimApiKey(normalizedKey);
+      appState.processingHelper.getLLMHelper().setNvidiaNimApiKey(normalizedKey);
+
+      // One NVIDIA key backs BOTH the chat provider and speech recognition
+      // (verified: the same nvapi- credential authenticates integrate.api
+      // .nvidia.com and the NVCF speech functions). That sharing is fine; the
+      // silent coupling was not. Removing the key from AI Providers used to
+      // leave sttProvider on 'nvidia_nim' with nothing to authenticate with, so
+      // buildSttProvider fell through to GoogleSTT — which, with no service
+      // account, meant transcription simply stopped mid-meeting with a console
+      // warning and no user-visible cause.
+      // Turning the provider off explicitly puts the user in the ordinary "no
+      // speech provider configured" state, which the UI already explains.
+      // Only on CLEAR: setting or rotating a key must not touch the selection.
+      const sttWasNvidia = !normalizedKey && cm.getSttProvider() === 'nvidia_nim';
+      if (sttWasNvidia) {
+        cm.setSttProvider('none');
+        console.log('[IPC] NVIDIA key cleared while it was the speech provider — speech provider set to none');
+      }
+
+      await appState.reconfigureSttProvider();
+      appState.getIntelligenceManager().resetEngine();
+      appState.getIntelligenceManager().initializeLLMs();
+      if (keyChanged) {
+        await refreshRuntimeDefaultIfUnavailable();
+        broadcastCredentialsChanged();
+      }
+      // Reported back so Settings can say WHY speech switched off, rather than
+      // the user discovering it later in a meeting.
+      return { success: true, sttProviderCleared: sttWasNvidia };
+    } catch (error: any) { return { success: false, error: error.message }; }
+  });
+
   safeHandle('set-litellm-config', async (_, config: { apiKey: string; baseURL: string; maxTokens?: number }) => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -6584,6 +7730,10 @@ export function initializeIpcHandlers(appState: AppState): void {
   const PRICING_CACHE_TTL_MS = 5 * 60_000;
 
   safeHandle('set-natively-api-key', async (_, apiKey: string) => {
+    // Set when the server REFUSES the key, so the handler can report the real
+    // reason instead of the unconditional { success: true } it used to return
+    // even for a key that authenticates nowhere.
+    let keyRejection: { error?: string } | null = null;
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
@@ -6598,7 +7748,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const defaultModel = cm.getDefaultModel();
       const providers = [...(cm.getCurlProviders() || []), ...(cm.getCustomProviders() || [])];
       llmHelper.setModel(defaultModel, providers);
-      appState.broadcast('model-changed', defaultModel);
+      appState.sendModelChanged(defaultModel);
 
       // If setNativelyApiKey auto-promoted the STT provider to 'natively', reconfigure
       // the audio pipeline immediately — without this, the in-memory pipeline still uses
@@ -6666,6 +7816,39 @@ export function initializeIpcHandlers(appState: AppState): void {
               '[IPC] set-natively-api-key: Pro inactive —',
               result.error,
             );
+          } else if (result.keyRejected) {
+            // The server REFUSED the key (4xx): it authenticates nowhere,
+            // /v1/chat included (both go through validateKey). By this point
+            // CredentialsManager.setNativelyApiKey has ALREADY auto-promoted the
+            // default model — and possibly the STT provider — to 'natively' and
+            // saved, so leaving it here parks the user on an endpoint that
+            // rejects every request, with nothing but a console line to say why.
+            // Undo the promotion and hand the server's own reason to the settings
+            // UI, which already renders `error` when a save reports failure.
+            //
+            // Only the 4xx branch does this. A standard-plan key ('no Pro') still
+            // authenticates against /v1/chat — the server gates only
+            // /v1/pro/verify on PRO_PLANS — and a 5xx/network verdict says
+            // nothing about the key, so neither may tear down working state.
+            console.warn(
+              '[IPC] set-natively-api-key: key REFUSED by server —',
+              result.code,
+              result.error,
+            );
+            const reverted = cm.revertNativelyAutoDefaults('Natively key refused by server');
+            if (reverted.defaultModel) {
+              const revertedProviders = [
+                ...(cm.getCurlProviders() || []),
+                ...(cm.getCustomProviders() || []),
+              ];
+              llmHelper.setModel(reverted.defaultModel, revertedProviders);
+              appState.sendModelChanged(reverted.defaultModel);
+            }
+            if (reverted.sttProvider) {
+              await appState.reconfigureSttProvider();
+            }
+            broadcastCredentialsChanged();
+            keyRejection = { error: result.error };
           } else {
             console.log('[IPC] set-natively-api-key: Pro not activated —', result.error);
           }
@@ -6703,7 +7886,9 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
       }
 
-      return { success: true };
+      return keyRejection
+        ? { success: false, error: keyRejection.error }
+        : { success: true };
     } catch (error: any) {
       console.error('Error saving Natively API key:', error);
       return { success: false, error: error.message };
@@ -6791,13 +7976,29 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const cm = CredentialsManager.getInstance();
 
-      // Get hardware ID for HWID-binding
-      let hwid = 'unavailable';
+      // Get hardware ID for HWID-binding.
+      //
+      // F-601: this MUST be a real per-machine identity. LicenseManager
+      // returns the literal string 'unavailable' when the native module
+      // failed to load (its own JSDoc scopes that value to "display to the
+      // user for support purposes"), and the trial row is keyed
+      // `hwid text NOT NULL UNIQUE` server-side. Sending the sentinel makes
+      // every machine with a broken native module collide on ONE
+      // free_trials row: the server's idempotent re-issue branch hands back
+      // a valid signed trial token for a STRANGER's trial, exposing their
+      // usage counters and billing every request against their quota.
+      // Fail closed instead — a trial that cannot be bound to this machine
+      // must not be started.
+      let hwid = '';
       try {
         const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-        hwid = LicenseManager.getInstance().getHardwareId() || 'unavailable';
+        hwid = LicenseManager.getInstance().getHardwareId() || '';
       } catch {
-        /* LicenseManager not available — fall back */
+        /* LicenseManager not available — handled by the guard below */
+      }
+      if (!hwid || hwid === 'unavailable') {
+        console.error('[Trial] Refusing to start a trial without a real hardware id (native module unavailable).');
+        return { ok: false, error: 'hardware_id_unavailable' };
       }
 
       const res = await fetch('https://api.natively.software/v1/trial/start', {
@@ -7380,6 +8581,38 @@ export function initializeIpcHandlers(appState: AppState): void {
   });
 
   // Get stored API keys (masked for UI display)
+  // R-10 resolution flow (§19.1): let the settings UI surface the ambiguous
+  // two-store state and apply the user's choice. Summary carries key NAMES and
+  // last-4 only — never values.
+  safeHandle('credentials:get-ambiguous-stores', async () => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      return CredentialsManager.getInstance().getAmbiguousStoreSummary();
+    } catch (e) {
+      console.error('[IPC] credentials:get-ambiguous-stores error:', e);
+      return null;
+    }
+  });
+
+  safeHandle('credentials:resolve-ambiguous-stores', async (_event, choice: 'keyring' | 'fallback' | 'merge') => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      const result = CredentialsManager.getInstance().resolveAmbiguousStores(choice);
+      if (result.ok) {
+        // The active credential set just changed wholesale — tell every window
+        // the same way an ordinary key edit does.
+        const { BrowserWindow } = require('electron');
+        for (const win of BrowserWindow.getAllWindows()) {
+          try { win.webContents.send('credentials-changed'); } catch { /* window closing */ }
+        }
+      }
+      return result;
+    } catch (e) {
+      console.error('[IPC] credentials:resolve-ambiguous-stores error:', e);
+      return { ok: false, error: 'internal_error' };
+    }
+  });
+
   safeHandle('get-stored-credentials', async () => {
     try {
       const { CredentialsManager } = require('./services/CredentialsManager');
@@ -7394,6 +8627,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: hasKey(creds.openaiApiKey),
         hasClaudeKey: hasKey(creds.claudeApiKey),
         hasDeepseekKey: hasKey(creds.deepseekApiKey),
+        hasNvidiaNimKey: hasKey(creds.nvidiaNimApiKey),
         hasLitellmBaseURL: hasKey(creds.litellmBaseURL),
         // The base URL is config, not a secret — returned in full so Settings can
         // prefill it (unlike API keys, which are only reported as booleans).
@@ -7402,6 +8636,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasNativelyKey: hasKey(creds.nativelyApiKey),
         googleServiceAccountPath: creds.googleServiceAccountPath || null,
         sttProvider: creds.sttProvider || 'none',
+        nvidiaNimSttModel: creds.nvidiaNimSttModel || 'nemotron-asr-streaming',
         groqSttModel: creds.groqSttModel || 'whisper-large-v3-turbo',
         hasSttGroqKey: hasKey(creds.groqSttApiKey),
         hasSttOpenaiKey: hasKey(creds.openAiSttApiKey),
@@ -7430,6 +8665,19 @@ export function initializeIpcHandlers(appState: AppState): void {
         openaiPreferredModel: creds.openaiPreferredModel || undefined,
         claudePreferredModel: creds.claudePreferredModel || undefined,
         deepseekPreferredModel: creds.deepseekPreferredModel || undefined,
+        // A retired id is withheld, not reported. `nvidia_nimPreferredModel` is a
+        // SECOND persisted store — AIProvidersSettings pushes it into the
+        // default-model dropdown as an extra option even when it is absent from
+        // the offered list — so leaving it in would keep offering
+        // meta/llama-3.1-8b-instruct (EOL 2026-08-26) after the picker table
+        // dropped it, and the retired-default repair above would silently undo
+        // the user's pick on the next refresh. Withholding it here is the only
+        // place that covers both.
+        nvidia_nimPreferredModel:
+          (require('./llm/nvidiaNimModels') as typeof import('./llm/nvidiaNimModels'))
+            .isNvidiaNimRetiredModelId(creds.nvidia_nimPreferredModel)
+            ? undefined
+            : creds.nvidia_nimPreferredModel || undefined,
         // Stored prefixed (`litellm/<model>`) — see StoredCredentials.litellmPreferredModel.
         litellmPreferredModel: creds.litellmPreferredModel || undefined,
         disabledProviders: creds.disabledProviders || [],
@@ -7443,6 +8691,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         hasOpenaiKey: false,
         hasClaudeKey: false,
         hasDeepseekKey: false,
+        hasNvidiaNimKey: false,
         hasLitellmBaseURL: false,
         litellmBaseURL: null,
         litellmMaxTokens: null,
@@ -7477,7 +8726,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'fetch-provider-models',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey: string) => {
       try {
         // Fall back to stored key if no key was explicitly provided
         let key = apiKey?.trim();
@@ -7489,6 +8738,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           else if (provider === 'openai') key = cm.getOpenaiApiKey();
           else if (provider === 'claude') key = cm.getClaudeApiKey();
           else if (provider === 'deepseek') key = cm.getDeepseekApiKey();
+          else if (provider === 'nvidia_nim') key = cm.getNvidiaNimApiKey();
         }
 
         if (!key) {
@@ -7526,7 +8776,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'set-provider-preferred-model',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'litellm', modelId: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim' | 'litellm', modelId: string) => {
       try {
         const { CredentialsManager } = require('./services/CredentialsManager');
         CredentialsManager.getInstance().setPreferredModel(provider, modelId);
@@ -7554,6 +8804,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         | 'azure'
         | 'ibmwatson'
         | 'soniox'
+        | 'nvidia_nim'
         | 'natively'
         | 'local-whisper',
     ) => {
@@ -7593,6 +8844,24 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       return 'none';
     }
+  });
+
+  safeHandle('set-nvidia-nim-stt-model', async (_, model: string) => {
+    try {
+      const { CredentialsManager } = require('./services/CredentialsManager');
+      // Single source of truth — see NVIDIA_NIM_STT_MODELS. A second hardcoded
+      // list here would silently reject models the picker already offers.
+      const { isNvidiaNimSttModel } = require('./audio/nvidiaNimSttModels');
+      if (!isNvidiaNimSttModel(model)) {
+        return { success: false, error: 'Unsupported NVIDIA NIM speech model' };
+      }
+      const cm = CredentialsManager.getInstance();
+      const persisted = cm.setNvidiaNimSttModel(model);
+      if (!persisted) return { success: false, error: 'Could not save NVIDIA NIM speech model' };
+      await appState.reconfigureSttProvider();
+      broadcastCredentialsChanged();
+      return { success: true };
+    } catch (error: any) { return { success: false, error: error.message }; }
   });
 
   // Shared guard for STT key saves. Keys persist via the OS keyring or, when that is
@@ -7826,7 +9095,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     'test-stt-connection',
     async (
       _,
-      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox',
+      provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim',
       apiKey: string,
       region?: string,
     ) => {
@@ -7850,7 +9119,16 @@ export function initializeIpcHandlers(appState: AppState): void {
           return { success: false, error: 'Invalid region' };
         }
 
-        if (provider === 'deepgram') {
+        if (provider === 'nvidia_nim') {
+          // Extracted so the settle-on-any-terminal-event logic is unit-testable
+          // (scripts/dev/riva-probe-check.cjs) instead of buried in this handler.
+          const { probeNvidiaNimStt } = require('./audio/nvidiaNimSttProbe');
+          const { CredentialsManager: CM } = require('./services/CredentialsManager');
+          // Probe the model the user actually selected — the models sit behind
+          // different NVCF function-ids, so testing a fixed one can pass while
+          // the selected model is unreachable.
+          return await probeNvidiaNimStt(apiKey, CM.getInstance().getNvidiaNimSttModel());
+        } else if (provider === 'deepgram') {
           const WebSocket = require('ws');
           const token = apiKey.trim();
           return await new Promise<{ success: boolean; error?: string }>((resolve) => {
@@ -8090,7 +9368,16 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('local-whisper-get-models', async () => {
     try {
       const { getAvailableModels } = require('./audio/whisper/modelManager');
-      const models = getAvailableModels();
+      const { getLocalModelLanguageSupport } = require('./audio/whisper/modelLanguageSupport');
+      // languageSupport: which RECOGNITION_LANGUAGES keys each model accepts
+      // (verified against each model's official docs — see
+      // modelLanguageSupport.ts). The Settings UI uses it to restrict the
+      // Language options to the active model's set and to grey out the
+      // Language / Accent-Region selects when the model can't change them.
+      const models = getAvailableModels().map((m: any) => ({
+        ...m,
+        languageSupport: getLocalModelLanguageSupport(m.id),
+      }));
       const activeModelId = SettingsManager.getInstance().get('localWhisperModel') ?? '';
       return { models, activeModelId };
     } catch (e: any) {
@@ -8146,7 +9433,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!MODEL_CATALOG_IDS.has(modelId)) {
         return { success: false, error: `Unknown local Whisper model: ${modelId}` };
       }
-      SettingsManager.getInstance().set('localWhisperModel', modelId);
+      if (!SettingsManager.getInstance().set('localWhisperModel', modelId)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       return { success: true };
     } catch (e: any) {
       return { success: false, error: e.message };
@@ -8167,7 +9459,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       const badGlobal = sm.get('localWhisperModel');
       const badMic = sm.get('localWhisperModelMic');
       const badSystem = sm.get('localWhisperModelSystem');
-      sm.set('localWhisperModel', DEFAULT_MODEL);
+      if (!sm.set('localWhisperModel', DEFAULT_MODEL)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       if (badMic) sm.set('localWhisperModelMic', DEFAULT_MODEL);
       if (badSystem) sm.set('localWhisperModelSystem', DEFAULT_MODEL);
       // Drop the recent-failure cooldown for every id we just replaced.
@@ -8215,7 +9512,12 @@ export function initializeIpcHandlers(appState: AppState): void {
         if (typeof cfg?.enabled === 'boolean') sm.set('localWhisperPerChannelEnabled', cfg.enabled);
         if (typeof cfg?.micModelId === 'string') sm.set('localWhisperModelMic', cfg.micModelId);
         if (typeof cfg?.systemModelId === 'string')
-          sm.set('localWhisperModelSystem', cfg.systemModelId);
+          if (!sm.set('localWhisperModelSystem', cfg.systemModelId)) {
+            // R-24: the write was refused (degraded settings store). Returning
+            // success — and broadcasting below — put every window on a value disk
+            // never received, which silently reverted on the next launch.
+            return { success: false, error: 'settings_store_degraded' };
+          }
         return { success: true };
       } catch (e: any) {
         return { success: false, error: e.message };
@@ -8244,8 +9546,8 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Settings overlay severed the event channel is no longer possible.
   safeHandle('local-whisper-start-download', async (_event, modelId: string) => {
     try {
-      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
-      const r = LocalModelDownloadService.getInstance().start('whisper', modelId);
+      const { LocalModelDownloadService, resolveLocalModelProviderName } = require('./services/LocalModelDownloadService');
+      const r = LocalModelDownloadService.getInstance().start(resolveLocalModelProviderName(modelId), modelId);
       // Preserve the original return shape: the panel treats 'already-downloading'
       // as a non-error success.
       if (r.alreadyDownloading) return { success: false, error: 'already-downloading' };
@@ -8257,8 +9559,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle('local-whisper-cancel-download', async (_event, modelId: string) => {
     try {
-      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
-      return LocalModelDownloadService.getInstance().cancel('whisper', modelId);
+      const { LocalModelDownloadService, resolveLocalModelProviderName } = require('./services/LocalModelDownloadService');
+      return LocalModelDownloadService.getInstance().cancel(resolveLocalModelProviderName(modelId), modelId);
     } catch (e: any) {
       return { success: false, error: e?.message ?? String(e) };
     }
@@ -8270,8 +9572,17 @@ export function initializeIpcHandlers(appState: AppState): void {
   // mid-download.
   safeHandle('local-whisper-get-download-state', async (_event, modelId?: string) => {
     try {
-      const { LocalModelDownloadService } = require('./services/LocalModelDownloadService');
-      return LocalModelDownloadService.getInstance().getState('whisper', modelId);
+      const { LocalModelDownloadService, resolveLocalModelProviderName } = require('./services/LocalModelDownloadService');
+      // With a modelId, resolve its real provider (whisper vs nemotron) for
+      // the single-entry lookup. Without one (querying every in-flight
+      // download for the panel's initial mount), pass no providerName at
+      // all — getState() then returns entries across every registered
+      // provider; hardcoding 'whisper' here previously meant the panel
+      // could never see a Nemotron entry on remount.
+      return LocalModelDownloadService.getInstance().getState(
+        modelId ? resolveLocalModelProviderName(modelId) : undefined,
+        modelId,
+      );
     } catch {
       return modelId ? null : [];
     }
@@ -8317,7 +9628,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle(
     'test-llm-connection',
-    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey?: string) => {
+    async (_, provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey?: string) => {
       console.log(`[IPC] Received test-llm-connection request for provider: ${provider}`);
       try {
         if (!apiKey || !apiKey.trim()) {
@@ -8328,6 +9639,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           else if (provider === 'openai') apiKey = creds.getOpenaiApiKey();
           else if (provider === 'claude') apiKey = creds.getClaudeApiKey();
           else if (provider === 'deepseek') apiKey = creds.getDeepseekApiKey();
+          else if (provider === 'nvidia_nim') apiKey = creds.getNvidiaNimApiKey();
         }
 
         if (!apiKey || !apiKey.trim()) {
@@ -8338,7 +9650,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         let response;
 
         if (provider === 'gemini') {
-          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent`;
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent`;
           response = await axios.post(
             url,
             {
@@ -8350,17 +9662,38 @@ export function initializeIpcHandlers(appState: AppState): void {
             },
           );
         } else if (provider === 'groq') {
-          response = await axios.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            {
-              model: 'llama-3.3-70b-versatile',
-              messages: [{ role: 'user', content: 'Hello' }],
-            },
-            {
-              headers: { Authorization: `Bearer ${apiKey}` },
-              timeout: 15000,
-            },
-          );
+          // Walk the ladder instead of pinning one id. The preferred Groq model
+          // is PREVIEW tier and Groq discontinues preview models without notice —
+          // pinning one turns its retirement into "your API key doesn't work",
+          // which is what users saw when llama-3.3-70b-versatile was switched off.
+          // Only a model-gone error advances; a bad key or a rate limit still
+          // fails immediately with its own message.
+          const { GROQ_TEXT_MODEL_LADDER, isGroqModelGone } = require('./llm/groqModels');
+          let lastGroqError: any = null;
+          for (const candidate of GROQ_TEXT_MODEL_LADDER) {
+            try {
+              response = await axios.post(
+                'https://api.groq.com/openai/v1/chat/completions',
+                {
+                  model: candidate,
+                  messages: [{ role: 'user', content: 'Hello' }],
+                },
+                {
+                  headers: { Authorization: `Bearer ${apiKey}` },
+                  timeout: 15000,
+                },
+              );
+              if (candidate !== GROQ_TEXT_MODEL_LADDER[0]) {
+                console.warn(`[IPC] Groq test: ${GROQ_TEXT_MODEL_LADDER[0]} is gone; the key works on ${candidate}`);
+              }
+              lastGroqError = null;
+              break;
+            } catch (groqErr: any) {
+              lastGroqError = groqErr;
+              if (!isGroqModelGone(groqErr)) break;
+            }
+          }
+          if (lastGroqError) throw lastGroqError;
         } else if (provider === 'openai') {
           response = await axios.post(
             'https://api.openai.com/v1/chat/completions',
@@ -8407,6 +9740,60 @@ export function initializeIpcHandlers(appState: AppState): void {
             },
           );
         }
+        else if (provider === 'nvidia_nim') {
+          // THE QUESTION THIS PROBE ANSWERS IS "was the key accepted?", not "did
+          // this model answer?". Getting that backwards is what broke it twice:
+          // first the pinned meta/llama-3.1-8b-instruct was retired (410) and
+          // reported as a bad key, then a live-looking replacement returned 404
+          // "Model not found" and was reported as a bad key too — even though
+          // NVIDIA only reaches a 404 AFTER authenticating, so that 404 was
+          // proof the key worked. See llm/nvidiaNimModels.ts for the full
+          // response matrix; the classifier owns the mapping.
+          const { NVIDIA_NIM_TEST_MODEL_LADDER, classifyNvidiaNimProbeError } =
+            require('./llm/nvidiaNimModels') as typeof import('./llm/nvidiaNimModels');
+          let lastNvidiaError: any = null;
+          let nvidiaKeyAccepted = false;
+          for (const candidate of NVIDIA_NIM_TEST_MODEL_LADDER) {
+            try {
+              response = await axios.post('https://integrate.api.nvidia.com/v1/chat/completions', {
+                model: candidate, messages: [{ role: 'user', content: 'Hello' }], max_tokens: 10,
+              }, { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 15000 });
+              lastNvidiaError = null;
+              break;
+            } catch (nvidiaErr: any) {
+              // The candidate is named in every branch. Without it the log said
+              // only "status: 404" and gave no way to tell WHICH rung failed,
+              // which cost a full round trip with the user to work out.
+              const verdict = classifyNvidiaNimProbeError(nvidiaErr);
+              console.warn(`[IPC] NVIDIA NIM test: ${candidate} -> ${nvidiaErr?.response?.status || nvidiaErr?.code} (${verdict})`);
+              if (verdict === 'try-next') { lastNvidiaError = nvidiaErr; continue; }
+              if (verdict === 'key-ok') {
+                // Authenticated, then rejected the model. The account simply is
+                // not entitled to this id — which is not what Test Connection
+                // asks about, and not something the user can act on.
+                nvidiaKeyAccepted = true;
+                lastNvidiaError = null;
+              } else {
+                lastNvidiaError = nvidiaErr;
+              }
+              break;
+            }
+          }
+          if (lastNvidiaError && classifyNvidiaNimProbeError(lastNvidiaError) === 'try-next') {
+            // Every rung was retired. 410 is pre-auth, so we learned NOTHING
+            // about the key — and rethrowing would show the user "the model
+            // 'mistralai/…' has reached its end of life", naming a model they
+            // never chose in a dialog asking about their key. Say what is
+            // actually true instead.
+            console.error(`[IPC] NVIDIA NIM test: every candidate is retired (${NVIDIA_NIM_TEST_MODEL_LADDER.join(', ')})`);
+            return {
+              success: false,
+              error: 'Could not verify the key: every model this test uses has been retired by NVIDIA. Update Natively, or pick a model from Refresh and try it directly.',
+            };
+          }
+          if (lastNvidiaError) throw lastNvidiaError;
+          if (nvidiaKeyAccepted && !response) return { success: true };
+        }
 
         if (response && (response.status === 200 || response.status === 201)) {
           return { success: true };
@@ -8417,18 +9804,32 @@ export function initializeIpcHandlers(appState: AppState): void {
         // CRITICAL: do NOT log the raw axios error — it includes the request config
         // with the Authorization header (full API key) and is dumped verbatim by
         // Node's util.inspect. Strip to a safe shape before logging.
+        //
+        // `detail`/`title` are read alongside the OpenAI-shaped fields because
+        // NVIDIA answers in RFC-7807 (`{type,title,status,detail}`) with neither
+        // `error.message` nor `message`. Without them a retired model logged
+        // `responseError: undefined` and told the user only "Request failed with
+        // status code 410", hiding NVIDIA's own "…has reached its end of life on
+        // 2026-08-26" — the one sentence that explains it isn't their key.
+        const { nvidiaNimErrorDetail } =
+          require('./llm/nvidiaNimModels') as typeof import('./llm/nvidiaNimModels');
+        const responseError =
+          error?.response?.data?.error?.message ||
+          error?.response?.data?.message ||
+          nvidiaNimErrorDetail(error);
         const safeInfo = {
           provider,
           status: error?.response?.status,
           statusText: error?.response?.statusText,
           code: error?.code,
           message: error?.message,
-          responseError: error?.response?.data?.error?.message || error?.response?.data?.message,
+          responseError,
         };
         console.error('LLM connection test failed:', safeInfo);
         const rawMsg =
           error?.response?.data?.error?.message ||
           error?.response?.data?.message ||
+          nvidiaNimErrorDetail(error) ||
           (error.response?.data?.error?.type
             ? `${error.response.data.error.type}: ${error.response.data.error.message}`
             : error.message) ||
@@ -8455,7 +9856,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       llmHelper.setGroqFastTextMode(enabled);
 
       const { SettingsManager } = require('./services/SettingsManager');
-      SettingsManager.getInstance().set('groqFastTextMode', enabled);
+      if (!SettingsManager.getInstance().set('groqFastTextMode', enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
 
       // Broadcast to all windows
       BrowserWindow.getAllWindows().forEach((win) => {
@@ -8481,7 +9887,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const normalized = CodexCliService.normalizeConfig(config || {});
       const sm = SettingsManager.getInstance();
-      sm.set('codexCliEnabled', normalized.enabled);
+      if (!sm.set('codexCliEnabled', normalized.enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
       sm.set('codexCliPath', normalized.path);
       sm.set('codexCliModel', normalized.model);
       sm.set('codexCliFastModel', normalized.fastModel);
@@ -8670,7 +10081,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         llmHelper.prewarmPromptCache().catch((_e: any): void => {});
       }
 
-      appState.broadcast('model-changed', modelId);
+      appState.sendModelChanged(modelId);
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -8702,7 +10113,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         llmHelper.prewarmPromptCache().catch((_e: any): void => {});
       }
 
-      appState.broadcast('model-changed', modelId);
+      appState.sendModelChanged(modelId);
 
       // Close the selector window if open
       appState.modelSelectorWindowHelper.hideWindow();
@@ -8722,7 +10133,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       return { model: cm.getDefaultModel() };
     } catch (error: any) {
       console.error('Error getting default model:', error);
-      return { model: 'gemini-3.6-flash' };
+      return { model: 'gemini-3.7-flash' };
     }
   });
 
@@ -9232,7 +10643,39 @@ export function initializeIpcHandlers(appState: AppState): void {
   // ==========================================
 
   // MODE 1: Assist (Passive observation)
+  // ── Usage-ledger feature instrumentation (phase 4) ─────────────────────────
+  //
+  // `runTracked` emits feature_started and exactly one terminal event. The
+  // feature name comes from the ACTIVE MODE and is only a NAMED feature when
+  // that mode is a built-in — a custom mode a user renamed "Technical
+  // Interview" reports the honest `mode_execution` instead (§31).
+  //
+  // Everything is wrapped: instrumentation must never be able to fail the answer
+  // it measures, so a failure to resolve the mode degrades to `mode_execution`
+  // rather than throwing into the handler.
+  const _usageFeature = (): any => {
+    try {
+      const { featureForMode } = require('./services/usageInstrumentation');
+      const { ModesManager: _MMUsage } = require('./services/ModesManager');
+      return featureForMode(_MMUsage.getInstance().getActiveMode());
+    } catch {
+      return 'mode_execution';
+    }
+  };
+  const _tracked = async <T>(fn: () => Promise<T>, failedIf?: (r: T) => boolean): Promise<T> => {
+    try {
+      const { runTracked } = require('./services/usageInstrumentation');
+      return await runTracked(_usageFeature(), fn, failedIf ? { failedIf } : undefined);
+    } catch (e: any) {
+      // Only a require()/wiring failure lands here; runTracked rethrows the
+      // handler's own error untouched, so this cannot swallow a real one.
+      if (e && e.__usageWrapperFailure) return fn();
+      throw e;
+    }
+  };
+
   safeHandle('generate-assist', async () => {
+    return _tracked(async () => {
     try {
       const intelligenceManager = appState.getIntelligenceManager();
       const insight = await intelligenceManager.runAssistMode();
@@ -9249,6 +10692,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    }, (r: any) => !r || r.insight === null || r.insight === undefined);
   });
 
   // MODE 2: What Should I Say (Primary auto-answer)
@@ -9267,6 +10711,10 @@ export function initializeIpcHandlers(appState: AppState): void {
       imagePaths?: string[],
       options?: { promptInstruction?: string; domContext?: string; domContextEnvelope?: unknown },
     ) => {
+      return _tracked(async () => {
+      // Auto Answer V3: a manual What-to-Answer (hotkey, button, or an accepted
+      // offer card) commits whatever Auto Answer was offering — retract the card.
+      try { appState.onManualWhatToAnswer?.(); } catch { /* never block the answer */ }
       try {
         let screenContext: any;
         let screenContextStatus: 'not_available' | 'available' | 'failed' = 'not_available';
@@ -9459,16 +10907,23 @@ export function initializeIpcHandlers(appState: AppState): void {
         };
       } catch (error: any) {
         console.error('[IPC] generate-what-to-say error:', error);
+        // Returns an error object rather than throwing. runTracked's default
+        // predicate reads the truthy `error` field and records this as FAILED —
+        // a dispute report must never imply service was delivered when it was
+        // not (§6). The two early returns above use the same shape and are
+        // classified the same way, which is the point of the shared wrapper.
         return {
           answer: null,
           question: question || 'unknown',
           error: error?.message || 'unknown_error',
         };
       }
+      });
     },
   );
 
   safeHandle('generate-clarify', async () => {
+    return _tracked(async () => {
     try {
       const intelligenceManager = appState.getIntelligenceManager();
       const clarification = await intelligenceManager.runClarify();
@@ -9494,6 +10949,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    }, (r: any) => !r || r.clarification === null || r.clarification === undefined);
   });
 
   // Shared helper: validate, then run images through the vision-first ImageOptimizer
@@ -9529,6 +10985,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   }
 
   safeHandle('generate-code-hint', async (_, imagePaths?: string[], problemStatement?: string) => {
+    return _tracked(async () => {
     try {
       // If no explicit images were passed from the frontend, fall back to the
       // screenshot queue so the AI can always "see" the user's screen.
@@ -9583,9 +11040,11 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    });
   });
 
   safeHandle('generate-brainstorm', async (_, imagePaths?: string[], problemStatement?: string) => {
+    return _tracked(async () => {
     try {
       // If no explicit images were passed from the frontend, fall back to the
       // screenshot queue so the AI can always "see" the user's screen.
@@ -9639,6 +11098,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    });
   });
 
   // Dynamic Action Button Mode (Recap vs Brainstorm)
@@ -9651,7 +11111,12 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle('set-action-button-mode', (_, mode: 'recap' | 'brainstorm') => {
     const { SettingsManager } = require('./services/SettingsManager');
     const sm = SettingsManager.getInstance();
-    sm.set('actionButtonMode', mode);
+    if (!sm.set('actionButtonMode', mode)) {
+      // R-24: the write was refused (degraded settings store). Returning
+      // success — and broadcasting below — put every window on a value disk
+      // never received, which silently reverted on the next launch.
+      return { success: false, error: 'settings_store_degraded' };
+    }
 
     BrowserWindow.getAllWindows().forEach((win) => {
       if (!win.isDestroyed()) {
@@ -9664,6 +11129,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   // MODE 3: Follow-Up (Refinement)
   safeHandle('generate-follow-up', async (_, intent: string, userRequest?: string) => {
+    return _tracked(async () => {
     try {
       const intelligenceManager = appState.getIntelligenceManager();
       const refined = await intelligenceManager.runFollowUp(intent, userRequest);
@@ -9680,10 +11146,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    }, (r: any) => !r || r.refined === null || r.refined === undefined);
   });
 
   // MODE 4: Recap (Summary)
   safeHandle('generate-recap', async () => {
+    return _tracked(async () => {
     try {
       const intelligenceManager = appState.getIntelligenceManager();
       const summary = await intelligenceManager.runRecap();
@@ -9700,10 +11168,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    }, (r: any) => !r || r.summary === null || r.summary === undefined);
   });
 
   // MODE 6: Follow-Up Questions
   safeHandle('generate-follow-up-questions', async () => {
+    return _tracked(async () => {
     try {
       const intelligenceManager = appState.getIntelligenceManager();
       const questions = await intelligenceManager.runFollowUpQuestions();
@@ -9720,6 +11190,7 @@ export function initializeIpcHandlers(appState: AppState): void {
     } catch (error: any) {
       throw error;
     }
+    }, (r: any) => !r || r.questions === null || r.questions === undefined);
   });
 
   // MODE 5: Manual Answer (Fallback)
@@ -9971,6 +11442,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // ==========================================
 
   safeHandle('generate-followup-email', async (_, input: any) => {
+    return _tracked(async () => {
     try {
       const { FOLLOWUP_EMAIL_PROMPT, GROQ_FOLLOWUP_EMAIL_PROMPT } = require('./llm/prompts');
       const { buildFollowUpEmailPromptInput } = require('./utils/emailUtils');
@@ -10008,6 +11480,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       console.error('Error generating follow-up email:', error);
       throw error;
     }
+    });
   });
 
   safeHandle('extract-emails-from-transcript', async (_, transcript: Array<{ text: string }>) => {
@@ -10218,7 +11691,14 @@ export function initializeIpcHandlers(appState: AppState): void {
           return { fallback: true };
         }
         console.error('[RAG] Live query error:', error);
-        event.sender.send('rag:stream-error', { live: true, error: msg });
+        // No rag:stream-error here (F-118): the {success:false} return below
+        // makes the renderer fall through to regular live chat, so a terminal
+        // error event would DOUBLE-SIGNAL — the error handler stapled
+        // "[RAG Error: …]" into the bubble and cleared streaming state, and
+        // the fallback then streamed fresh tokens into that torn-down row.
+        // For the live class the fallback owns the UX; the meeting/global
+        // handlers keep their terminal events because nothing falls back.
+        // Live-reproduced in scripts/audit/F-118-repro.mjs.
       }
       return { success: false, error: error.message };
     } finally {
@@ -10485,7 +11965,12 @@ export function initializeIpcHandlers(appState: AppState): void {
       orchestrator.setKnowledgeMode(enabled);
 
       const { SettingsManager } = require('./services/SettingsManager');
-      SettingsManager.getInstance().set('knowledgeMode', enabled);
+      if (!SettingsManager.getInstance().set('knowledgeMode', enabled)) {
+        // R-24: the write was refused (degraded settings store). Returning
+        // success — and broadcasting below — put every window on a value disk
+        // never received, which silently reverted on the next launch.
+        return { success: false, error: 'settings_store_degraded' };
+      }
 
       return { success: true };
     } catch (error: any) {
@@ -10500,7 +11985,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
-      orchestrator.deleteDocumentsByType(DocType.RESUME);
+      // Both tiers in ONE transaction. Deleting only Tier 1 here left Tier 2's
+      // PII-bearing knowledge_cards orphaned — the user asked for their résumé
+      // to be removed and half of it stayed on disk. Tier 1 (premium
+      // KnowledgeDatabaseManager) and Tier 2 (this repo's DatabaseManager) wrap
+      // the SAME better-sqlite3 connection, so runInTransaction() is a genuine
+      // cross-tier rollback rather than call sequencing.
+      const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
+      deleteProfileTransactional(orchestrator, DocType.RESUME, 'resume');
       return { success: true };
     } catch (error: any) {
       return { success: false, error: error.message };
@@ -10626,7 +12118,10 @@ export function initializeIpcHandlers(appState: AppState): void {
         return { success: false, error: 'Knowledge engine not initialized' };
       }
       const { DocType } = require('../premium/electron/knowledge/types');
-      orchestrator.deleteDocumentsByType(DocType.JD);
+      // Same cross-tier transaction as profile:delete above — see the comment
+      // there for why a Tier-1-only delete is a partial delete.
+      const { deleteProfileTransactional } = require('./services/knowledge/deleteProfileTransactional') as typeof import('./services/knowledge/deleteProfileTransactional');
+      deleteProfileTransactional(orchestrator, DocType.JD, 'jd');
       return { success: true };
     } catch (error: any) {
       return { success: false, error: error.message };
@@ -11308,16 +12803,59 @@ export function initializeIpcHandlers(appState: AppState): void {
 
       return { microphone: mic, screen, platform: 'darwin' };
     }
-    // Windows/Linux: no TCC — permissions handled by OS at install/first-use time
+    // F-706: Windows 10/11 DOES expose a queryable microphone privacy state —
+    // Electron's own typings document getMediaAccessStatus('microphone') as
+    // @platform win32,darwin, and note the global setting that controls it.
+    // Reporting a hardcoded 'granted' meant that with the per-app or global
+    // microphone toggle off, onboarding never prompted, the launcher's
+    // permission check stayed green, and capture silently yielded nothing with
+    // no diagnosable cause. Screen capture has no equivalent Windows gate, so
+    // 'granted' remains correct there.
+    if (process.platform === 'win32') {
+      let microphone: string = 'granted';
+      try {
+        // Any non-'granted' value (denied / restricted / not-determined) must
+        // surface; fall back to 'granted' only if the API itself is unavailable,
+        // so a query failure can never LOCK a working machine out of capture.
+        microphone = systemPreferences.getMediaAccessStatus('microphone') || 'granted';
+      } catch {
+        microphone = 'granted';
+      }
+      return { microphone, screen: 'granted', platform: 'win32' };
+    }
+    // Linux: no queryable per-app permission model here.
     return { microphone: 'granted', screen: 'granted', platform: process.platform };
   });
 
   safeHandle('permissions:request-mic', async () => {
-    if (process.platform !== 'darwin') return true;
+    // CR-03: askForMediaAccess is documented @platform darwin and is a no-op
+    // elsewhere. Returning a bare `true` off darwin told the renderer the grant
+    // SUCCEEDED, so the Windows onboarding re-read an unchanged 'denied' and
+    // presented a control that could never turn green. Report honestly: false
+    // means "this platform cannot grant programmatically" — the caller's remedy
+    // is permissions:open-mic-settings.
+    if (process.platform !== 'darwin') return false;
     try {
       return await systemPreferences.askForMediaAccess('microphone');
     } catch {
       return false;
+    }
+  });
+
+  // CR-03: on win32 there is NO per-app grant API — the privacy panel is the
+  // only remedy, and before this the renderer had no way to reach it (its
+  // settings link early-returned for non-darwin). The platform decision lives in
+  // src/lib/micPermissionPolicy so main and renderer cannot disagree about which
+  // platforms have a reachable panel.
+  safeHandle('permissions:open-mic-settings', async () => {
+    const uri = micSettingsUri(process.platform);
+    if (!uri) return { ok: false, reason: 'no-settings-panel' };
+    try {
+      await shell.openExternal(uri);
+      return { ok: true };
+    } catch (e: any) {
+      console.warn('[IPC] permissions:open-mic-settings failed:', e?.message || e);
+      return { ok: false, reason: 'open-failed' };
     }
   });
 
@@ -11568,7 +13106,7 @@ export function initializeIpcHandlers(appState: AppState): void {
   // Exposed so a rollout stage can be gated on measured rates instead of a
   // description of rates, and so §5's abort conditions are evaluated rather
   // than remembered.
-  safeHandle('context-intelligence:rollout-metrics', async (_, input?: { baselineContamination?: number | null; baselineP95Ms?: number | null; minTurns?: number }) => {
+  safeHandle('context-intelligence:rollout-metrics', async (_, input?: { baselineContamination?: number | null; baselineOrchestrationP95Ms?: number | null; minTurns?: number }) => {
     try {
       const { getRolloutMetrics, evaluateAbortConditions } = require('./context-intelligence/observability/rollout-metrics');
       return { ok: true, metrics: getRolloutMetrics(), abort: evaluateAbortConditions(input ?? {}) };
@@ -11739,8 +13277,12 @@ export function initializeIpcHandlers(appState: AppState): void {
             modeId: activeMode.id,
             modeTemplateType: activeMode.templateType,
           });
+          appState.applyAutoAnswerThresholds?.(activeMode.templateType);
         } else if (appStateIntMgr && !id) {
           appStateIntMgr.clearDynamicActionContext();
+          // Mode cleared: back to the registry's no-mode Auto Answer bar
+          // instead of keeping the previous mode's thresholds (review#10).
+          appState.applyAutoAnswerThresholds?.(null);
         }
       } catch {
         /* non-fatal */
@@ -11822,7 +13364,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       const { ingestModeReferenceFile } = require('./services/ModeReferenceFileIngestion') as typeof import('./services/ModeReferenceFileIngestion');
       const file = await ingestModeReferenceFile({
         modeId,
-        filePath: selectedPath,
+        filePath: selectedPath!,  // guarded + assigned on the straight line above
         onIndexStatus: (status, fileId) => {
           BrowserWindow.getAllWindows().forEach((win) => {
             if (!win.isDestroyed()) win.webContents.send('mode-file-index-status', { modeId, fileId, phase: status });
@@ -12313,7 +13855,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       // confirmation; only flip the toggle if the user picks "Allow".
       if (e?.name === 'LANBindConfirmationRequired') {
         const win = appState.getMainWindow() ?? undefined;
-        const response = dialog.showMessageBoxSync(win as BrowserWindow | undefined, {
+        const lanBindDialogOptions: Electron.MessageBoxSyncOptions = {
           type: 'warning',
           message: 'Allow LAN access?',
           detail:
@@ -12321,7 +13863,12 @@ export function initializeIpcHandlers(appState: AppState): void {
           buttons: ['Cancel', 'Allow LAN access'],
           defaultId: 0,
           cancelId: 0,
-        });
+        };
+        // Electron types (options) and (parent, options) but not (undefined, options);
+        // picking the overload by parent presence leaves the runtime call unchanged.
+        const response = win
+          ? dialog.showMessageBoxSync(win, lanBindDialogOptions)
+          : dialog.showMessageBoxSync(lanBindDialogOptions);
         if (response !== 1) {
           return { ok: false, declined: true };
         }
@@ -12542,9 +14089,19 @@ export function initializeIpcHandlers(appState: AppState): void {
       // strip prior-assistant turns from the snapshot (topic-collapse), and block
       // an invalid answer from being saved (contamination loop).
       let phoneDocGrounded = false;
+      // F-502: pin the mode id at t0 as well. phoneDocGrounded is captured here,
+      // BEFORE the awaits, but every mode read inside streamChat resolved the
+      // LIVE ModesManager singleton — so a `modes:set-active` landing mid-request
+      // made retrieval read a DIFFERENT mode's documents than the contract this
+      // turn was planned against. The phone surface is the worse half: unlike
+      // desktop it never registers in _chatStreamsBySender, so modes:set-active
+      // does not abort it either.
+      let phonePinnedModeId: string | null = null;
       try {
         const { ModesManager } = require('./services/ModesManager');
-        phoneDocGrounded = ModesManager.getInstance().getActiveModeInfo()?.documentGroundedCustomModeActive === true;
+        const phoneModeInfo = ModesManager.getInstance().getActiveModeInfo();
+        phoneDocGrounded = phoneModeInfo?.documentGroundedCustomModeActive === true;
+        phonePinnedModeId = phoneModeInfo?.id ?? null;
       } catch { /* mode unavailable — treat as non-doc-grounded */ }
 
       // Doc-grounded strict-isolation (audit #3, 2026-07-05): mirror the
@@ -12612,6 +14169,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             phoneRouteOptions = {
               answerType: phonePlan?.answerType || 'unknown_answer',
               forbiddenContextLayers: phonePlan?.forbiddenContextLayers,
+              // F-502: t0-pinned mode — see phonePinnedModeId above.
+              pinnedModeId: phonePinnedModeId,
             };
           }
         } catch { /* plan unavailable — fall back to no routeOptions (legacy behavior) */ }
@@ -12693,8 +14252,8 @@ export function initializeIpcHandlers(appState: AppState): void {
             const clarify = buildSourceSwitchClarification(_pOwn.owner, _pExplicitSwitch);
             try { phoneMirror.publishToken(String(myStreamId), clarify); } catch (_) {}
             try { phoneMirror.publishDone(String(myStreamId), clarify); } catch (_) {}
-            win?.webContents.send('gemini-stream-token', clarify, { streamId: myStreamId });
-            win?.webContents.send('gemini-stream-done', { streamId: myStreamId });
+            win?.webContents.send('gemini-stream-token', clarify, { streamId: myStreamId, source: 'phone' });
+            win?.webContents.send('gemini-stream-done', { streamId: myStreamId, source: 'phone' });
             intelligenceManager.addAssistantMessage(clarify, undefined, 'phone_mirror');
             intelligenceManager.logUsage('chat', message, clarify);
             if (isIntelligenceFlagEnabled('trace')) {
@@ -12706,15 +14265,28 @@ export function initializeIpcHandlers(appState: AppState): void {
           // Best-effort — never break the phone path on the ownership check.
           if (isIntelligenceFlagEnabled('trace')) console.warn('[SOURCE-GUARD] phone ownership check skipped (non-fatal):', pOwnErr?.message);
         }
-        const stream = llmHelper.streamChat(message, undefined, context, resolveManualChatBasePrompt(llmHelper, { codingTask: !!(phoneRouteOptions?.answerType && isCodingAnswerType(phoneRouteOptions.answerType as any)) }), false, false, [], phoneController.signal, undefined, phoneRouteOptions);
+        const stream = llmHelper.streamChat(message, undefined, context, resolveManualChatBasePrompt(llmHelper, resolveCodingPromptSignals({ answerType: phoneRouteOptions?.answerType as any, question: message })), false, false, [], phoneController.signal, undefined, phoneRouteOptions);
         let full = '';
         let phoneSuperseded = false;
         // Deadline-guarded (Issue 1) — this is a live streaming surface too: a hung
         // provider must never block it forever. Uses the standard chat first-useful
         // budget; an inter-token stall guard protects long answers.
+        //
+        // CR-05: this passed NEITHER route flag, so it always took the 7s cloud
+        // cap. Both defaults are wrong here for the same reasons the manual-chat
+        // site documents, and the rationale is surface-agnostic:
+        //   • viaServerCascade — the natively-api server cuts over to the next
+        //     provider at AI_TTFT_BUDGET_MS (10s). Aborting at 7s tore the HTTP
+        //     request down 3s BEFORE the rescue, producing exactly the "did not
+        //     produce an answer in time" outcome F-301 exists to eliminate.
+        //   • isLocal — a local model cold-loads its weights (8-12s for a 7-9B)
+        //     before the first token, so 7s aborted every cold local generation
+        //     on the phone path to zero tokens.
+        const phoneUsingLocalLlm = llmHelper.isUsingOllama() || llmHelper.isUsingCodexCli();
+        const phoneViaServerCascade = llmHelper.isUsingNativelyServerCascade?.() === true;
         await raceStreamWithDeadline({
           stream: stream as AsyncGenerator<string>,
-          firstUsefulDeadlineMs: firstUsefulDeadlineMs('general_meeting_answer'),
+          firstUsefulDeadlineMs: firstUsefulDeadlineMs('general_meeting_answer', phoneUsingLocalLlm, phoneViaServerCascade),
           isUsefulYet: () => full.trim().length >= 5,
           shouldAbort: () => {
             if (_phoneChatLatestId !== myPhoneId) {
@@ -12729,7 +14301,7 @@ export function initializeIpcHandlers(appState: AppState): void {
             try { phoneMirror.publishToken(String(myStreamId), token); } catch (_) {}
             // streamId lets the desktop renderer drop tokens from a superseded
             // chat stream (audit finding #3); backward-compatible optional arg.
-            win?.webContents.send('gemini-stream-token', token, { streamId: myStreamId });
+            win?.webContents.send('gemini-stream-token', token, { streamId: myStreamId, source: 'phone' });
             full += token;
           },
           onCleanup: () => { try { phoneController.abort(); } catch { /* noop */ } },
@@ -12739,7 +14311,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           try {
             phoneMirror.publishDone(String(myStreamId), full);
           } catch (_) {}
-          win?.webContents.send('gemini-stream-done', { streamId: myStreamId });
+          win?.webContents.send('gemini-stream-done', { streamId: myStreamId, source: 'phone' });
           // Document-grounded: block a greeting/empty answer from SessionTracker
           // so it can't contaminate the next turn (same backstop as the desktop
           // path, minus the regenerate — the phone surface keeps it simple).

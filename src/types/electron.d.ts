@@ -32,11 +32,50 @@ export interface DynamicActionPayload {
   }
 }
 
+export type DirectAssistSource = 'typed' | 'stt' | 'screenshot'
+
+export interface DirectAssistRequest {
+  requestId: string
+  source: DirectAssistSource
+  currentRequest: string
+  skillId?: string
+  manualContext?: string
+  referenceContext?: string
+  pageContext?: { dom?: string; ocr?: string; url?: string; title?: string } | null
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>
+  transcript?: string
+  imagePaths?: string[]
+  requestedLanguage?: string
+  requestedFormat?: string
+  maxContextChars?: number
+}
+
+export interface DirectAssistError {
+  code: string
+  message: string
+  retryable: boolean
+}
+
+export type DirectAssistEvent =
+  | { type: 'start'; requestId: string; provider: string; model: string; trimmedFields: string[] }
+  | { type: 'delta'; requestId: string; sequence: number; text: string }
+  | { type: 'done'; requestId: string; sequence: number; provider: string; model: string; fullText?: string }
+  | { type: 'error'; requestId: string; sequence: number; partial: boolean; error: DirectAssistError }
+  | { type: 'cancel'; requestId: string; sequence: number }
+
 export interface ElectronAPI {
   updateContentDimensions: (dimensions: {
     width: number
     height: number
   }) => Promise<void>
+  // X-anchored overlay resize. Resolves with the size the main process
+  // ACTUALLY applied after its floor(workArea * 0.9) clamp — the renderer
+  // adopts that value so its panel width, toggle anchor and hover-gate margin
+  // never drift from the real window. Optional: older preloads lack it.
+  updateContentDimensionsCentered?: (dimensions: {
+    width: number
+    height: number
+  }) => Promise<{ width: number; height: number } | undefined>
   // Overlay aux windows (pill / resize toggle) coordination
   sendOverlayUiState?: (state: Record<string, unknown>) => Promise<void>
   onOverlayUiState?: (
@@ -56,6 +95,18 @@ export interface ElectronAPI {
   dismissOverlayPopovers?: (opts?: { settings?: boolean; model?: boolean }) => Promise<void>
   onToggleExpand: (callback: () => void) => () => void
   getRecognitionLanguages: () => Promise<Record<string, any>>
+  // Local Whisper model info — used by SettingsOverlay to restrict the
+  // Language / Accent selects to what the active local model accepts
+  // (models[] entries carry a `languageSupport` from modelLanguageSupport.ts).
+  // The model panel itself goes through its own `(window as any).electronAPI`
+  // cast, so only the two read APIs SettingsOverlay calls are declared here.
+  localWhisperGetModels?: () => Promise<{ models: any[]; activeModelId: string }>
+  localWhisperGetChannelConfig?: () => Promise<{
+    enabled: boolean
+    micModelId: string
+    systemModelId: string
+    globalModelId: string
+  }>
   getScreenshots: () => Promise<Array<{ path: string; preview: string }>>
   deleteScreenshot: (
     path: string
@@ -127,7 +178,6 @@ export interface ElectronAPI {
   onSettingsVisibilityChange: (callback: (isVisible: boolean) => void) => () => void
   toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>
   closeSettingsWindow: () => Promise<void>
-  toggleAdvancedSettings: () => Promise<void>
   closeAdvancedSettings: () => Promise<void>
   openSettingsTab: (tab: string) => Promise<void>
   onOpenSettingsTab: (callback: (tab: string) => void) => () => void
@@ -148,7 +198,7 @@ export interface ElectronAPI {
   runLocalFallbackPreflight: () => Promise<any>
   switchToOllama: (model?: string, url?: string) => Promise<{ success: boolean; error?: string }>
   switchToGemini: (apiKey?: string, modelId?: string) => Promise<{ success: boolean; error?: string }>
-  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek', apiKey?: string) => Promise<{ success: boolean; error?: string }>
+  testLlmConnection: (provider: 'gemini' | 'groq' | 'openai' | 'claude' | 'deepseek' | 'nvidia_nim', apiKey?: string) => Promise<{ success: boolean; error?: string }>
   selectServiceAccount: () => Promise<{ success: boolean; path?: string; cancelled?: boolean; error?: string }>
 
   // API Key Management
@@ -157,6 +207,7 @@ export interface ElectronAPI {
   setOpenaiApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setClaudeApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setDeepseekApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
+  setNvidiaNimApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string; sttProviderCleared?: boolean }>
   setLitellmConfig: (config: { apiKey: string; baseURL: string; maxTokens?: number }) => Promise<{ success: boolean; error?: string }>
   getAvailableLiteLLMModels: () => Promise<string[]>
   refreshLiteLLMModels: () => Promise<string[]>
@@ -165,6 +216,7 @@ export interface ElectronAPI {
   setDisabledProviders: (providers: string[]) => Promise<{ success: boolean; error?: string }>
   setCloudEnabledModels: (provider: string, models: string[]) => Promise<{ success: boolean; error?: string }>
   setNativelyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
+  setNvidiaNimSttModel: (model: string) => Promise<{ success: boolean; error?: string }>
   // ── In-app review / testimonial prompt ─────────────────────────────────
   reviewGetPromptState: () => Promise<{
     ok: boolean;
@@ -198,10 +250,22 @@ export interface ElectronAPI {
   }) => Promise<{ ok: boolean; error?: string; status?: number }>
   getNativelyPricing: () => Promise<{ ok: boolean; currency?: string; fetchedAt?: string; stale?: boolean; products?: Record<string, { id: string; dodoProductId: string; name: string; amount: number | null; currency: string; formattedPrice: string | null; interval: 'month' | 'year' | 'lifetime'; checkoutUrl: string; coupon: { code: string; eligible: boolean; discountPercent: number; reason?: string } }>; error?: string; status?: number }>
   getNativelyUsage: (force?: boolean) => Promise<{ ok: boolean; error?: string; plan?: string; quota?: { transcription: { used: number; limit: number; remaining: number }; ai: { used: number; limit: number; remaining: number }; search: { used: number; limit: number; remaining: number }; resets_at: string }; member_since?: string }>
-  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; litellmPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
+  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; hasDeepseekKey: boolean; hasNvidiaNimKey?: boolean; hasLitellmBaseURL?: boolean; litellmBaseURL?: string | null; litellmMaxTokens?: number | null; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; deepseekPreferredModel?: string; nvidia_nimPreferredModel?: string; litellmPreferredModel?: string; disabledProviders?: string[]; cloudEnabledModels?: Record<string, string[]>; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
+  // R-10 resolution flow: ambiguous credential stores (names + last-4 only; null when nothing to resolve).
+  getAmbiguousCredentialStores: () => Promise<{
+    keyring: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
+    fallback: { keys: { name: string; last4: string }[]; mtimeIso: string | null };
+  } | null>;
+  resolveAmbiguousCredentialStores: (choice: 'keyring' | 'fallback' | 'merge') => Promise<{ ok: boolean; error?: string }>;
   // Permissions
-  checkPermissions:     () => Promise<{ microphone: 'granted'|'denied'|'not-determined'|'restricted'; screen: 'granted'|'denied'|'not-determined'|'restricted'; platform: string }>
+  // CR-03: 'unknown' is in Electron 43's declared return union for
+  // getMediaAccessStatus and win32 can return it. Omitting it here made the
+  // renderer's `as PermStatus` cast unsound.
+  checkPermissions:     () => Promise<{ microphone: 'granted'|'denied'|'not-determined'|'restricted'|'unknown'; screen: 'granted'|'denied'|'not-determined'|'restricted'|'unknown'; platform: string }>
+  /** Resolves false off darwin: no platform but macOS can grant programmatically. */
   requestMicPermission: () => Promise<boolean>
+  /** Opens the OS microphone privacy panel. The only remedy on win32. */
+  openMicSettings:      () => Promise<{ ok: boolean; reason?: string }>
 
   // Free Trial
   startTrial:     () => Promise<{ ok: boolean; hasToken?: boolean; started_at?: string; expires_at?: string; expired?: boolean; already_used?: boolean; converted_to?: string | null; usage?: { ai: number; stt_seconds: number; search: number }; limits?: { duration_ms: number; ai_requests: number; stt_minutes: number; search_requests: number }; error?: string; status?: number }>
@@ -213,7 +277,7 @@ export interface ElectronAPI {
   onTrialEnded:   (cb: (data: { choice: string }) => void) => () => void
 
   // STT Provider Management
-  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively' | 'local-whisper') => Promise<{ success: boolean; error?: string }>
+  setSttProvider: (provider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim' | 'natively' | 'local-whisper') => Promise<{ success: boolean; error?: string }>
   getSttProvider: () => Promise<string>
   setGroqSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setOpenAiSttApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
@@ -226,7 +290,7 @@ export interface ElectronAPI {
   setGroqSttModel: (model: string) => Promise<{ success: boolean; error?: string }>
   setSonioxApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setIbmWatsonRegion: (region: string) => Promise<{ success: boolean; error?: string }>
-  testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox', apiKey: string, region?: string) => Promise<{ success: boolean; error?: string }>
+  testSttConnection: (provider: 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'nvidia_nim', apiKey: string, region?: string) => Promise<{ success: boolean; error?: string }>
 
   // STT Config Events (fired when STT provider/key changes during a meeting)
   onSttConfigChanged: (callback: (data: { configured: boolean; provider: string }) => void) => () => void
@@ -287,6 +351,16 @@ export interface ElectronAPI {
     imageCount?: number;
     usedImageInput?: boolean;
   }>
+  startDirectAssist: (request: DirectAssistRequest) => Promise<{
+    accepted: boolean
+    requestId: string
+    error?: DirectAssistError
+  }>
+  cancelDirectAssist: (
+    requestId: string,
+    source?: DirectAssistSource
+  ) => Promise<{ success: boolean; cancelled: boolean; error?: string }>
+  onDirectAssistEvent: (callback: (event: DirectAssistEvent) => void) => () => void
   generateClarify: () => Promise<{ clarification: string | null }>
   generateCodeHint: (imagePaths?: string[], problemStatement?: string) => Promise<{ hint: string | null }>
   generateBrainstorm: (imagePaths?: string[], problemStatement?: string) => Promise<{ script: string | null }>
@@ -368,6 +442,7 @@ export interface ElectronAPI {
 
   // Phase 3 — Cluely-style dynamic action cards.
   onIntelligenceDynamicAction: (callback: (data: { action: DynamicActionPayload }) => void) => () => void
+  onIntelligenceDynamicActionRetract: (callback: (data: { id: string; reason: string }) => void) => () => void
   acceptDynamicAction: (actionId: string) => Promise<{ success: boolean; action?: DynamicActionPayload; error?: string }>
   dismissDynamicAction: (actionId: string) => Promise<{ success: boolean; error?: string }>
   listDynamicActions: () => Promise<{ success: boolean; actions: DynamicActionPayload[]; error?: string }>
@@ -417,8 +492,15 @@ export interface ElectronAPI {
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
   toggleModelSelector: (coords: { x: number; y: number; activate?: boolean }) => Promise<void>;
   modelSelectorCloseIfOpen: () => Promise<void>;
-  forceRestartOllama: () => Promise<void>;
+  // NOTE: this interface and the one in electron/preload.ts are maintained
+  // separately and drift. That drift is what hid the Ollama bug: the settings
+  // screen reached these through a generic `invoke` that neither file declares
+  // and preload does not expose, behind a @ts-ignore that silenced the error.
+  /** Real handler shape — `{ success }`, not void. */
+  forceRestartOllama: () => Promise<{ success: boolean; reason?: string }>;
   isOllamaReachable: () => Promise<boolean>;
+  /** Start the local Ollama daemon when Ollama is the selected provider. */
+  ensureOllamaRunning: () => Promise<{ success: boolean; reason?: string; [k: string]: unknown }>;
 
   // Settings Window
   toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>;
@@ -475,11 +557,13 @@ export interface ElectronAPI {
 
   onOllamaPullProgress: (callback: (data: { status: string; percent: number }) => void) => () => void;
   onOllamaPullComplete: (callback: () => void) => () => void;
+  onOllamaError: (callback: (data: { message: string }) => void) => () => void;
 
   onMeetingsUpdated: (callback: () => void) => () => void
 
   // Provider Compatibility
   onIncompatibleProviderWarning: (callback: (data: { count: number, oldProvider: string, newProvider: string }) => void) => () => void;
+  onEmbeddingDegraded: (callback: (data: { kind: 'fallback' | 'persist-failed'; fallbackProvider?: string; reason?: string }) => void) => () => void;
   onReindexProgress: (callback: (phase: 'started' | 'progress' | 'complete', data: { count?: number, done?: number, total?: number, space?: string, partial?: boolean }) => void) => () => void;
   reindexIncompatibleMeetings: () => Promise<void>;
 
@@ -614,6 +698,11 @@ export interface ElectronAPI {
   // Ambient AI Chat — when enabled, meetings run without mic/system audio capture
   getAmbientChatEnabled: () => Promise<boolean>;
   setAmbientChatEnabled: (enabled: boolean) => Promise<{ success: boolean }>;
+  getAutoAnswerEnabled: () => Promise<boolean>;
+  setAutoAnswerEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  getDirectAssistEnabled: () => Promise<boolean>;
+  setDirectAssistEnabled: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  onDirectAssistEnabledChanged: (callback: (enabled: boolean) => void) => () => void;
 
   getCodeVerification: () => Promise<boolean>;
   setCodeVerification: (enabled: boolean) => Promise<{ success: boolean }>;
@@ -712,6 +801,26 @@ export interface ElectronAPI {
   onDomContextReceived: (
     callback: (dom: string, meta?: DomCaptureMeta, envelope?: ContextEnvelope) => void,
   ) => () => void;
+  // The Cmd/Ctrl+Shift+Y page capture fell back to a screenshot; the notice
+  // says why so the overlay can surface it. Mirrors PageCaptureFallbackNotice
+  // in electron/services/pageCaptureFallback.ts.
+  onPageCaptureFallback: (
+    callback: (notice: PageCaptureFallbackNotice) => void,
+  ) => () => void;
+  // A ⌘/Ctrl+Y page capture just started (in flight). The next answer request
+  // waits briefly for its delivery instead of racing past it.
+  onPageCaptureStarted: (callback: () => void) => () => void;
+}
+
+/**
+ * Why a page capture (Cmd/Ctrl+Shift+Y) fell back to a screenshot. Mirrors
+ * electron/services/pageCaptureFallback.ts (main is the canonical source).
+ */
+export interface PageCaptureFallbackNotice {
+  kind: 'not-connected' | 'needs-host-permission' | 'timeout' | 'no-tab' | 'error';
+  label: string;
+  detail: string;
+  reason: string;
 }
 
 /**

@@ -50,6 +50,9 @@ const ENV_KEYS = [
 // The full flag set — Meeting Notes V3 product flags intentionally ship default ON;
 // the rest remain additive/opt-in default OFF.
 const ALL_FLAG_KEYS = [
+  // WTA audit flags (2026-08-18, both default OFF — shadow/observe-only).
+  'questionLedgerShadow',
+  'wtaClauseCoverageRepair',
   'trace', 'durableMemoryWindow', 'profileTreeV2', 'contextRouterV2',
   'liveTranscriptBrain', 'promptAssemblerV2', 'answerDiversityGuard', 'meetingMemoryV2',
   'meetingSummaryV3', 'meetingModeAutoDetect', 'followUpDraftV2', 'speakerLabelsV1',
@@ -86,6 +89,14 @@ const ALL_FLAG_KEYS = [
   // Prompt System v2 (2026-08-01) — default OFF everywhere (including dev/test):
   // the legacy prompt suite must keep passing byte-for-byte until deliberate rollout.
   'promptSystemV2',
+  // WTA governance yields to a V3-composed turn (2026-08-28) — default ON,
+  // literal (never isInternalDevTestContext): it restores the !v3OwnedTurn
+  // invariant LLMHelper already enforces, and a fix for a production-only
+  // failure must not resolve differently in dev/test.
+  'wtaGovernanceYieldsToV3',
+  // The doc-grounded validator checks the block that was SENT (2026-08-28) —
+  // default ON, literal (never isInternalDevTestContext).
+  'docGroundedValidatorUsesSentEvidence',
 ];
 
 const DEFAULT_ON_KEYS = new Set([
@@ -117,6 +128,14 @@ const DEFAULT_ON_KEYS = new Set([
   // Prompt System v2 — promoted to production default-ON (2026-08-02) after the
   // 8-run benchmark campaign (see the intelligenceFlags.ts promotion comment).
   'promptSystemV2',
+  // WTA governance yields to a V3-composed turn (2026-08-28) — default ON,
+  // literal (never isInternalDevTestContext): it restores the !v3OwnedTurn
+  // invariant LLMHelper already enforces, and a fix for a production-only
+  // failure must not resolve differently in dev/test.
+  'wtaGovernanceYieldsToV3',
+  // The doc-grounded validator checks the block that was SENT (2026-08-28) —
+  // default ON, literal (never isInternalDevTestContext).
+  'docGroundedValidatorUsesSentEvidence',
 ]);
 
 const expectedDefault = (key) => DEFAULT_ON_KEYS.has(key) ? true : false;

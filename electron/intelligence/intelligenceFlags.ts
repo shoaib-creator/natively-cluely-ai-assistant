@@ -50,6 +50,8 @@ export type IntelligenceFlagKey =
   | 'profileTreeV2'                // Phase 4 — route identity through ProfileTreeService
   | 'contextRouterV2'              // Phase 6 — consult the consolidated ContextRouter
   | 'liveTranscriptBrain'          // Phase 7 — consult LiveTranscriptBrain
+  | 'questionLedgerShadow'         // WTA audit Phase 2 — QuestionLedger shadow/parity (observe-only)
+  | 'wtaClauseCoverageRepair'      // WTA audit Part 11 — focused append-only repair for uncovered clauses
   | 'promptAssemblerV2'            // Phase 9
   | 'answerDiversityGuard'         // Phase 5 — wire AnswerDiversityGuard into delivery
   | 'meetingMemoryV2'              // Phase 10
@@ -299,13 +301,67 @@ export type IntelligenceFlagKey =
   // byte-for-byte the legacy constants. Rollout: enable per the mode-by-mode
   // order in the migration notes; the legacy constants are removable only
   // after this flag has been default-ON through a full release cycle.
-  | 'promptSystemV2';
+  | 'promptSystemV2'
+  // ── WTA governance yields to a V3-composed turn (2026-08-28) ──────────────
+  // `LLMHelper.ts` guards Context OS pack governance on `!v3OwnedTurn` — when
+  // V3 has already composed the turn, the legacy governance must not also run.
+  // `WhatToAnswerLLM`'s in-file copy of that gate never got the term, so on the
+  // live-audio path a V3 turn with real evidence could still hit
+  // `refuse_insufficient_evidence` in the legacy pack and hard-return a canned
+  // refusal BEFORE any model call — while manual chat, which sets
+  // `v3Owned: true`, answered the same question normally. That asymmetry is the
+  // reported "works typed, refuses on audio" bug.
+  //
+  // Default ON: this restores the invariant LLMHelper already enforces, and a
+  // literal default (never isInternalDevTestContext) so dev, test and
+  // production resolve it identically — the F5 split that let composePrompt be
+  // built, tested and never executed for a user.
+  //
+  // Flag OFF is byte-for-byte the pre-2026-08-28 behaviour, including for
+  // LEGACY (non-V3) WTA turns, which keep governance in BOTH positions: the new
+  // term only fires when `requestSnapshot.v3Prompt` is present, and a legacy
+  // turn has none.
+  //
+  // See docs/retrieval-handoff/02-WTA-VS-MANUAL.md §3b.
+  | 'wtaGovernanceYieldsToV3'
+  // ── The doc-grounded validator checks the block that was SENT (2026-08-28) ──
+  // The post-stream validator re-ran a separate LEGACY retrieval and judged the
+  // streamed answer against it. Under V3 the answer was grounded in V3's
+  // evidence — a different set — so a correct answer could be overwritten with
+  // "I could not find that in the retrieved sections of the document." by a
+  // witness who was not in the room. With this ON, a V3-composed turn is
+  // validated against `v3Prompt.evidenceBlock`, and a V3 turn that carried no
+  // evidence is not doc-validated at all (there is nothing it could have been
+  // grounded in, and the composer already shaped the answer around that).
+  //
+  // This is deliberately NOT a blanket V3 exemption: V3 is the default path, so
+  // exempting it would retire the zero-fabrication guard for nearly every WTA
+  // turn. `computeEvidenceCoverage` still has the final word.
+  //
+  // Default ON via a literal, never isInternalDevTestContext.
+  // See docs/retrieval-handoff/01-ROOT-CAUSES.md RC7(b).
+  | 'docGroundedValidatorUsesSentEvidence';
 
 interface FlagSpec {
   /** env var name (NATIVELY_* convention). */
   env: string;
   /** SettingsManager key for a UI/persisted opt-in. */
   setting: string;
+  /**
+   * When true, the flag is PERMANENTLY ON (no user-facing toggle) and the
+   * SettingsManager override for `setting` is never consulted — a stale
+   * persisted value from when this flag WAS toggleable (on either side) is
+   * inert and can never re-surface. Only the env var and `default` still
+   * apply. Use this when retiring a settings-UI row for a flag that graduates
+   * to "just how the product works": flip this on and delete the UI entry,
+   * do NOT touch anyone's settings.json — that's what makes the retirement
+   * safe for users who already persisted the old value.
+   *
+   * The env var remains the operator kill-switch — deliberately NOT
+   * suppressed by this field — so the flag can still be forced off in the
+   * field without a release even after its UI is gone.
+   */
+  settingIgnored?: boolean;
   /**
    * Default when neither env nor settings decide. A plain `boolean` for a
    * fixed default; a thunk (`() => boolean`) for a CONTEXT-DEPENDENT default
@@ -351,16 +407,28 @@ const FLAGS: Record<IntelligenceFlagKey, FlagSpec> = {
   profileTreeV2: { env: 'NATIVELY_PROFILE_TREE_V2', setting: 'profileTreeV2Enabled', default: false },
   contextRouterV2: { env: 'NATIVELY_CONTEXT_ROUTER_V2', setting: 'contextRouterV2Enabled', default: false },
   liveTranscriptBrain: { env: 'NATIVELY_LIVE_TRANSCRIPT_BRAIN', setting: 'liveTranscriptBrainEnabled', default: false },
+  questionLedgerShadow: { env: 'NATIVELY_QUESTION_LEDGER_SHADOW', setting: 'questionLedgerShadowEnabled', default: false },
+  wtaClauseCoverageRepair: { env: 'NATIVELY_WTA_CLAUSE_COVERAGE_REPAIR', setting: 'wtaClauseCoverageRepairEnabled', default: false },
   promptAssemblerV2: { env: 'NATIVELY_PROMPT_ASSEMBLER_V2', setting: 'promptAssemblerV2Enabled', default: false },
   answerDiversityGuard: { env: 'NATIVELY_ANSWER_DIVERSITY_GUARD', setting: 'answerDiversityGuardEnabled', default: false },
   meetingMemoryV2: { env: 'NATIVELY_MEETING_MEMORY_V2', setting: 'meetingMemoryV2Enabled', default: false },
-  // Meeting Notes V3 ships ON by default (product decision 2026-06-20). Each remains
-  // env/settings-overridable; set NATIVELY_MEETING_SUMMARY_V3=0 to revert to the legacy
-  // single-pass summary path. All paths keep a deterministic fallback and honor the
+  // Meeting Notes V3 is now the UNCONDITIONAL default (product decision 2026-08-25) —
+  // the experimental settings toggle has been removed. `settingIgnored: true` means a
+  // stale persisted `meetingSummaryV3Enabled` (from when the toggle existed, in either
+  // direction) is never read — this flag now only listens to the env kill-switch and
+  // its default. Set NATIVELY_MEETING_SUMMARY_V3=0 to force the legacy single-pass
+  // summary path in an emergency without a release; that is the ONLY remaining way to
+  // turn this off. All paths keep a deterministic fallback and honor the
   // post_call_summary data scope.
-  meetingSummaryV3: { env: 'NATIVELY_MEETING_SUMMARY_V3', setting: 'meetingSummaryV3Enabled', default: true },
+  meetingSummaryV3: { env: 'NATIVELY_MEETING_SUMMARY_V3', setting: 'meetingSummaryV3Enabled', settingIgnored: true, default: true },
   meetingModeAutoDetect: { env: 'NATIVELY_MEETING_MODE_AUTODETECT', setting: 'meetingModeAutoDetectEnabled', default: true },
-  followUpDraftV2: { env: 'NATIVELY_FOLLOWUP_DRAFT_V2', setting: 'followUpDraftV2Enabled', default: true },
+  // The LLM-written follow-up draft is now the UNCONDITIONAL default (product decision
+  // 2026-08-25) — the experimental settings toggle has been removed. `settingIgnored: true`
+  // means a stale persisted `followUpDraftV2Enabled` (from when the toggle existed, in
+  // either direction) is never read — this flag now only listens to the env kill-switch and
+  // its default. Set NATIVELY_FOLLOWUP_DRAFT_V2=0 to force the deterministic fallback draft
+  // in an emergency without a release; that is the ONLY remaining way to turn this off.
+  followUpDraftV2: { env: 'NATIVELY_FOLLOWUP_DRAFT_V2', setting: 'followUpDraftV2Enabled', settingIgnored: true, default: true },
   speakerLabelsV1: { env: 'NATIVELY_SPEAKER_LABELS_V1', setting: 'speakerLabelsV1Enabled', default: true },
   // Constrained LLM polish of the Summary (note-content-only, "no new tokens" gated). ON by
   // default — it can only improve readability and always falls back to the deterministic
@@ -513,6 +581,9 @@ const FLAGS: Record<IntelligenceFlagKey, FlagSpec> = {
   // promptSystemV2Enabled setting reverts to the legacy constants everywhere
   // (every call site is `resolveV2SystemPrompt(...) ?? legacy`).
   promptSystemV2: { env: 'NATIVELY_PROMPT_SYSTEM_V2', setting: 'promptSystemV2Enabled', default: true },
+  // Literal `true`, NOT isInternalDevTestContext — see the union member's note.
+  wtaGovernanceYieldsToV3: { env: 'NATIVELY_WTA_GOVERNANCE_YIELDS_TO_V3', setting: 'wtaGovernanceYieldsToV3Enabled', default: true },
+  docGroundedValidatorUsesSentEvidence: { env: 'NATIVELY_DOC_GROUNDED_VALIDATOR_SENT_EVIDENCE', setting: 'docGroundedValidatorUsesSentEvidenceEnabled', default: true },
 };
 
 const ON_VALUES = new Set(['1', 'true', 'on', 'enabled', 'yes']);
@@ -537,6 +608,7 @@ function readEnvOverride(key: IntelligenceFlagKey): 'on' | 'off' | null {
 }
 
 function readSettingOverride(key: IntelligenceFlagKey): boolean | null {
+  if (FLAGS[key].settingIgnored) return null;
   try {
     // From electron/intelligence/ → ../services/SettingsManager
     const { SettingsManager } = require('../services/SettingsManager');
@@ -828,6 +900,9 @@ export function setIntelligenceFlag(key: IntelligenceFlagKey, value: boolean | n
     if (typeof key !== 'string' || !Object.prototype.hasOwnProperty.call(FLAGS, key)) return false;
     const spec = FLAGS[key];
     if (!spec || typeof spec.setting !== 'string') return false;
+    // The flag no longer reads its setting (permanently-on, no UI toggle) — persisting a
+    // value here would silently do nothing and mislead a future caller. Refuse instead.
+    if (spec.settingIgnored) return false;
     const { SettingsManager } = require('../services/SettingsManager');
     const sm = SettingsManager.getInstance();
     if (value === null) {

@@ -49,12 +49,40 @@ export interface TranscriptSegment {
     confidence?: number;
     /** Where this segment came from. Absent = legacy/unknown writer (see TranscriptOrigin). */
     origin?: TranscriptOrigin;
+    /** STT provider id that produced this segment (WTA audit F9, additive). */
+    sttProvider?: string;
+    /** Punctuation provenance (WTA audit F9): 'unavailable' means the provider
+     *  never guaranteed punctuation — scoring must treat a missing '?' as
+     *  NEUTRAL, not negative. Absent = legacy writer (same neutral treatment). */
+    punctuationSource?: import('./llm/punctuationProvenance').PunctuationSource;
 }
 
 export interface SuggestionTrigger {
     context: string;
     lastQuestion: string;
-    confidence: number;
+    /**
+     * Trigger-level confidence that `lastQuestion` is an answerable question.
+     * Optional since the Auto Answer V3 campaign: the automatic trigger no
+     * longer fabricates a value, and an absent confidence means "defer to the
+     * planner's own classifier score" (PlannerDecision falls back to
+     * intentResult.confidence).
+     */
+    confidence?: number;
+    /**
+     * True when the trigger came from the Auto Answer path rather than a user
+     * action. The engine records the resulting generation so a user barge-in
+     * can cancel exactly that stream and never a manual What-to-Answer.
+     */
+    automatic?: boolean;
+    // ── Auto Answer V3 identity/quality fields (all optional, V2 §26) ──
+    questionId?: string;
+    answerability?: number;
+    dialogueAct?: string;
+    isFollowUp?: boolean;
+    endpointSource?: string;
+    candidateGeneration?: number;
+    /** The controller verified (by id or embedding cosine) that the speculative cache answers THIS question. */
+    reuseSpeculative?: boolean;
 }
 
 // Context item matching Swift ContextManager structure
@@ -62,6 +90,10 @@ export interface ContextItem {
     role: 'interviewer' | 'user' | 'assistant';
     text: string;
     timestamp: number;
+    /** STT provider id (WTA audit F9, additive; absent on legacy/assistant items). */
+    sttProvider?: string;
+    /** Punctuation provenance (WTA audit F9, additive; see TranscriptSegment). */
+    punctuationSource?: import('./llm/punctuationProvenance').PunctuationSource;
 }
 
 /**
@@ -305,7 +337,11 @@ export class SessionTracker {
         this.contextItems.push({
             role,
             text,
-            timestamp: segment.timestamp
+            timestamp: segment.timestamp,
+            // F9 provenance rides along when the seam supplied it (additive;
+            // legacy writers leave both undefined = neutral treatment).
+            ...(segment.sttProvider ? { sttProvider: segment.sttProvider } : {}),
+            ...(segment.punctuationSource ? { punctuationSource: segment.punctuationSource } : {}),
         });
 
         this.evictOldEntries();
@@ -513,15 +549,15 @@ export class SessionTracker {
 
     /**
      * DURABLE context window (Intelligence OS, 2026-06-12). Unlike `getContext()`,
-     * which reads `contextItems` — hard-evicted to `contextWindowDuration` (120s) on
+     * which reads `contextItems` — hard-evicted to `contextWindowDuration` (180s) on
      * EVERY final segment by `evictOldEntries()` — this reads `fullTranscript`, the
-     * session's persisted store that survives the 120s eviction. It exists to make
+     * session's persisted store that survives the 180s eviction. It exists to make
      * genuinely long-range recall possible: a project named at minute 1 is still
      * present at minute 62.
      *
      * WHY THIS METHOD EXISTS: `IntelligenceEngine.LIVE_MEMORY_WINDOW_SECONDS = 7200`
      * fed `getContext(7200)` into the long-range follow-up memory and assumed a 2h
-     * window. But `contextItems` can never hold more than ~120s, so that path
+     * window. But `contextItems` can never hold more than ~180s, so that path
      * silently saw at most the last two minutes — the long-range entity it was built
      * to recall had already been evicted. Pointing it at the durable store fixes the
      * bug for the common case (a multi-minute session under the compaction threshold).
@@ -530,7 +566,7 @@ export class SessionTracker {
      * evicts the OLDEST 500 raw segments into an epoch summary, so this returns only
      * the raw segments STILL RESIDENT — a minute-1 entity in a *very* long session can
      * still age out of the raw store into a summary. That's a far higher bar than the
-     * 120s `contextItems` eviction this fixes; for the full summary-prefixed view see
+     * 180s `contextItems` eviction this fixes; for the full summary-prefixed view see
      * `getFullSessionContext()`.
      *
      * @param lastSeconds Window size in seconds (default 7200 = 2h). `Infinity`
@@ -588,18 +624,22 @@ export class SessionTracker {
     getContextWithInterim(lastSeconds: number = 120): ContextItem[] {
         const contextItems = [...this.getContext(lastSeconds)];
 
+        // RC-1 (session C, 2026-08-21): same resolver as the WTA injection site
+        // in IntelligenceEngine — a cumulative provider interim (measured up to
+        // 10K chars) must never be appended whole; only its novel tail is.
         const lastInterim = this.lastInterimInterviewer;
         if (lastInterim && lastInterim.text.trim().length > 0) {
-            const lastItem = contextItems[contextItems.length - 1];
-            const isDuplicate = lastItem &&
-                lastItem.role === 'interviewer' &&
-                (lastItem.text === lastInterim.text ||
-                    Math.abs(lastItem.timestamp - lastInterim.timestamp) < 1000);
-
-            if (!isDuplicate) {
+            const { resolveInterimInjection } = require('./llm/interimInjectionGuard') as typeof import('./llm/interimInjectionGuard');
+            const verdict = resolveInterimInjection({
+                interim: { text: lastInterim.text, timestamp: lastInterim.timestamp },
+                recentInterviewerFinals: contextItems.filter(item => item.role === 'interviewer'),
+                lastContextItem: contextItems[contextItems.length - 1] ?? null,
+                now: Date.now(),
+            });
+            if (verdict.action === 'inject') {
                 contextItems.push({
                     role: 'interviewer',
-                    text: lastInterim.text,
+                    text: verdict.text,
                     timestamp: lastInterim.timestamp,
                 });
             }

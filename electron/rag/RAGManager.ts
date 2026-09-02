@@ -7,6 +7,7 @@ import { LLMHelper } from '../LLMHelper';
 import { preprocessTranscript, RawSegment } from './TranscriptPreprocessor';
 import { chunkTranscript } from './SemanticChunker';
 import { VectorStore } from './VectorStore';
+import type { AppAPIConfig } from './EmbeddingProviderResolver';
 import { EmbeddingPipeline } from './EmbeddingPipeline';
 import { RAGRetriever } from './RAGRetriever';
 import { LiveRAGIndexer } from './LiveRAGIndexer';
@@ -62,7 +63,7 @@ async function* raceGeneratorWithDeadline(
     }
 }
 
-export interface RAGManagerConfig {
+export interface RAGManagerConfig extends Partial<AppAPIConfig> {
     db: Database.Database;
     // dbPath/extPath are unused by VectorStore now (it runs on `db` directly —
     // see VectorStore.ts's header comment for why the worker-thread design
@@ -71,13 +72,33 @@ export interface RAGManagerConfig {
     // out-of-process search path doesn't have to re-thread them.
     dbPath: string;
     extPath: string;
-    openaiKey?: string;
-    geminiKey?: string;
-    geminiKeys?: string[];   // optional pool for embedding key-rotation + 429 cooldown
-    ollamaUrl?: string;
-    providerDataScopes?: ProviderDataScopePolicy;
-    explicitKeyManagement?: boolean;
+    /**
+     * The embedding configuration, forwarded WHOLE (2026-08-30).
+     *
+     * This used to re-declare six fields by hand — openaiKey, geminiKey,
+     * geminiKeys, ollamaUrl, providerDataScopes, explicitKeyManagement — and the
+     * constructor re-listed the same six into `embeddingPipeline.initialize()`.
+     * `buildEmbeddingConfig()` returns an `AppAPIConfig` with far more than
+     * that (nativelyApiKey, nativelyTrialToken, nativelyApiUrl,
+     * ollamaEmbeddingModel/Dims, the per-provider model+dims hints, and the
+     * embeddingMode/embeddingProvider choice), and `main.ts` spreads it straight
+     * in — so every field outside the hand-written six was SILENTLY DROPPED on a
+     * normal app start.
+     *
+     * TypeScript could not catch it: spreading a typed variable into an object
+     * literal skips excess-property checking, so `typecheck:electron` stayed
+     * green while the managed-embedding tier and the user's chosen Ollama
+     * embedding model were never configured at all. The feature only appeared
+     * if the user later re-entered an OpenAI/Gemini key, because
+     * `initializeEmbeddings` forwards with `{...keys}` and therefore carried
+     * everything by accident.
+     *
+     * Carrying the type instead of a copy of its field names is what stops this
+     * recurring — the same lesson `embeddingConfigIdentity.ts` was written for,
+     * one layer down.
+     */
 }
+
 
 /**
  * RAGManager - Central orchestrator for RAG operations
@@ -118,14 +139,14 @@ export class RAGManager {
         this.retriever = new RAGRetriever(this.vectorStore, this.embeddingPipeline);
         this.liveIndexer = new LiveRAGIndexer(this.vectorStore, this.embeddingPipeline);
 
-        this.embeddingPipeline.initialize({
-            openaiKey: config.openaiKey,
-            geminiKey: config.geminiKey,
-            geminiKeys: config.geminiKeys,
-            ollamaUrl: config.ollamaUrl,
-            providerDataScopes: config.providerDataScopes,
-            explicitKeyManagement: config.explicitKeyManagement,
-        }).then(() => {
+        // Forward the WHOLE embedding config. Hand-listing fields here is what
+        // dropped nativelyApiKey / nativelyTrialToken / nativelyApiUrl /
+        // ollamaEmbeddingModel / ollamaEmbeddingDims and the embeddingMode +
+        // embeddingProvider choice on every normal app start — see
+        // RAGManagerConfig's note. `db`/`dbPath`/`extPath` are this class's own
+        // and are the only fields the pipeline must not see.
+        const { db: _db, dbPath: _dbPath, extPath: _extPath, ...embeddingConfig } = config;
+        this.embeddingPipeline.initialize(embeddingConfig).then(() => {
             // Backfill provider metadata for meetings that were embedded before the
             // embedding_provider column was written (or where the write failed silently).
             this._backfillEmbeddingProviderMetadata();
@@ -158,7 +179,11 @@ export class RAGManager {
         return this.embeddingPipeline;
     }
 
-    initializeEmbeddings(keys: { openaiKey?: string, geminiKey?: string, geminiKeys?: string[], ollamaUrl?: string, providerDataScopes?: ProviderDataScopePolicy, explicitKeyManagement?: boolean }): void {
+    // `AppAPIConfig`, not a hand-written subset. This path already FORWARDED
+    // everything at runtime via `{...keys}` — which is precisely why the managed
+    // tier worked here and not in the constructor — but its type named only six
+    // fields, so it read as though the rest were unsupported.
+    initializeEmbeddings(keys: AppAPIConfig): void {
         const initPromise = this.embeddingPipeline.initialize({
             ...keys,
             explicitKeyManagement: keys.explicitKeyManagement,
@@ -278,11 +303,22 @@ export class RAGManager {
         const prompt = buildRAGPrompt(query, context.formattedContext, 'meeting', context.intent);
 
         // Stream response
-        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true);
+        const streamOutcome: { incomplete?: boolean } = {};
+        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true, undefined, streamOutcome);
 
         for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS)) {
             if (abortSignal?.aborted) break;
             yield chunk;
+        }
+        // F7 (code-review 2026-08-14): surface an incomplete stream to the
+        // reader. Without this, a capped or post-commit-failed stream ended
+        // normally, ipcHandlers sent rag:stream-complete, and the renderer
+        // finalized a mid-sentence bubble as a complete answer that then
+        // entered conversation state. The coda makes the truncation VISIBLE
+        // in the rendered/persisted answer (skipped on user abort — that is
+        // a cancellation, not a truncation).
+        if (streamOutcome.incomplete && !abortSignal?.aborted) {
+            yield '\n\n_(Answer incomplete \u2014 the model stream ended early.)_';
         }
     }
 
@@ -309,11 +345,22 @@ export class RAGManager {
         const prompt = buildRAGPrompt(query, context.formattedContext, 'global', context.intent);
 
         // Stream response
-        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true);
+        const streamOutcome: { incomplete?: boolean } = {};
+        const stream = this.llmHelper.streamChatWithGemini(prompt, undefined, undefined, true, undefined, streamOutcome);
 
         for await (const chunk of raceGeneratorWithDeadline(stream, RAG_STREAM_STALL_MS)) {
             if (abortSignal?.aborted) break;
             yield chunk;
+        }
+        // F7 (code-review 2026-08-14): surface an incomplete stream to the
+        // reader. Without this, a capped or post-commit-failed stream ended
+        // normally, ipcHandlers sent rag:stream-complete, and the renderer
+        // finalized a mid-sentence bubble as a complete answer that then
+        // entered conversation state. The coda makes the truncation VISIBLE
+        // in the rendered/persisted answer (skipped on user abort — that is
+        // a cancellation, not a truncation).
+        if (streamOutcome.incomplete && !abortSignal?.aborted) {
+            yield '\n\n_(Answer incomplete \u2014 the model stream ended early.)_';
         }
     }
 
@@ -367,6 +414,25 @@ export class RAGManager {
             return;
         }
         
+        // F-411: purge anything still sitting under this id BEFORE indexing the
+        // new session. The live id is a CONSTANT ('live-meeting-current'), and
+        // the only cleanup is at meeting end — guarded by !isMeetingActive, and
+        // deliberately skipped when a new meeting has already started. So after
+        // a crash, a force-quit, or a start that overlaps the previous drain,
+        // the previous meeting's transcript chunks survive under the same id;
+        // the live "ask about this meeting" surface filters only on meeting_id,
+        // so meeting A's transcript was served as evidence for meeting B.
+        // There is no startup sweep anywhere, and `chunks` has no
+        // UNIQUE(meeting_id, chunk_index) to stop the rows interleaving.
+        // Purging here is the one place that runs on EVERY path into a new
+        // live session, and it is safe: these JIT rows are always disposable
+        // (post-meeting RAG re-indexes under the real meeting id).
+        try {
+            this.deleteMeetingData(meetingId);
+        } catch (e) {
+            console.warn('[RAGManager] Failed to purge stale live-indexing data before start:', e);
+        }
+
         // Ensure meeting row exists in DB to satisfy foreign key constraints for chunks
         try {
             this.db.prepare(`

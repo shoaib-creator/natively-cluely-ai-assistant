@@ -424,12 +424,70 @@ export function sentenceAwareWindows(text: string, targetWords: number, overlapW
     if (!clean) return [];
     const wordCount = (s: string) => (s.match(/\S+/g) || []).length;
     if (wordCount(clean) <= targetWords) return [clean];
+    // Hard word-cap fallback for text the sentence splitter cannot DIVIDE —
+    // deliberately NOT for a sentence that is merely long.
+    //
+    // Two different situations reach the one-piece case, and they want opposite
+    // treatment:
+    //
+    //   (a) A genuine, over-long sentence. Splitting it is actively harmful: the
+    //       RFC 8259 case this file's test is built on split "Implementations
+    //       MUST NOT add a byte order mark" so that a chunk carried "byte order
+    //       mark" WITHOUT "MUST NOT" — a retrieved fragment that states the
+    //       opposite of the source. Semantic integrity beats the word cap here,
+    //       and `SentenceAwareChunking` pins that.
+    //
+    //   (b) A body with no sentence structure at all. This used to hit the same
+    //       `return [clean]` and hand back the WHOLE text as one window, with
+    //       `targetWords` silently ignored. That is not an edge case here:
+    //       realtime STT emits unpunctuated transcripts (Soniox sends none at
+    //       all), as do OCR dumps, table/CSV extractions and minified content. A
+    //       5600-word document became ONE chunk — retrieval granularity gone, and
+    //       the embedder truncates at its token limit, so most of the document
+    //       was never searchable.
+    //
+    // A length ceiling separates them. Real sentences, even legal or normative
+    // ones, do not run to hundreds of words; text claiming to be a single
+    // sentence several times the window size is unpunctuated prose, not a clause
+    // worth protecting. Below the ceiling we keep it whole and accept one
+    // oversized chunk; above it we window by words.
+    //
+    // The discriminator is STRUCTURE first, length only as a backstop.
+    //
+    // A piece is windowed when it is over-long AND either
+    //   (a) it contains no sentence-terminal punctuation at all — then it is not
+    //       a sentence in any meaningful sense, it is an unpunctuated transcript
+    //       or an OCR/table dump, and there is no clause to protect; or
+    //   (b) it is longer than a generous absolute ceiling — the backstop for a
+    //       structureless run that happens to carry one trailing period, which
+    //       would otherwise slip past (a) and reproduce the original bug.
+    //
+    // Length alone was NOT enough, and picking `3x` first was a mistake worth
+    // recording: a `3 * 140 = 420` ceiling exactly swallowed a 420-word
+    // three-paragraph fixture (ModeLocalRerank's), collapsing three chunks into
+    // one. Any single number is arbitrary at its boundary; whether the text has
+    // sentences at all is not.
+    const HAS_SENTENCE_PUNCTUATION = /[.!?]/;
+    const ABSOLUTE_CEILING_WORDS = targetWords * 3;
+    const wordWindows = (s: string): string[] => {
+        const w = s.match(/\S+/g) || [];
+        if (w.length <= targetWords) return [s];
+        const structureless = !HAS_SENTENCE_PUNCTUATION.test(s);
+        if (!structureless && w.length <= ABSOLUTE_CEILING_WORDS) return [s];
+        const step = Math.max(1, targetWords - overlapWords);
+        const out: string[] = [];
+        for (let i = 0; i < w.length; i += step) {
+            out.push(w.slice(i, i + targetWords).join(' '));
+            if (i + targetWords >= w.length) break;
+        }
+        return out;
+    };
     const sentences: string[] = [];
     for (const part of clean.split(/(?<=[.!?][")\]]?)\s+(?=[A-Z0-9"[(])/)) {
         const p = part.trim();
-        if (p) sentences.push(p);
+        if (p) sentences.push(...wordWindows(p));
     }
-    if (sentences.length <= 1) return [clean];
+    if (sentences.length <= 1) return sentences.length === 1 ? [sentences[0]] : [clean];
     const windows: string[] = [];
     let cur: string[] = [];
     let curWords = 0;
@@ -491,6 +549,26 @@ export function selectTableOfContentsEntries(query: string, map: DocumentMap): s
     return scored.filter((item) => item.hits === best.hits && item.score >= best.score * 0.8).map((item) => item.entry);
 }
 
+/**
+ * The titles of a numbered section's ANCESTORS, outermost first.
+ *
+ * "4.2.1" -> ["4 Method", "4.2 Training"]. Returns [] for a top-level or
+ * unnumbered section, which correctly yields no `[context: …]` prefix: there is
+ * no ancestry to disambiguate against.
+ */
+function ancestorTitles(map: DocumentMap, num: string): string[] {
+    if (!num || !num.includes('.')) return [];
+    const parts = num.split('.');
+    const byNum = new Map(map.sections.map((s) => [s.num, s]));
+    const out: string[] = [];
+    for (let i = 1; i < parts.length; i++) {
+        const prefix = parts.slice(0, i).join('.');
+        const ancestor = byNum.get(prefix);
+        if (ancestor?.heading) out.push(`${prefix} ${ancestor.heading}`);
+    }
+    return out;
+}
+
 export function sectionAwareChunksFromMap(
     map: DocumentMap,
     chunkWords: number,
@@ -513,9 +591,26 @@ export function sectionAwareChunksFromMap(
         const tag = section.num
             ? `[Section ${section.num} | p${section.pageStart}${section.pageEnd !== section.pageStart ? '-' + section.pageEnd : ''}]`
             : `[p${section.pageStart}]`;
-        const headingLine = section.heading && section.heading !== 'Preamble'
-            ? `${tag} ${section.heading}`
-            : tag;
+        // ANCESTOR PATH (T9, 2026-08-28), appended AFTER the tag and never in
+        // place of it: five call sites parse `[Section N.N | pX]` anchored at
+        // position 0 (ModeHybridRetriever.ts:1118, :1216, :1802, :2020 and
+        // documentGroundedPrompt.ts:653, :699), so substituting the format would
+        // break section-targeted retrieval, the section-restore pass and the
+        // prompt's own SECTION-TAGGED RELEVANCE rule at once.
+        //
+        // The path is derived from the section NUMBER, which is what carries
+        // hierarchy in a numbered document: 4.2.1's ancestors are 4 and 4.2, and
+        // they are already in this map. That gives "4 Method > 4.2 Training" in
+        // front of a chunk that would otherwise say only "4.2.1 Optimizer" —
+        // the same identity fix as the flat path, expressed in the vocabulary
+        // this document shape actually uses.
+        const ancestors = ancestorTitles(map, section.num);
+        const ctx = ancestors.length ? `[context: ${ancestors.join(' > ')}]` : '';
+        const headingLine = [
+            tag,
+            ctx,
+            section.heading && section.heading !== 'Preamble' ? section.heading : '',
+        ].filter(Boolean).join(' ');
         const words = body.split(/\s+/).filter(Boolean);
         if (words.length <= chunkWords) {
             chunks.push(`${headingLine}\n${body}`);

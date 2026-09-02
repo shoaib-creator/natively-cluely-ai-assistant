@@ -9,6 +9,13 @@ export interface AppSettings {
     isUndetectable?: boolean;
     disguiseMode?: 'terminal' | 'settings' | 'activity' | 'none';
     verboseLogging?: boolean;
+    // Windows only, DEFAULT false. When true, an always-on WH_KEYBOARD_LL hook
+    // swallows + self-dispatches the app's own global shortcuts even when stealth
+    // typing is OFF, closing the residual leak where a dropped RegisterHotKey
+    // registration lets a chord's key reach the foreground app. Off by default
+    // because an always-present low-level keyboard hook is more visible to
+    // EDR/AV than one that exists only during stealth-typing sessions.
+    stealthShortcutGuard?: boolean;
     // Context Intelligence debug logging level (Developer settings). The env
     // var NATIVELY_CONTEXT_DEBUG overrides this — precedence is owned by
     // context-intelligence/debug/debug-config.ts, which reads this value
@@ -19,6 +26,16 @@ export interface AppSettings {
     // while idle. Off by default — the hotkey's existing behavior is unchanged
     // until the user opts in from Settings > General.
     ambientChatEnabled?: boolean;
+    // Automatic answers after the interviewer finishes a question. Off by
+    // default: until the user opts in from Settings > General, an answer is
+    // produced only by the What-to-Answer hotkey, exactly as before. The
+    // trigger itself lives in AppState.scheduleAutoAnswer().
+    autoAnswerEnabled?: boolean;
+    // Direct Assist is the opt-in, single-provider answer path. It deliberately
+    // bypasses meeting retrieval and the legacy answer-orchestration pipeline.
+    // Keep the persisted default OFF during rollout; the operator kill switch
+    // (NATIVELY_DIRECT_ASSIST_KILL_SWITCH) always wins over this preference.
+    directAssistEnabled?: boolean;
     actionButtonMode?: 'recap' | 'brainstorm';
     groqFastTextMode?: boolean;
     codexCliEnabled?: boolean;
@@ -229,9 +246,25 @@ export class SettingsManager {
         return this.settings[key];
     }
 
-    public set<K extends keyof AppSettings>(key: K, value: AppSettings[K]): void {
+    /**
+     * @returns true when the value was persisted; false when the store is
+     * degraded and the write was refused. CR-04: callers that report success to
+     * the renderer must check this — several used to report success while disk
+     * was unchanged, so the setting silently reverted on restart.
+     */
+    public set<K extends keyof AppSettings>(key: K, value: AppSettings[K]): boolean {
+        // R-15: when the store is degraded, saveSettings() refuses. Mutating
+        // in-memory first left the process believing the write succeeded while
+        // disk still held the old value — and roughly fifteen IPC handlers report
+        // success to the renderer off this call. Refuse before mutating so memory
+        // and disk cannot disagree.
+        if (this.settingsUnreadable) {
+            console.warn(`[SettingsManager] Refusing to set "${String(key)}": the settings store is degraded this session (see the quarantine warning at startup).`);
+            return false;
+        }
         this.settings[key] = value;
         this.saveSettings();
+        return true;
     }
 
     // Resolved screen-understanding mode with default and runtime validation.
@@ -251,24 +284,54 @@ export class SettingsManager {
         return 'off';
     }
 
-    public setContextDebugLevel(level: ContextDebugLevelSetting): void {
+    /**
+     * CR-04: this used to mutate `this.settings` directly and then call
+     * saveSettings(), which REFUSES when the store is degraded — so memory and
+     * disk diverged, the IPC handler reported success, and the setting reverted
+     * on restart. The R-15 guard lives in set(); go through it.
+     * @returns false when the write was refused.
+     */
+    public setContextDebugLevel(level: ContextDebugLevelSetting): boolean {
         if (!(VALID_CONTEXT_DEBUG_LEVELS as readonly string[]).includes(level)) {
             throw new Error(`[SettingsManager] Invalid contextDebugLevel: ${level}`);
         }
-        this.settings.contextDebugLevel = level;
-        this.saveSettings();
+        return this.set('contextDebugLevel', level);
     }
 
-    public setScreenUnderstandingMode(mode: ScreenUnderstandingMode): void {
+    /**
+     * CR-04: same bypass as setContextDebugLevel. Worse here, because the IPC
+     * handler also BROADCASTS screen-understanding-mode-changed to every window
+     * — so the whole UI switched mode while disk still held the old value.
+     * @returns false when the write was refused.
+     */
+    public setScreenUnderstandingMode(mode: ScreenUnderstandingMode): boolean {
         if (!(VALID_SCREEN_UNDERSTANDING_MODES as readonly string[]).includes(mode)) {
             throw new Error(`[SettingsManager] Invalid screenUnderstandingMode: ${mode}`);
         }
-        this.settings.screenUnderstandingMode = mode;
-        this.saveSettings();
+        return this.set('screenUnderstandingMode', mode);
     }
 
     public getTechnicalInterviewVisionFirst(): boolean {
         return this.settings.technicalInterviewVisionFirst !== false;
+    }
+
+    /**
+     * Emergency operator stop for Direct Assist. This is intentionally a
+     * hard-off switch: renderer settings can never override it. The value is
+     * read on every call so a test harness or a managed launch environment can
+     * establish the effective state before any request is dispatched.
+     */
+    public isDirectAssistKilledByOperator(): boolean {
+        const raw = String(process.env.NATIVELY_DIRECT_ASSIST_KILL_SWITCH ?? '')
+            .trim()
+            .toLowerCase();
+        return raw === '1' || raw === 'true' || raw === 'on' || raw === 'yes';
+    }
+
+    /** Effective Direct Assist state. Persisted default is false. */
+    public getDirectAssistEnabled(): boolean {
+        if (this.isDirectAssistKilledByOperator()) return false;
+        return this.settings.directAssistEnabled === true;
     }
 
     // ── Smart Browser Context v2 — resolved settings (single default source) ──
@@ -373,14 +436,27 @@ export class SettingsManager {
                         throw new Error('Settings JSON is not a valid object');
                     }
                 } catch (parseError) {
-                    console.error('[SettingsManager] Failed to parse settings.json. Continuing with empty settings. Error:', parseError);
-                    this.settings = {};
+                    // F-703: the file EXISTS but is unreadable. Continuing with
+                    // `{}` is fine for reads, but the next set() used to
+                    // serialize that empty object straight over settings.json —
+                    // destroying every user setting (~60 keys incl. API/CLI
+                    // paths, retention, provider scopes, onboarding state) on
+                    // the first toggle after a corrupt read. CredentialsManager
+                    // treats this exact situation as unacceptable and refuses
+                    // writes for the session; mirror that here so a recoverable
+                    // file is never overwritten with a partial one.
+                    this.quarantineUnreadableSettings(parseError);
                 }
                 console.log('[SettingsManager] Settings loaded');
             }
         } catch (e) {
-            console.error('[SettingsManager] Failed to read settings file:', e);
+            // F-703: same reasoning as the parse failure above — a file we
+            // could not READ must not be overwritten from an empty in-memory
+            // object. (A genuinely absent file is handled by the existsSync
+            // branch above and stays writable, so first-run is unaffected.)
+            console.error('[SettingsManager] Failed to read settings file; continuing READ-ONLY for this session:', e);
             this.settings = {};
+            this.settingsUnreadable = true;
         }
     }
 
@@ -402,10 +478,80 @@ export class SettingsManager {
         }
     }
 
+    /**
+     * F-703: set when settings.json exists but could not be read/parsed. While
+     * true the in-memory object is a partial view, so persisting it would
+     * destroy the user's real settings. Reads continue to work (callers get
+     * defaults); writes are refused for the session, exactly as
+     * CredentialsManager does for an unreadable keyring.
+     */
+    private settingsUnreadable = false;
+
+    /** True when settings could not be loaded and writes are being refused. */
+    public isDegraded(): boolean {
+        return this.settingsUnreadable;
+    }
+
+    /**
+     * R-15: a file that cannot be PARSED will never parse — the content is
+     * deterministic — so refusing writes for "this session" actually refused them
+     * on every launch, forever, with no recovery path (isDegraded() had no
+     * callers and nothing ever cleared the flag). A 0-byte, whitespace-only,
+     * "null" or BOM-prefixed settings.json therefore bricked the settings store
+     * permanently, and saveSettings' missing fsync is one of the ways such a file
+     * gets created in the first place.
+     *
+     * F-703's underlying concern was still right: never overwrite a recoverable
+     * file with an empty object. Quarantine satisfies both — the original bytes
+     * are PRESERVED under a timestamped name for recovery, and the app continues
+     * with defaults on a writable store so it self-heals on the next write.
+     *
+     * If the rename itself fails we fall back to F-703's read-only stance, which
+     * is the correct conservative choice: we could not move the file, so we must
+     * not overwrite it either.
+     */
+    private quarantineUnreadableSettings(cause: unknown): void {
+        this.settings = {};
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const quarantinePath = `${this.settingsPath}.corrupt-${stamp}`;
+        try {
+            fs.renameSync(this.settingsPath, quarantinePath);
+            this.settingsUnreadable = false;
+            console.error(
+                `[SettingsManager] settings.json could not be parsed and was moved to ${quarantinePath}. `
+                + 'Continuing with defaults on a writable store; the original file is preserved for recovery. Cause:',
+                cause,
+            );
+        } catch (renameErr) {
+            this.settingsUnreadable = true;
+            console.error(
+                '[SettingsManager] settings.json could not be parsed AND could not be quarantined; '
+                + 'continuing READ-ONLY so the existing file is not overwritten. Parse cause:',
+                cause, 'Quarantine error:', renameErr,
+            );
+        }
+    }
+
     private saveSettings(): void {
+        if (this.settingsUnreadable) {
+            console.warn('[SettingsManager] Refusing to save: settings.json was unreadable and could not be quarantined, so writing would overwrite it with an incomplete set. Repair or remove the file, then restart.');
+            return;
+        }
         try {
             const tmpPath = this.settingsPath + '.tmp';
-            fs.writeFileSync(tmpPath, JSON.stringify(this.settings, null, 2));
+            // R-15: write + fsync + rename. Without the fsync the rename could be
+            // durable while the DATA was still in the page cache, so a power loss
+            // left a 0-byte settings.json — which is exactly the input that used to
+            // brick the store permanently. Only the FILE is synced: fsync on a
+            // directory handle is not supported on Windows, so syncing the parent
+            // would break the win32 path for a guarantee we do not need here.
+            const fd = fs.openSync(tmpPath, 'w');
+            try {
+                fs.writeFileSync(fd, JSON.stringify(this.settings, null, 2));
+                fs.fsyncSync(fd);
+            } finally {
+                fs.closeSync(fd);
+            }
             fs.renameSync(tmpPath, this.settingsPath);
         } catch (e) {
             console.error('[SettingsManager] Failed to save settings:', e);

@@ -255,7 +255,19 @@ export class NativelyProSTT extends EventEmitter {
         // CoreAudio Tap) ~5-7s after start(), which is exactly when the first
         // chunk arrives — long before the server has confirmed the
         // handshake.
-        if (this.isActive && this.isConnected) {
+        // F-204: gate on the states the comment above actually describes, not
+        // on `isConnected`. isConnected only flips when the SERVER's
+        // {status:'connected'} frame arrives — a full round-trip AFTER the
+        // auth frame (which commits sample_rate) was sent in ws.on('open').
+        // Gating on it left the window readyState===OPEN && !isConnected
+        // silently un-reconnected: the old rate was already committed
+        // server-side, so the server transcoded stale-rate while the bytes
+        // arrived at the new rate — exactly the garbled-transcript failure
+        // this block exists to prevent. Live-reproduced in
+        // scripts/audit/F-204-repro.mjs.
+        const socket = this.ws;
+        const preHandshake = !socket || socket.readyState === WebSocket.CONNECTING;
+        if (this.isActive && !preHandshake) {
             console.log(`[NativelyProSTT:${this.channel}] Rate changed mid-stream — reconnecting WS so server uses the new declared rate.`);
             this.reconnectAttempts = 0;     // fresh session — reset backoff
             this.intentionalClose  = true;  // don't re-trigger via close handler
@@ -637,10 +649,26 @@ export class NativelyProSTT extends EventEmitter {
                             kind: this.target ? this.kindForUrl(connectUrl) : 'railway',
                         });
                     }
+                    // Speaker label, when the relay sends one. The app's PRIMARY
+                    // speaker separation is physical — mic and system audio are
+                    // two devices and two sessions — and nothing here changes
+                    // that. This is the second-order case that separation cannot
+                    // reach: several voices INSIDE the meeting-audio channel (a
+                    // panel, a colleague answering a colleague, a two-speaker
+                    // video). Soniox stt-rt-v5 can label them per token, so if
+                    // the relay ever forwards the tag — the same way it already
+                    // forwards per-token `language` — Auto Answer's judge picks
+                    // it up with no further client work. Absent field → absent
+                    // label → today's behaviour exactly.
+                    const speakerId = typeof msg.speaker === 'string' ? msg.speaker
+                        : typeof msg.speaker === 'number' ? `speaker_${msg.speaker}`
+                        : typeof msg.speaker_id === 'string' ? msg.speaker_id
+                        : undefined;
                     this.emit('transcript', {
                         text:       msg.text,
                         isFinal:    msg.is_final    ?? false,
                         confidence: msg.confidence  ?? 1.0,
+                        ...(speakerId ? { speakerId } : {}),
                     });
                 }
             } catch (err) {

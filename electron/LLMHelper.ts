@@ -68,6 +68,14 @@ import { promisify } from 'util';
 import axios from 'axios';
 import { createProviderRateLimiters, RateLimiter } from './services/RateLimiter';
 import { CodexCliConfig, CodexCliService, DEFAULT_CODEX_CLI_CONFIG } from './services/CodexCliService';
+import { GROQ_PRIMARY_MODEL, groqFallbackFor, isGroqModelGone } from './llm/groqModels';
+import { DirectAssistError } from './direct-assist/errors';
+import { DIRECT_ASSIST_CURRENT_TURN_SPEECH_MARKER } from './direct-assist/requestBuilder';
+import type {
+  DirectAssistDispatchRequest,
+  DirectAssistProvider,
+  DirectAssistSelection,
+} from './direct-assist/types';
 const execAsync = promisify(exec);
 const NATIVELY_API_URL = (process.env.NATIVELY_API_URL || 'https://api.natively.software').replace(/\/+$/, '');
 
@@ -109,7 +117,7 @@ interface OllamaResponse {
 }
 
 // Model constants for Gemini (priority: flash-lite → flash → pro)
-const GEMINI_FLASH_MODEL = "gemini-3.6-flash"
+const GEMINI_FLASH_MODEL = "gemini-3.7-flash"
 const GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite"
 const GEMINI_PRO_MODEL = "gemini-3.1-pro-preview"
 
@@ -118,11 +126,30 @@ const GEMINI_PRO_MODEL = "gemini-3.1-pro-preview"
 // serial Gemini cascade (flash-lite → flash → pro) — flash-lite leads, flash and
 // pro are pure pre-first-token fallbacks. The former VISION_HEDGE_ENABLED /
 // TEXT_HEDGE_ENABLED / GEMINI_TEXT_HEDGE_CONFIG knobs were removed.
-const GROQ_MODEL = "llama-3.3-70b-versatile"
+// Groq retired every Llama id it hosted: `llama-3.3-70b-versatile` shut down
+// 2026-08-16 and `meta-llama/llama-4-scout-17b-16e-instruct` on 2026-07-17.
+// `qwen/qwen3.6-27b` is the replacement for BOTH paths — it is the only model
+// left in Groq's catalogue that accepts image input, so text and vision share
+// one id. The user's pick in the model selector still wins; these are only the
+// baseline used when nothing is chosen and by the Fast Text / emergency paths.
+//
+// The id is PREVIEW tier, so the text paths ladder down to a production-tier
+// model when it is retired — see electron/llm/groqModels.ts. Vision does not
+// ladder: if this id goes, Groq hosts nothing that accepts an image, and the
+// vision chain is meant to fall through to another provider.
+const GROQ_MODEL = GROQ_PRIMARY_MODEL
+import { GROQ_VISION_MODEL } from './llm/groqModels'
+// Groq rejects a request carrying more than 5 images. Every other vision
+// provider here takes as many as we send, so the cap lives on the Groq path.
+const GROQ_VISION_MAX_IMAGES = 5
 const OPENAI_MODEL = "gpt-5.4"
 const CLAUDE_MODEL = "claude-sonnet-4-6"
 const DEEPSEEK_MODEL = "deepseek-v4-flash"
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+const NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+// Requested ceiling; see createNvidiaNimCompletion for why it is a request and
+// not a guarantee (NVIDIA exposes no per-model output budget to look up).
+const NVIDIA_NIM_MAX_OUTPUT_TOKENS = 8192
 const DEEPSEEK_MAX_OUTPUT_TOKENS = 8192
 // LiteLLM fronts arbitrary upstream models with widely varying output ceilings.
 // Resolution order per request: (1) user manual override from Settings,
@@ -213,17 +240,46 @@ export const CODING_THINKING_BUDGET = 0;
 // `thinkingBudget` is DEPRECATED in favor of the `thinkingLevel` enum
 // (minimal|low|medium|high), and gemini-3.1-pro CANNOT disable thinking — it
 // rejects budget:0 / 'minimal' with a 400, so Pro gets 'low' (its floor).
-// A budget of 0 (or negative) maps to 'minimal' (verified to drive
-// thoughtsTokenCount→0 on flash/flash-lite); a positive budget is preserved
-// verbatim for callers that explicitly want a bounded token budget.
-// Keep the Pro→LOW / flash→MINIMAL policy in sync with the server's
-// thinkingConfigForModel() in natively-api/lib/flashModelPicker.js.
+// A budget of 0 (or negative) maps to 'minimal' ONLY on models that accept it;
+// a positive budget is preserved verbatim for callers that explicitly want a
+// bounded token budget.
+// Keep this policy in sync with the server's thinkingConfigForModel() in
+// natively-api/lib/flashModelPicker.js.
 // Match "pro" as a SEGMENT (not a loose substring) so only real Pro ids hit the
 // floor — Pro rejects MINIMAL/budget:0 with a 400.
 const PRO_MODEL_RE = /(?:^|[-/])pro(?:[-/]|$)/i;
+
+// `minimal` IS NOT UNIFORMLY SUPPORTED ACROSS THE FLASH TIER. Probed live
+// against the Gemini API on 2026-08-14:
+//
+//   gemini-3.1-flash-lite   minimal → 200    low → 200
+//   gemini-3.6-flash        minimal → 200    low → 200
+//   gemini-3.7-flash        minimal → 400    low → 200
+//                           ("Thinking level MINIMAL is not supported for this
+//                            model. Please retry with other thinking level.")
+//
+// So `minimal` is opt-in PER MODEL ID and `low` — accepted by every flash tier
+// and by Pro — is the floor for any other model. The direction matters: sending
+// MINIMAL to a model that rejects it is a hard 400 on the interactive stream,
+// not a slower answer. This is the client mirror of MINIMAL_THINKING_MODELS in
+// natively-api/lib/flashModelPicker.js — add an id only after probing it live.
+// Safe as an allow-list because buildThinkingConfig's only call site is the
+// Gemini-only streaming path, so it never sees an OpenAI/Claude model id.
+const MINIMAL_THINKING_MODELS = new Set<string>([
+  'gemini-3.1-flash-lite',
+  'gemini-3.6-flash',
+]);
+
 export function buildThinkingConfig(model: string | undefined, budget: number): { thinkingLevel: ThinkingLevel } | { thinkingBudget: number } {
   if (typeof model === 'string' && PRO_MODEL_RE.test(model)) return { thinkingLevel: ThinkingLevel.LOW };
-  if (budget <= 0) return { thinkingLevel: ThinkingLevel.MINIMAL };
+  if (budget <= 0) {
+    // Unknown/unlisted model → LOW, the universally accepted floor. Falling
+    // through to MINIMAL here is what 400s gemini-3.7-flash.
+    if (typeof model === 'string' && !MINIMAL_THINKING_MODELS.has(model)) {
+      return { thinkingLevel: ThinkingLevel.LOW };
+    }
+    return { thinkingLevel: ThinkingLevel.MINIMAL };
+  }
   return { thinkingBudget: budget };
 }
 
@@ -264,6 +320,14 @@ const IMAGE_ANALYSIS_PROMPT = `Analyze concisely. Be direct. No markdown formatt
 
 ${IMAGE_TRUST_TRAILER}`
 
+/** Per-call routing/budget overrides for the meeting-notes path. Omitted → today's behaviour. */
+export type MeetingSummaryCallOpts = {
+  /** Routes to the gateway's benchmarked extraction path (larger budget, no MiniMax-M3). */
+  purpose?: 'extraction';
+  /** Overrides BOTH the Natively inner fetch cap and the outer race. Default 10s. */
+  timeoutMs?: number;
+};
+
 /** Out-of-band result of one streamChat call. See streamChatWithOutcome. */
 export interface StreamOutcome {
   /** True when the turn stopped early and the text is INCOMPLETE. */
@@ -297,6 +361,7 @@ export class LLMHelper {
   // DeepSeek is OpenAI-compatible; reuse the OpenAI SDK with a custom baseURL.
   // Kept as a separate client so credentials/scope/telemetry stay provider-specific.
   private _deepseekClient: OpenAI | null = null
+  private _nvidiaNimClient: OpenAI | null = null
   // LiteLLM proxy is OpenAI-compatible (AI gateway fronting 100+ providers).
   // Same pattern as DeepSeek: OpenAI SDK + custom baseURL, separate client so
   // credentials/scope/telemetry stay provider-specific.
@@ -312,6 +377,8 @@ export class LLMHelper {
   private set claudeClient(v: Anthropic | null) { this._claudeClient = v }
   private get deepseekClient(): OpenAI | null { return this.isProviderDisabled('deepseek') ? null : this._deepseekClient }
   private set deepseekClient(v: OpenAI | null) { this._deepseekClient = v }
+  private get nvidiaNimClient(): OpenAI | null { return this.isProviderDisabled('nvidia_nim') ? null : this._nvidiaNimClient }
+  private set nvidiaNimClient(v: OpenAI | null) { this._nvidiaNimClient = v }
   private get litellmClient(): OpenAI | null { return this.isProviderDisabled('litellm') ? null : this._litellmClient }
   private set litellmClient(v: OpenAI | null) { this._litellmClient = v }
 
@@ -352,6 +419,7 @@ export class LLMHelper {
   private openaiApiKey: string | null = null
   private claudeApiKey: string | null = null
   private deepseekApiKey: string | null = null
+  private nvidiaNimApiKey: string | null = null
   private litellmApiKey: string | null = null
   private litellmBaseURL: string = "http://localhost:4000/v1"
   // Manual output-ceiling override (Settings → LiteLLM Proxy dropdown).
@@ -843,7 +911,7 @@ export class LLMHelper {
     console.warn(`[ScopeFallback] ${scope} denied; Ollama unavailable, omitting from context`);
   }
 
-  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string, groqApiKey?: string, openaiApiKey?: string, claudeApiKey?: string, deepseekApiKey?: string) {
+  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string, groqApiKey?: string, openaiApiKey?: string, claudeApiKey?: string, deepseekApiKey?: string, nvidiaNimApiKey?: string) {
     this.useOllama = useOllama
 
     // Initialize rate limiters
@@ -882,6 +950,7 @@ export class LLMHelper {
       this.deepseekClient = new OpenAI({ apiKey: deepseekApiKey, baseURL: DEEPSEEK_BASE_URL })
       console.log(`[LLMHelper] DeepSeek client initialized with model: ${DEEPSEEK_MODEL}`)
     }
+    if (nvidiaNimApiKey) this.setNvidiaNimApiKey(nvidiaNimApiKey)
 
     if (useOllama) {
       this.ollamaUrl = ollamaUrl || "http://127.0.0.1:11434"
@@ -1003,6 +1072,15 @@ export class LLMHelper {
     this.deepseekPermanentlyDead = false;
     this.deepseekSkipWarned = false;
     console.log("[LLMHelper] DeepSeek API Key updated.");
+  }
+
+  public setNvidiaNimApiKey(apiKey: string) {
+    const trimmed = (apiKey || '').trim();
+    this.nvidiaNimApiKey = trimmed || null;
+    this.nvidiaNimClient = trimmed ? new OpenAI({ apiKey: trimmed, baseURL: NVIDIA_NIM_BASE_URL }) : null;
+    this.textHealth.delete('nvidia_nim');
+    this.visionHealth.delete('nvidia_nim');
+    console.log(`[LLMHelper] NVIDIA NIM API Key ${trimmed ? 'updated' : 'cleared'}.`);
   }
 
   /**
@@ -1273,6 +1351,12 @@ export class LLMHelper {
 
   // --- Model Type Checkers ---
   private isOpenAiModel(modelId: string): boolean {
+    // Groq hosts OpenAI's open-weight models under 'openai/gpt-oss-…', so the
+    // bare "openai" substring matched them and routed the picker's new Groq
+    // models to api.openai.com (404 model_not_found on every turn — code-
+    // review 2026-08-23). Excluding Groq-hosted ids HERE fixes every dispatch
+    // site at once, independent of branch ordering.
+    if (this.isGroqModel(modelId)) return false;
     return modelId.startsWith("gpt-") || modelId.startsWith("o1-") || modelId.startsWith("o3-") || modelId.includes("openai");
   }
 
@@ -1287,6 +1371,52 @@ export class LLMHelper {
 
   private isLiteLLMModel(modelId: string): boolean {
     return !!modelId && modelId.startsWith("litellm/");
+  }
+
+  private isNvidiaNimModel(modelId: string): boolean { return !!modelId && modelId.startsWith('nvidia_nim/'); }
+
+  /**
+   * NVIDIA NIM output ceiling.
+   *
+   * Unlike LiteLLM (whose /model/info exposes a per-model budget, see
+   * resolveLitellmMaxTokens), NVIDIA's /v1/models returns only id/object/
+   * created/owned_by — there is no ceiling to look up. The model list is
+   * fetched wholesale from the catalogue, so the user can select a model whose
+   * ceiling is below this default, and a fixed max_tokens then 400s EVERY
+   * request for that model with no path to recovery.
+   *
+   * So: ask for NVIDIA_NIM_MAX_OUTPUT_TOKENS, and if the server rejects the
+   * request because of it, retry once letting the server apply the model's own
+   * default. Message-shape-agnostic on purpose — it keys off the 400 plus a
+   * mention of the parameter, not off one vendor phrasing.
+   */
+  private isNvidiaNimMaxTokensRejection(error: any): boolean {
+    const status = error?.status ?? error?.response?.status;
+    if (status !== 400 && status !== 422) return false;
+    const text = [
+      error?.message,
+      error?.error?.message,
+      error?.response?.data?.message,
+      error?.response?.data?.detail,
+      typeof error?.response?.data?.error === 'string' ? error.response.data.error : error?.response?.data?.error?.message,
+    ].filter(Boolean).join(' ').toLowerCase();
+    return text.includes('max_tokens') || text.includes('max tokens') || text.includes('maximum tokens');
+  }
+
+  /**
+   * Run an NVIDIA NIM completion, dropping max_tokens and retrying once if the
+   * model's ceiling is lower than what we asked for.
+   */
+  private async createNvidiaNimCompletion(request: any, options?: any): Promise<any> {
+    const client = this.nvidiaNimClient;
+    if (!client) throw new Error('NVIDIA NIM client not initialized');
+    try {
+      return await client.chat.completions.create({ ...request, max_tokens: NVIDIA_NIM_MAX_OUTPUT_TOKENS }, options);
+    } catch (error: any) {
+      if (!this.isNvidiaNimMaxTokensRejection(error)) throw error;
+      console.warn(`[LLMHelper] NVIDIA NIM rejected max_tokens=${NVIDIA_NIM_MAX_OUTPUT_TOKENS} for ${request?.model}; retrying with the model's own ceiling`);
+      return await client.chat.completions.create(request, options);
+    }
   }
 
   private getDeepseekMaxOutput(_modelId: string): number {
@@ -1341,8 +1471,17 @@ export class LLMHelper {
     return 4096 * 4; // unknown model → conservative
   }
 
+  // MIRRORS isKnownGroqModel() in ipcHandlers.ts and the auto-default check in
+  // CredentialsManager.setNativelyApiKey(). All three must agree about what a
+  // Groq id looks like, or the picker offers a model routing rejects.
+  //
+  // `openai/gpt-oss-*` is Groq-hosted, NOT the OpenAI API — it is gated by the
+  // Groq key. This check must therefore run before any OpenAI classification.
   private isGroqModel(modelId: string): boolean {
-    return modelId.startsWith("llama-") || modelId.startsWith("mixtral-") || modelId.startsWith("gemma-") || modelId.startsWith("meta-llama/") || modelId.startsWith("qwen/") || modelId.startsWith("qwen-");
+    // Delegates to the ONE shared predicate (groqModels.ts) — the three
+    // hand-synced copies had already drifted (code-review 2026-08-23).
+    const { isGroqModelId } = require('./llm/groqModels') as typeof import('./llm/groqModels');
+    return isGroqModelId(modelId);
   }
 
   private isGeminiModel(modelId: string): boolean {
@@ -1537,7 +1676,7 @@ export class LLMHelper {
     });
   }
 
-  private async *streamWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+  private async *streamWithCodexCli(userContent: string, systemPrompt?: string, fastMode = false, imagePaths?: string[], signal?: AbortSignal, modelOverride?: string): AsyncGenerator<string, void, unknown> {
     if (!this.isCodexAvailable()) throw new Error('Codex CLI transport is disabled or ChatGPT is signed out.');
     // Codex routes to chatgpt.com/backend-api — it is a CLOUD provider, and it
     // needs the same local-only last boundary every other cloud provider has.
@@ -1551,7 +1690,7 @@ export class LLMHelper {
     // first next() rather than at call time — still strictly before any byte
     // reaches CodexCliService.stream, which is the property that matters.
     this.assertOutboundScopes('codex', userContent, imagePaths);
-    const model = this.getSelectedCodexCliModel(fastMode);
+    const model = modelOverride || this.getSelectedCodexCliModel(fastMode);
     // See note in generateWithCodexCli — system prompt is sent
     // separately as `body.instructions`, not concatenated.
     yield* CodexCliService.stream(this.codexCliConfig.path, {
@@ -2315,15 +2454,25 @@ ANSWER DIRECTLY:`;
       if (this.useOllama) {
         return await this.callOllama(promptMessage, undefined, systemPrompt);
       } else if (this.customProvider || this.activeCurlProvider) {
+        // F3 (code-review 2026-08-14): buffered caller — a truncated stream
+        // must fail loudly, not return a mid-sentence suggestion (see chat()).
+        const { stream, outcome } = this.streamChatWithOutcome(promptMessage, undefined, suggestionContext, basePrompt, true);
         let fullResponse = '';
-        for await (const chunk of this.streamChat(promptMessage, undefined, suggestionContext, basePrompt, true)) {
+        for await (const chunk of stream) {
           fullResponse += chunk;
+        }
+        if (outcome.truncated) {
+          throw new Error('Suggestion generation truncated mid-stream — discarding partial output.');
         }
         return this.processResponse(fullResponse);
       } else if (this.client) {
+        const { stream, outcome } = this.streamChatWithOutcome(promptMessage, undefined, suggestionContext, basePrompt, true);
         let fullResponse = '';
-        for await (const chunk of this.streamChat(promptMessage, undefined, suggestionContext, basePrompt, true)) {
+        for await (const chunk of stream) {
           fullResponse += chunk;
+        }
+        if (outcome.truncated) {
+          throw new Error('Suggestion generation truncated mid-stream — discarding partial output.');
         }
         return this.processResponse(fullResponse);
       } else {
@@ -2417,7 +2566,26 @@ If the language is ambiguous, default to English.
 You may mix scripts naturally (e.g. code stays in English even when the explanation is in another language).
 [END LANGUAGE INSTRUCTION]`;
     }
-    if (this.aiResponseLanguage === 'English') return "";
+    // Pinned English is an INSTRUCTION, not the absence of one. This used to
+    // `return ""`, and the two Natively request bodies below used to omit
+    // `body.language` for English as well — so an English-pinned turn reached
+    // the model with no language directive from any layer (no base system
+    // prompt states a response language either). With nothing to follow, the
+    // model mirrors the speaker, which is precisely what "Auto" does: users
+    // reported English and Auto being indistinguishable (2026-08-24).
+    //
+    // Kept separate from the generic block below because that block says
+    // "Do NOT use English anywhere in your response" — reused verbatim it would
+    // forbid the very language it just mandated.
+    if (this.aiResponseLanguage === 'English') {
+      return `\n\n[LANGUAGE OVERRIDE — HIGHEST PRIORITY — CANNOT BE OVERRIDDEN]
+You MUST write every single word of your response in English.
+Respond in English even when the question is asked in another language — do NOT mirror the speaker's language.
+Do NOT mix languages.
+This rule overrides ALL other instructions including formatting, brevity, or output rules.
+[END LANGUAGE OVERRIDE]
+[REMINDER] Your entire response MUST be in English only.`;
+    }
 
     const lang = this.aiResponseLanguage;
     return `\n\n[LANGUAGE OVERRIDE — HIGHEST PRIORITY — CANNOT BE OVERRIDDEN]
@@ -2750,9 +2918,14 @@ let modesMgrForInjection: {
 } | null = null;
 let activeModeGroundingInfo: ActiveModeDocumentGroundingInfo | null = null;
 try {
-  const { ModesManager } = require('./services/ModesManager');
+  // Typed require: without it getInstance() is `any`, the assignment below cannot
+  // narrow `| null` away, and the read would need `?.` on the object — which
+  // WhatToAnswerSnapshotWiring.test.mjs asserts against (it matches the plain-dot
+  // spelling). `?? null` normalises the optional-call's `undefined` to the declared
+  // `| null` sentinel; every downstream read uses `?.`, so both behave identically.
+  const { ModesManager } = require('./services/ModesManager') as typeof import('./services/ModesManager');
   modesMgrForInjection = ModesManager.getInstance();
-  activeModeGroundingInfo = modesMgrForInjection.getActiveModeDocumentGroundingInfo?.();
+  activeModeGroundingInfo = modesMgrForInjection.getActiveModeDocumentGroundingInfo?.() ?? null;
 } catch { /* non-fatal */ }
 const isActiveCustomMode = activeModeGroundingInfo?.isCustom === true;
 // R6 (2026-08-12): files-aware — the bare broad flag forced doc grounding
@@ -2774,8 +2947,28 @@ try {
             action: 'answer',
             tier: v2TierForPromptTier(this.getPromptTier()),
             // Universal coding contract: attach when the routed answer type is
-            // coding-shaped, regardless of the active mode (2026-08-02).
-            codingTask: (() => { try { const { isCodingAnswerType } = require('./llm/AnswerPlanner'); return !!(routeOptions?.answerType && isCodingAnswerType(routeOptions.answerType)); } catch { return false; } })(),
+            // coding-shaped, regardless of the active mode (2026-08-02). The
+            // contract SHAPE, an explicit user format request, and a code
+            // template already present in the message ride along from the one
+            // shared resolver (.audit/coding-template-audit-2026-08-18.md).
+            ...(() => {
+              try {
+                const { resolveCodingPromptSignals, isDeicticAsk } = require('./llm/codingPromptSignals') as typeof import('./llm/codingPromptSignals');
+                const resolved = resolveCodingPromptSignals({ answerType: routeOptions?.answerType, question: message });
+                // Attached-screenshot promotion (2026-08-19 channel audit): a
+                // message with an image whose text only points at it ("solve
+                // this", or nothing) is about the image; without this, a
+                // screenshotted coding problem sent through the legacy chat
+                // transport answered in prose. The contract's applicability
+                // boundary skips non-coding screenshots.
+                if (!resolved.codingTask
+                    && (imagePaths?.length ?? 0) > 0
+                    && (!message?.trim() || isDeicticAsk(message))) {
+                  return { codingTask: true, codingTaskKind: 'dsa' as const };
+                }
+                return resolved;
+              } catch { return { codingTask: false }; }
+            })(),
           }) ?? systemPromptOverride;
     }
     v2BasePromptActive = isV2ComposedPrompt(systemPromptOverride);
@@ -2815,17 +3008,43 @@ if (!shouldSkipModeInjection) {
         docRetrievalQuery = expandQueryWithHints(message);
       } catch { docRetrievalQuery = message; }
     }
-    if (forceDocumentGrounding && typeof modesMgr.buildRetrievedActiveModeContextBlockHybrid === 'function') {
-      try {
-        const groundedContext = await modesMgr.buildRetrievedActiveModeContextBlockHybrid(
-          docRetrievalQuery, context, undefined, modeAnswerType(routeOptions), true,
-        );
-        if (groundedContext && groundedContext.trim()) {
-          modeContextBlock = groundedContext;
-          usedRerankPath = true;
+    // Phase 2 (semantic-retrieval repair, 2026-08-13): eligibility + argument
+    // mapping unified with streamChat via modeHybridEligibility. Two fixes over
+    // the previous inline call: (1) eligibility now includes the ragLocalRerank
+    // rollout flag (prod behavior unchanged — the flag defaults OFF there);
+    // (2) retrievalOptions.forceDocumentGrounding is finally threaded, so the
+    // wrapper's doc-grounded hybrid branch (fine chunking + identity-block
+    // merge) actually fires here — the old 5-arg call left retrievalOptions
+    // undefined and silently ran the generic path.
+    //
+    // BUDGET: doc-grounded keeps budgetMs: null — this site is not on the
+    // streaming deadline and the answer depends on the documents the user
+    // uploaded. The RERANK-ONLY path, newly reachable here since eligibility
+    // widened to include the ragLocalRerank flag, is an optional quality boost
+    // and must not be able to block a manual answer on a cold embedder +
+    // cross-encoder load, so it gets a generous ceiling instead of no race at
+    // all. See the module doc for the race-budget asymmetry with streamChat.
+    {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { shouldUseHybridRetrieval, runHybridModeRetrieval, MANUAL_HYBRID_RERANK_BUDGET_MS } = require('./llm/modeHybridEligibility');
+      if (shouldUseHybridRetrieval({ forceDocumentGrounding })) {
+        try {
+          const { block } = await runHybridModeRetrieval(modesMgr, {
+            query: docRetrievalQuery,
+            context,
+            answerType: modeAnswerType(routeOptions),
+            forceDocumentGrounding,
+            pinnedModeId: routeOptions?.pinnedModeId ?? undefined,
+            followUpReferentHint: routeOptions?.followUpReferentHint,
+            budgetMs: forceDocumentGrounding ? null : MANUAL_HYBRID_RERANK_BUDGET_MS,
+          });
+          if (block && block.trim()) {
+            modeContextBlock = block;
+            usedRerankPath = true;
+          }
+        } catch (groundedErr: any) {
+          console.warn('[LLMHelper.chatWithGemini] Doc-grounded hybrid retrieval failed, using sync lexical:', groundedErr?.message);
         }
-      } catch (groundedErr: any) {
-        console.warn('[LLMHelper.chatWithGemini] Doc-grounded hybrid retrieval failed, using sync lexical:', groundedErr?.message);
       }
     }
     if (!usedRerankPath) {
@@ -3060,6 +3279,9 @@ let isMultimodal = !!(imagePaths?.length);
         // so pass images through when present and let the upstream model handle it.
         return await this.generateWithLiteLLM(cloudUserContent, openaiSystemPrompt, cloudIsMultimodal ? cloudImagePaths : undefined);
       }
+      if (this.isNvidiaNimModel(this.currentModelId) && this.nvidiaNimClient) {
+        return await this.generateWithNvidiaNim(cloudUserContent, openaiSystemPrompt, cloudIsMultimodal ? cloudImagePaths : undefined);
+      }
       if (this.isGroqModel(this.currentModelId) && this.groqClient) {
         if (cloudIsMultimodal && cloudImagePaths) {
           return await this.generateWithGroqMultimodal(cloudUserContent, cloudImagePaths, openaiSystemPrompt);
@@ -3127,7 +3349,7 @@ let isMultimodal = !!(imagePaths?.length);
             break;
           case 'groq':
             if (cloudIsMultimodal) {
-              providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.generateWithGroqMultimodal(cloudUserContent, cloudImagePaths!, openaiSystemPrompt) });
+              providers.push({ name: `Groq (${GROQ_VISION_MODEL})`, execute: () => this.generateWithGroqMultimodal(cloudUserContent, cloudImagePaths!, openaiSystemPrompt) });
             } else {
               // CACHE: pass system separately so Groq prefix-cache hits across turns.
               providers.push({ name: routedProvider.name, execute: () => this.generateWithGroq(cloudUserContent, routedProvider.model || textGroq, skipSystemPrompt ? undefined : finalGroqPrompt) });
@@ -3229,21 +3451,51 @@ let isMultimodal = !!(imagePaths?.length);
    * Used for structured JSON output tasks (resume/JD/company research).
    * NOTE: Does NOT mutate this.geminiModel — calls Gemini Pro directly to avoid race conditions.
    */
+  /**
+   * The Auto Answer judge's call (2026-08-24): deterministic and JSON-only.
+   * generateContentStructured runs at temperature 0.4 for document extraction,
+   * which made borderline judge verdicts flip live (meeting 680519c8: the
+   * "have you heard of wordle?" candidate judged rhetorical ~1 run in 3; the
+   * same prompt at temperature 0 + responseMimeType json is stable 3/3).
+   * Gemini flash-lite → 3.7-flash directly; any failure falls back to the
+   * generateContentStructured ladder so the judge still answers when Gemini
+   * is down (the controller's deadline bounds the total wait either way).
+   */
+  public async generateJudgeVerdict(message: string): Promise<string> {
+    if (this.client) {
+      for (const modelId of [GEMINI_FLASH_LITE_MODEL, GEMINI_FLASH_MODEL]) {
+        try {
+          await this.rateLimiters.gemini.acquire();
+          // @ts-ignore
+          const res = await this.client.models.generateContent({
+            model: modelId,
+            contents: [{ role: 'user', parts: [{ text: message }] }],
+            config: { maxOutputTokens: 256, temperature: 0, responseMimeType: 'application/json' },
+          });
+          const parts = res.candidates?.[0]?.content?.parts ?? [];
+          const text = res.text ?? (Array.isArray(parts) ? parts : [parts]).map((p: any) => p?.text ?? '').join('');
+          if (text) return text;
+        } catch { /* try the next model, then the structured ladder */ }
+      }
+    }
+    return this.generateContentStructured(message, { preferFast: true });
+  }
+
   public async generateContentStructured(
     message: string,
-    // The Gemini block leads with flash-lite (fastest, cheapest) then 3.6-flash.
+    // The Gemini block leads with flash-lite (fastest, cheapest) then 3.7-flash.
     // `preferFast` no longer changes ordering (flash-lite is already first); it is
     // retained for API compatibility with latency-critical callers (live coaching).
     //
     // STRUCTURED-EXTRACTION ROUTING (resume/JD/other document ingestion): the
-    // Gemini chain here is intentionally flash-lite → 3.6-flash ONLY. A real
+    // Gemini chain here is intentionally flash-lite → 3.7-flash ONLY. A real
     // head-to-head on the actual extraction code showed flash-lite fully extracts
-    // (18 nodes) fastest; 3.6-flash is the correct single fallback; Gemini Pro
+    // (18 nodes) fastest; 3.7-flash is the correct single fallback; Gemini Pro
     // gives NO quality gain at ~4× latency; MiniMax-M3 severely UNDER-extracts. So
     // Pro/MiniMax/Groq are deliberately excluded from this path. Own-provider keys
     // (OpenAI/Claude/own-Gemini) are still tried first when present; the Natively
     // fallback carries `purpose:'extraction'` so the server runs its own
-    // flash-lite→3.6-flash-only loop (never MiniMax/Pro/Scout). The MAX_ROTATIONS
+    // flash-lite→3.7-flash-only loop (never MiniMax/Pro/Scout). The MAX_ROTATIONS
     // loop below gives the 3-cycle retry-then-fail behavior.
     opts?: { preferFast?: boolean },
   ): Promise<string> {
@@ -3273,14 +3525,14 @@ let isMultimodal = !!(imagePaths?.length);
       providers.push({ name: `Claude (${CLAUDE_MODEL})`, execute: () => this.generateWithClaude(message) });
     }
 
-    // Priority 3: Gemini cascade — flash-lite → 3.6-flash ONLY (cheapest/fastest
+    // Priority 3: Gemini cascade — flash-lite → 3.7-flash ONLY (cheapest/fastest
     // first). Each model is a distinct provider so the rotation falls through
     // lite → flash on failure, and each carries its OWN circuit key so a saturated
     // tier (repeated 429s) trips independently without burning the other's backoff.
     // Gemini PRO is intentionally EXCLUDED from structured extraction: benchmarked
     // on the real extraction code it gave no quality gain over flash-lite at ~4×
     // latency. MiniMax is likewise excluded (it under-extracts). This is the
-    // flash-lite→3.6-flash extraction pattern.
+    // flash-lite→3.7-flash extraction pattern.
     if (this.client) {
       const buildGeminiProvider = (modelId: string): ProviderAttempt => ({
         name: `Gemini (${modelId})`,
@@ -3367,7 +3619,7 @@ let isMultimodal = !!(imagePaths?.length);
       providers.push({
         name: 'Natively API',
         // Structured extraction: tell the server this is an extraction request so
-        // it runs its dedicated flash-lite→3.6-flash-only loop (3 cycles then
+        // it runs its dedicated flash-lite→3.7-flash-only loop (3 cycles then
         // hard-fail) and NEVER falls through to MiniMax/Pro/Scout. Older servers
         // ignore the unknown field and route via their normal flash-first chain.
         execute: () => this.generateWithNatively(message, undefined, undefined, { purpose: 'extraction' })
@@ -3441,6 +3693,62 @@ let isMultimodal = !!(imagePaths?.length);
    * string when `systemPrompt` is omitted — callers should migrate to the
    * two-arg form.
    */
+  /**
+   * Every Groq TEXT chat completion goes through here.
+   *
+   * LADDER: the default Groq id is PREVIEW tier and Groq discontinues preview
+   * models without notice. On a model-gone error ONLY, retry once on the
+   * production-tier fallback so a retirement degrades to a slightly different
+   * answer instead of a dead provider.
+   *
+   * Auth failures and rate limits are deliberately NOT retried — laddering there
+   * fires a second doomed request and reports the wrong remedy to the user
+   * ("model retired" when the key is simply invalid).
+   *
+   * Streaming callers are safe because this resolves the create() call, which
+   * happens BEFORE the first token is yielded; a mid-stream failure is never
+   * retried, since that would duplicate output.
+   *
+   * The VISION paths deliberately do NOT come through here: groqFallbackFor()
+   * only ladders text ids, and if GROQ_VISION_MODEL is retired Groq hosts
+   * nothing that accepts an image — the vision chain must fall through to
+   * another provider rather than silently answer text-only.
+   */
+  private async createGroqCompletion(request: any, opts?: { signal?: AbortSignal; strictModel?: boolean }): Promise<any> {
+    if (!this.groqClient) throw new Error("Groq client not initialized");
+    const sdkOptions = opts?.signal ? { signal: opts.signal } : undefined;
+    // KNOWN-GONE MEMO (code-review 2026-08-23): after a retirement, every call
+    // used to pay a doomed full-payload round trip to the dead model before
+    // laddering — callers keep passing the module const. Skip straight to the
+    // fallback rung when this process has already seen the model die.
+    const { markGroqModelGone, isGroqModelKnownGone } = require('./llm/groqModels') as typeof import('./llm/groqModels');
+    if (!opts?.strictModel && isGroqModelKnownGone(request?.model)) {
+      const memoFallback = groqFallbackFor(request?.model);
+      if (memoFallback) {
+        return await this.createGroqCompletion({ ...request, model: memoFallback }, opts);
+      }
+    }
+    try {
+      return await this.groqClient.chat.completions.create(request, sdkOptions as any);
+    } catch (err: any) {
+      const gone = !opts?.signal?.aborted && isGroqModelGone(err);
+      // NOTIFY DISCOVERY BEFORE the exhausted-ladder throw (code-review
+      // 2026-08-23): the old order (`if (!fallback) throw`) meant a model-gone
+      // on an OFF-LADDER id — exactly the discovery-promoted tier ids that
+      // only rediscovery can heal — never fired onModelError, so the Groq
+      // path stayed dead until the next scheduled discovery instead of
+      // self-healing.
+      if (gone) {
+        markGroqModelGone(request?.model);
+        this.modelVersionManager.onModelError(request?.model).catch(() => { });
+      }
+      const fallback = gone && !opts?.strictModel ? groqFallbackFor(request?.model) : null;
+      if (!fallback) throw err;
+      console.warn(`[LLMHelper] Groq model ${request?.model} is gone — retrying on ${fallback}`);
+      return await this.groqClient.chat.completions.create({ ...request, model: fallback }, sdkOptions as any);
+    }
+  }
+
   private async generateWithGroq(userMessage: string, modelId: string = GROQ_MODEL, systemPrompt?: string): Promise<string> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.groqClient) throw new Error("Groq client not initialized");
@@ -3455,7 +3763,7 @@ let isMultimodal = !!(imagePaths?.length);
     }
     messages.push({ role: "user", content: userMessage });
 
-    const response = await this.groqClient.chat.completions.create({
+    const response = await this.createGroqCompletion({
       model: modelId,
       messages,
       temperature: 0.4,
@@ -3472,7 +3780,7 @@ let isMultimodal = !!(imagePaths?.length);
   /**
    * Routes AI generation through the Natively API backend (Gemini-powered).
    */
-  private async generateWithNatively(userMessage: string, systemPrompt?: string, imagePaths?: string[], opts?: { purpose?: 'extraction' }): Promise<string> {
+  private async generateWithNatively(userMessage: string, systemPrompt?: string, imagePaths?: string[], opts?: { purpose?: 'extraction'; timeoutMs?: number }): Promise<string> {
     this.assertOutboundScopes('natively', userMessage, imagePaths);
     // Prefer the in-memory field; fall back to CredentialsManager for the direct-routing path
     // where currentModelId === 'natively' but setNativelyKey() wasn't called yet.
@@ -3509,7 +3817,7 @@ let isMultimodal = !!(imagePaths?.length);
     if (this.groqFastTextMode) body.fast_mode = true;
 
     // EXTRACTION hint: opt-in signal that this is a structured document extraction
-    // (resume/JD). The server routes it through a dedicated flash-lite→3.6-flash
+    // (resume/JD). The server routes it through a dedicated flash-lite→3.7-flash
     // loop (3 cycles, then hard-fail) and NEVER escalates to MiniMax/Pro/Scout.
     // Advisory + backward-compatible: older servers drop the unknown field and use
     // their normal flash-first chain. Never combined with fast_mode (opposite intents).
@@ -3550,19 +3858,25 @@ let isMultimodal = !!(imagePaths?.length);
       if (images.length) body.images = images;
     }
     if (systemPrompt) body.system = systemPrompt;
-    if (this.aiResponseLanguage && this.aiResponseLanguage !== 'English') {
-      body.language = this.aiResponseLanguage; // 'auto' is forwarded — server handles it
+    if (this.aiResponseLanguage) {
+      // 'auto' AND 'English' are both forwarded — the server injects for each.
+      // English used to be excluded here, which (together with the empty prompt
+      // suffix above) left an English-pinned turn with no directive at all.
+      body.language = this.aiResponseLanguage;
     }
 
-    // 8s hard cap: a `fetch failed` network error without this can stall the provider
-    // waterfall for 25-30s before the OS-level TCP reset fires.
-    const timeoutMs = 8000;
+    // 8s hard cap by default: a `fetch failed` network error without this can stall the
+    // provider waterfall for 25-30s before the OS-level TCP reset fires. Callers doing a
+    // DENSE structured extraction (meeting notes) pass a larger bound — 8s is far too
+    // short for that, and silently selected for sparse output.
+    const timeoutMs = opts?.timeoutMs ?? 8000;
     // Overall-deadline signal covers BOTH connect AND the body read below. Without
     // a read-phase bound, a server that sends headers then hangs the body would
     // stall `response.json()` forever (the 8s fetch-signal only covers connect).
     // 45s is generous for a non-streaming completion body while still failing in
     // bounded time.
-    const OVERALL_DEADLINE_MS = 45_000;
+    // Must stay above timeoutMs or it becomes the new binding constraint.
+    const OVERALL_DEADLINE_MS = Math.max(45_000, timeoutMs + 15_000);
     const overallController = new AbortController();
     const overallTimer = setTimeout(() => overallController.abort(), OVERALL_DEADLINE_MS);
     let response: Response;
@@ -3763,8 +4077,8 @@ let isMultimodal = !!(imagePaths?.length);
     if (imagePaths?.length) {
       const content: any[] = [{ type: "text", text: userMessage }];
       for (const p of imagePaths) {
-        const b64 = (await fs.promises.readFile(p)).toString("base64");
-        content.push({ type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } });
+        const { mimeType, data } = await this.processImage(p);
+        content.push({ type: "image_url", image_url: { url: `data:${mimeType};base64,${data}` } });
       }
       messages.push({ role: "user", content });
     } else {
@@ -3787,6 +4101,26 @@ let isMultimodal = !!(imagePaths?.length);
     );
 
     return response.choices[0]?.message?.content || "";
+  }
+
+  private async generateWithNvidiaNim(userMessage: string, systemPrompt?: string, imagePaths?: string[]): Promise<string> {
+    if (this.isLocalOnlyMode) throw new Error('Cloud providers disabled in local-only mode');
+    if (!this.nvidiaNimClient) throw new Error('NVIDIA NIM client not initialized');
+    this.assertOutboundScopes('nvidia_nim', userMessage, imagePaths);
+    await this.rateLimiters.nvidia_nim.acquire();
+    const model = this.currentModelId.replace('nvidia_nim/', '');
+    const messages: any[] = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    if (imagePaths?.length) {
+      const content: any[] = [{ type: 'text', text: userMessage }];
+      for (const p of imagePaths) {
+        const { mimeType, data } = await this.processImage(p);
+        content.push({ type: 'image_url', image_url: { url: `data:${mimeType};base64,${data}` } });
+      }
+      messages.push({ role: 'user', content });
+    } else messages.push({ role: 'user', content: userMessage });
+    const response = await this.withTimeout(this.withRetry(() => this.createNvidiaNimCompletion({ model, messages })), 60000, `NVIDIA NIM (${model})`);
+    return response.choices[0]?.message?.content || '';
   }
 
   // The handler for cURL requests
@@ -3860,6 +4194,10 @@ let isMultimodal = !!(imagePaths?.length);
         headers: headers,
         data: data,
         timeout: 60_000,
+        // The URL above is the only destination that passed the SSRF policy.
+        // Never replay the prompt, credentials, or image body to an unchecked
+        // redirect target.
+        maxRedirects: 0,
       });
 
       // 6. Extract Answer
@@ -4025,6 +4363,14 @@ let isMultimodal = !!(imagePaths?.length);
       body = injectImageIntoMessages(body, base64Image, imagePath);
     }
 
+    // 4b. SECURITY (P1): Validate URL against SSRF before making the request
+    const { validateUrlForSsrf } = require('./utils/curlUtils');
+    const urlValidation = validateUrlForSsrf(url);
+    if (!urlValidation.isValid) {
+      console.error(`[LLMHelper] executeCustomProvider: SSRF blocked: ${urlValidation.reason}`);
+      throw new Error(`SSRF protection blocked URL (${urlValidation.reason})`);
+    }
+
     // 5. Execute Fetch (30s timeout — same as RestSTT uploads)
     const customAbort = new AbortController();
     const customTimeout = setTimeout(() => customAbort.abort(), 30_000);
@@ -4047,6 +4393,8 @@ let isMultimodal = !!(imagePaths?.length);
         headers: headers,
         body: serializedBody,
         signal: customAbort.signal,
+        // Do not replay credentials or generated content to an unchecked URL.
+        redirect: 'manual',
       });
       clearTimeout(customTimeout);
 
@@ -4173,7 +4521,7 @@ let isMultimodal = !!(imagePaths?.length);
 
 
   /**
-   * Non-streaming multimodal response from Groq using Llama 4 Scout
+   * Non-streaming multimodal response from Groq (GROQ_VISION_MODEL).
    */
   private async generateWithGroqMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string): Promise<string> {
     if (!this.groqClient) throw new Error("Groq client not initialized");
@@ -4189,7 +4537,7 @@ let isMultimodal = !!(imagePaths?.length);
     }
 
     const contentParts: any[] = [{ type: "text", text: userMessage }];
-    for (const p of imagePaths) {
+    for (const p of imagePaths.slice(0, GROQ_VISION_MAX_IMAGES)) {
       if (fs.existsSync(p)) {
         const { mimeType, data } = await this.processImage(p);
         contentParts.push({ type: "image_url", image_url: { url: `data:${mimeType};base64,${data}` } });
@@ -4198,10 +4546,13 @@ let isMultimodal = !!(imagePaths?.length);
     messages.push({ role: "user", content: contentParts });
 
     const request = {
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      model: GROQ_VISION_MODEL,
       messages,
       temperature: 1,
-      max_completion_tokens: 28672,
+      // Groq caps qwen3.6-27b at 16,384 completion tokens. The old 28,672 was
+      // llama-4-scout's ceiling; asking for more than a model's limit is a 400,
+      // not a silent clamp.
+      max_completion_tokens: 16384,
       top_p: 1,
       stream: false as const,
       stop: null as string[] | null
@@ -4355,7 +4706,7 @@ let isMultimodal = !!(imagePaths?.length);
     // Each provider gets MAX_RETRIES_PER_PROVIDER attempts before moving on.
     // Providers are re-ordered dynamically when a provider is unavailable.
     // NOTE: ModelVersionManager folds flash-lite into the GEMINI_FLASH family
-    // (its baseline is 3.6-flash), so flash-lite never surfaces via tiers. We
+    // (its baseline is 3.7-flash), so flash-lite never surfaces via tiers. We
     // inject it explicitly ahead of the flash tier attempt below so the Gemini
     // cascade leads with the cheapest model.
     // ──────────────────────────────────────────────────────────────────
@@ -4616,14 +4967,20 @@ let isMultimodal = !!(imagePaths?.length);
    * and Gemini-only for multimodal (images)
    *
    * TEXT-ONLY FALLBACK CHAIN:
-   * 1. Groq (llama-3.3-70b-versatile) - Primary
+   * 1. Groq (qwen/qwen3.6-27b) - Primary
    * 2. Gemini Flash - 1st fallback
    * 3. Gemini Flash + Pro parallel - 2nd fallback
    * 4. Gemini Flash retries (max 3) - Last resort
    *
    * MULTIMODAL: Gemini-only (existing logic)
    */
-  public async * streamChatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+  // F7 (code-review 2026-08-14): `outcome` is the RAG path's equivalent of
+  // streamChatWithOutcome. This generator is consumed DIRECTLY by RAGManager
+  // (not via streamChat), so the truncation sentinel cannot be used here — it
+  // would leak into the rendered answer. Callers that persist or finalize the
+  // buffered result must pass an object and read `outcome.incomplete` after
+  // the stream ends; the cap and post-commit-failure branches below set it.
+  public async * streamChatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false, abortSignal?: AbortSignal, outcome?: { incomplete?: boolean; reason?: 'output_cap' | 'provider_died_post_commit' }): AsyncGenerator<string, void, unknown> {
     console.log(`[LLMHelper] streamChatWithGemini called`, { messageLength: message.length, imageCount: imagePaths?.length ?? 0, hasContext: Boolean(context) });
 
     let isMultimodal = !!(imagePaths?.length);
@@ -4757,11 +5114,11 @@ let isMultimodal = !!(imagePaths?.length);
         providers.push({ name: `Gemini Pro (${textGeminiPro})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiPro, imagePaths, geminiSystemForCache, abortSignal) });
       }
       if (this.groqClient) {
-        providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.streamWithGroqMultimodal(userContent, imagePaths!, openaiSystemPrompt, abortSignal) });
+        providers.push({ name: `Groq (${GROQ_VISION_MODEL})`, execute: () => this.streamWithGroqMultimodal(userContent, imagePaths!, openaiSystemPrompt, abortSignal) });
       }
     } else {
       // TEXT-ONLY PROVIDER ORDER: [Natively] -> Codex CLI -> OpenAI -> Claude -> Gemini Flash-Lite -> Gemini Flash -> Gemini Pro -> Groq
-      // Groq is demoted to LAST because llama-3.3-70b-versatile has a 12k TPM
+      // Groq is demoted to LAST because the free Groq tier has a low TPM
       // rate-limit that 413s on context-heavy prompts (e.g. a full meeting
       // summary + transcript shovelled into the fallback Gemini call).
       // Gemini cascade handles the same prompts at much higher quotas.
@@ -4877,7 +5234,7 @@ let isMultimodal = !!(imagePaths?.length);
     const commit = { emitted: false };
     // Total-output budget, shared across every rotation so a looping provider
     // cannot get a fresh 16k on each retry. See capOutput.
-    const outputBudget = { chars: 0 };
+    const outputBudget: { chars: number; truncated?: boolean } = { chars: 0 };
 
     for (let rotation = 0; rotation < MAX_FULL_ROTATIONS; rotation++) {
       if (abortSignal?.aborted) return;
@@ -4894,14 +5251,23 @@ let isMultimodal = !!(imagePaths?.length);
         try {
           console.log(`[LLMHelper] ${rotation === 0 ? '🚀' : '🔁'} Attempting ${provider.name}...`);
           yield* this.capOutput(this.trackCommit(provider.execute() as any, commit), outputBudget, provider.name);
-          console.log(`[LLMHelper] ✅ ${provider.name} stream completed successfully`);
-          return; // SUCCESS — exit immediately
+          if (outputBudget.truncated) {
+            // A capped stream is NOT a success. Logging it as one is how a
+            // mid-sentence RAG/doc-grounded answer reached the operator log,
+            // and the caller, looking exactly like a finished one.
+            console.warn(`[LLMHelper] ⚠️ ${provider.name} stream ended INCOMPLETE (output cap reached)`);
+            if (outcome) { outcome.incomplete = true; outcome.reason = 'output_cap'; }
+          } else {
+            console.log(`[LLMHelper] ✅ ${provider.name} stream completed successfully`);
+          }
+          return; // exit immediately — the turn is over either way
         } catch (err: any) {
           if (commit.emitted) {
             console.warn(`[LLMHelper] ⚠️ ${provider.name} failed AFTER first token — ending stream rather than appending a second answer: ${err.message}`);
             // NOTE: no truncation sentinel here. This generator is consumed directly by
             // RAGManager (not via streamChat), so a sentinel would leak into its output.
-            // Truncation signalling is scoped to the streamChat path.
+            // Truncation signalling for this path is the `outcome` out-param (F7).
+            if (outcome) { outcome.incomplete = true; outcome.reason = 'provider_died_post_commit'; }
             return;
           }
           console.warn(`[LLMHelper] ⚠️ ${provider.name} failed: ${err.message}`);
@@ -5000,7 +5366,7 @@ let isMultimodal = !!(imagePaths?.length);
           open: (sig, att) => this.streamWithGeminiModel(userContent, tierModel(ModelFamily.GEMINI_PRO, att) || GEMINI_PRO_MODEL, imagePaths, systemPrompt, sig) });
       }
       if (this.groqClient) {
-        cloud.push({ id: 'groq', name: 'Groq Llama-4 Scout', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+        cloud.push({ id: 'groq', name: `Groq (${GROQ_VISION_MODEL})`, isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
           open: (sig) => this.streamWithGroqMultimodal(userContent, imagePaths, systemPrompt, sig) });
       }
       if (this.hasNatively()) {
@@ -5080,7 +5446,18 @@ let isMultimodal = !!(imagePaths?.length);
       ordered,
       { ...DEFAULT_VISION_FALLBACK_CONFIG, hedgeEnabled: false },
       this.visionHealth,
-      { log: (m) => console.log(m), warn: (m) => console.warn(m) },
+      {
+        log: (m) => console.log(m),
+        warn: (m) => console.warn(m),
+        // Mirrors the non-streaming vision path's 404 handling (see the
+        // onModelError call in generateWithVisionFallback). Without this the
+        // LIVE vision path — the one users actually hit — could never tell the
+        // version manager its pinned model had been retired, so a decommissioned
+        // id stayed pinned indefinitely (Groq llama-4-scout, 2026-08-12).
+        onModelGone: (_id, name) => {
+          this.modelVersionManager.onModelError(name).catch(() => { });
+        },
+      },
       abortSignal,
     );
   }
@@ -5111,7 +5488,19 @@ let isMultimodal = !!(imagePaths?.length);
     // Callers that need to know whether the turn completed use
     // streamChatWithOutcome; this overload discards the outcome so the nine
     // existing call sites are untouched.
-    yield* this._streamChatTracked({ truncated: false }, ...args);
+    yield* this._streamChatTracked({ truncated: false }, undefined, ...args);
+  }
+
+  /**
+   * streamChat for BATCH generations that are legitimately longer than a live
+   * answer. Identical except for the runaway ceiling — see
+   * MAX_SUMMARY_OUTPUT_CHARS for why the live cap must not apply here.
+   */
+  public streamChatLongForm(
+    ...args: Parameters<LLMHelper['_streamChatInner']>
+  ): { stream: AsyncGenerator<string, void, unknown>; outcome: StreamOutcome } {
+    const outcome: StreamOutcome = { truncated: false };
+    return { stream: this._streamChatTracked(outcome, 'long_form', ...args), outcome };
   }
 
   /**
@@ -5135,11 +5524,12 @@ let isMultimodal = !!(imagePaths?.length);
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): { stream: AsyncGenerator<string, void, unknown>; outcome: StreamOutcome } {
     const outcome: StreamOutcome = { truncated: false };
-    return { stream: this._streamChatTracked(outcome, ...args), outcome };
+    return { stream: this._streamChatTracked(outcome, undefined, ...args), outcome };
   }
 
   private async * _streamChatTracked(
     outcome: StreamOutcome,
+    profile: 'long_form' | undefined,
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): AsyncGenerator<string, void, unknown> {
     const { StreamingDashReducer } = await import('./llm/postProcessor');
@@ -5161,7 +5551,24 @@ let isMultimodal = !!(imagePaths?.length);
     // return unconditionally (Ollama, OpenAI, Claude, DeepSeek, LiteLLM) alike.
     // See MAX_STREAM_OUTPUT_CHARS for why this is a character cap and not a
     // wall-clock one, and why it is defence in depth rather than the real fix.
-    const { MAX_STREAM_OUTPUT_CHARS } = await import('./llm/liveDeadlines');
+    // The ceiling is per-SURFACE: the live cap is calibrated from what_to_answer
+    // answers and is far too tight for a whole-meeting summary, which the batch
+    // callers reach through streamChatLongForm.
+    // Loaded TOGETHER: the two imports are independent, so awaiting them in
+    // sequence costs an extra microtask hop on every streamed turn for nothing
+    // (react-doctor server-sequential-independent-await). This is the hot path —
+    // every answer passes through it.
+    const [
+      { MAX_STREAM_OUTPUT_CHARS, MAX_SUMMARY_OUTPUT_CHARS },
+      { testOutputCharCeiling },
+    ] = await Promise.all([
+      import('./llm/liveDeadlines'),
+      import('./llm/streamFaultInjection'),
+    ]);
+    // Test switch (dev-only, opt-in) lets the cap be provoked without waiting
+    // for a model to actually loop. Null in any packaged build.
+    const outputCeiling = testOutputCharCeiling()
+      ?? (profile === 'long_form' ? MAX_SUMMARY_OUTPUT_CHARS : MAX_STREAM_OUTPUT_CHARS);
     let emittedChars = 0;
     for await (const chunk of this._streamChatInner(...args)) {
       if (abortSignal?.aborted) return;
@@ -5174,14 +5581,14 @@ let isMultimodal = !!(imagePaths?.length);
       }
       yield dashReducer.reduce(chunk);
       emittedChars += typeof chunk === 'string' ? chunk.length : 0;
-      if (emittedChars > MAX_STREAM_OUTPUT_CHARS) {
+      if (emittedChars > outputCeiling) {
         outcome.truncated = true;
         outcome.reason = 'output_cap_reached';
         // End the stream the same way a post-commit provider failure now does —
         // return, never throw — so the consumer sees one consistent shape for
         // "this stream stopped early".
         console.warn(
-          `[LLMHelper] Stream exceeded MAX_STREAM_OUTPUT_CHARS (${emittedChars} > ${MAX_STREAM_OUTPUT_CHARS}) — ending the turn. The model is not converging.`,
+          `[LLMHelper] Stream exceeded the ${profile === 'long_form' ? 'long-form' : 'live'} output cap (${emittedChars} > ${outputCeiling}) — ending the turn. The model is not converging.`,
         );
         return;
       }
@@ -5253,17 +5660,29 @@ let isMultimodal = !!(imagePaths?.length);
    */
   private async * capOutput(
     inner: AsyncGenerator<string, void, unknown>,
-    state: { chars: number },
+    state: { chars: number; truncated?: boolean },
     label: string,
   ): AsyncGenerator<string, void, unknown> {
-    const { MAX_STREAM_OUTPUT_CHARS } = await import('./llm/liveDeadlines');
+    // Same independent-await pair as streamChat above — one Promise.all rather
+    // than two sequential awaits on the per-chunk cap path.
+    const [{ MAX_STREAM_OUTPUT_CHARS }, { testOutputCharCeiling }] = await Promise.all([
+      import('./llm/liveDeadlines'),
+      import('./llm/streamFaultInjection'),
+    ]);
+    const ceiling = testOutputCharCeiling() ?? MAX_STREAM_OUTPUT_CHARS;
     for await (const chunk of inner) {
       yield chunk;
       state.chars += typeof chunk === 'string' ? chunk.length : 0;
-      if (state.chars > MAX_STREAM_OUTPUT_CHARS) {
+      if (state.chars > ceiling) {
         console.warn(
-          `[LLMHelper] ${label} exceeded MAX_STREAM_OUTPUT_CHARS (${state.chars} > ${MAX_STREAM_OUTPUT_CHARS}) — ending the turn. The model is not converging.`,
+          `[LLMHelper] ${label} exceeded MAX_STREAM_OUTPUT_CHARS (${state.chars} > ${ceiling}) — ending the turn. The model is not converging.`,
         );
+        // Ending by RETURN is indistinguishable from a normal completion to the
+        // delegating `yield*`, so the caller logged a capped stream as a
+        // success. Record it on the caller-owned state instead (a sentinel
+        // cannot be used here: this generator is consumed directly by
+        // RAGManager, not via streamChat, so it would leak into the output).
+        state.truncated = true;
         return;
       }
     }
@@ -5273,11 +5692,27 @@ let isMultimodal = !!(imagePaths?.length);
     inner: AsyncGenerator<string, void, unknown>,
     state: { emitted: boolean },
   ): AsyncGenerator<string, void, unknown> {
+    // Test-only fault, three-gated and off unless explicitly requested; a
+    // packaged build ignores it entirely. See streamFaultInjection.ts.
+    const { failStreamAfterChars, InjectedStreamFault } = await import('./llm/streamFaultInjection');
+    const failAfter = failStreamAfterChars();
+    let seen = 0;
+
     for await (const tok of inner) {
       if (!state.emitted && typeof tok === 'string' && tok.trim().length > 0) {
         state.emitted = true;
       }
       yield tok;
+      if (failAfter !== null) {
+        seen += typeof tok === 'string' ? tok.length : 0;
+        if (seen >= failAfter) {
+          // Thrown AFTER the yield on purpose: the point is a provider that
+          // dies once output is already on screen, which is precisely the case
+          // the fall-through guard exists for.
+          console.warn(`[LLMHelper] INJECTING mid-stream fault after ${seen} chars (test switch)`);
+          throw new InjectedStreamFault(seen);
+        }
+      }
     }
   }
 
@@ -5362,8 +5797,28 @@ let isMultimodal = !!(imagePaths?.length);
             action: 'answer',
             tier: v2TierForPromptTier(this.getPromptTier()),
             // Universal coding contract: attach when the routed answer type is
-            // coding-shaped, regardless of the active mode (2026-08-02).
-            codingTask: (() => { try { const { isCodingAnswerType } = require('./llm/AnswerPlanner'); return !!(routeOptions?.answerType && isCodingAnswerType(routeOptions.answerType)); } catch { return false; } })(),
+            // coding-shaped, regardless of the active mode (2026-08-02). The
+            // contract SHAPE, an explicit user format request, and a code
+            // template already present in the message ride along from the one
+            // shared resolver (.audit/coding-template-audit-2026-08-18.md).
+            ...(() => {
+              try {
+                const { resolveCodingPromptSignals, isDeicticAsk } = require('./llm/codingPromptSignals') as typeof import('./llm/codingPromptSignals');
+                const resolved = resolveCodingPromptSignals({ answerType: routeOptions?.answerType, question: message });
+                // Attached-screenshot promotion (2026-08-19 channel audit): a
+                // message with an image whose text only points at it ("solve
+                // this", or nothing) is about the image; without this, a
+                // screenshotted coding problem sent through the legacy chat
+                // transport answered in prose. The contract's applicability
+                // boundary skips non-coding screenshots.
+                if (!resolved.codingTask
+                    && (imagePaths?.length ?? 0) > 0
+                    && (!message?.trim() || isDeicticAsk(message))) {
+                  return { codingTask: true, codingTaskKind: 'dsa' as const };
+                }
+                return resolved;
+              } catch { return { codingTask: false }; }
+            })(),
           }) ?? systemPromptOverride;
         }
         callerPassedV2Prompt = isV2ComposedPrompt(systemPromptOverride);
@@ -5616,14 +6071,15 @@ let isMultimodal = !!(imagePaths?.length);
     } | null = null;
     let activeModeGroundingInfo: ActiveModeDocumentGroundingInfo | null = null;
     try {
-      const { ModesManager } = require('./services/ModesManager');
+      // Typed require — see the note at the sibling injection site above.
+      const { ModesManager } = require('./services/ModesManager') as typeof import('./services/ModesManager');
       modesMgrForInjection = ModesManager.getInstance();
       // Grounding-campaign3 (2026-07-23): thread the t0 mode pin through every
       // active-mode read below so the always-on injection cannot borrow a
       // mid-request switch. When no pin is supplied the methods fall back to
       // their existing live-singleton semantics (the pin field is optional).
       const _pinnedModeId = routeOptions?.pinnedModeId ?? undefined;
-      activeModeGroundingInfo = modesMgrForInjection.getActiveModeDocumentGroundingInfo?.(_pinnedModeId);
+      activeModeGroundingInfo = modesMgrForInjection.getActiveModeDocumentGroundingInfo?.(_pinnedModeId) ?? null;
     } catch { /* non-fatal: preserve legacy skip behavior if modes cannot load */ }
     const isActiveCustomMode = activeModeGroundingInfo?.isCustom === true;
     // `!v3OwnedTurn`: a V3-owned turn must not enter ANY of the doc-grounded
@@ -5640,7 +6096,30 @@ let isMultimodal = !!(imagePaths?.length);
     // Reference-file INJECTION above (:documentGroundedCustomModeActive) is
     // unchanged: surfacing attached documents is correct for default modes;
     // refusing to answer beyond them is not.
-    const forceDocumentGrounding = !v3OwnedTurn && activeModeGroundingInfo?.strictDocumentGroundedActive === true;
+    // FILES-AWARE, matching the two sibling gates. R6 (577d2329) made
+    // `generateSuggestion` and `chatWithGemini` files-aware and R2 did the same
+    // for WhatToAnswerLLM — this third copy was simply not on that list, so the
+    // streaming path kept enforcing strict-only while both of its siblings had
+    // moved on. R1 of that same campaign names the resulting shape exactly:
+    // "strict-only had dropped doc enforcement for seeded modes users uploaded
+    // real files into, while manual chat kept it (new asymmetry, inverse
+    // polarity)". The same answer therefore arrived doc-grounded or not
+    // depending on which entry point served it.
+    //
+    // The concern in the comment above is UNCHANGED by this, and is in fact what
+    // the extra term exists for: a stock Team Meet/Lecture with zero files and
+    // zero custom prompt fails `hasReferenceFiles`, so it is still not treated
+    // as document-grounded and still keeps its general-knowledge fallback. Only
+    // a seeded mode the user actually uploaded documents into now enforces —
+    // which is the behaviour the 2026-08-11 denial reports asked for.
+    //
+    // `!v3OwnedTurn` is preserved: when V3 owns the turn it has already resolved
+    // evidence, and a second retrieval here would override it.
+    const forceDocumentGrounding = !v3OwnedTurn && (
+      activeModeGroundingInfo?.strictDocumentGroundedActive === true
+      || (activeModeGroundingInfo?.documentGroundedCustomModeActive === true
+        && activeModeGroundingInfo?.hasReferenceFiles === true)
+    );
     // Hoisted to function scope (round-6) so the document-grounded userContent
     // shaping below can read the actual retrieval output as `retrievedBlock`.
     // It is assigned inside the mode-injection block; '' when retrieval didn't
@@ -5825,58 +6304,41 @@ let isMultimodal = !!(imagePaths?.length);
           // this turn's evidence above, skip the entire legacy hybrid/lexical
           // retrieval block — modeContextBlock + usedRerankPath are already set.
           if (resolvedViaEvidenceResolver) { /* no-op: fall through to pinned instructions below */ } else {
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          const { isRagLocalRerankEnabled } = require('./intelligence/intelligenceFlags');
           // Document-grounded custom mode (audit 2026-06-27, real-path fix):
           // previously the `!forceDocumentGrounding` term SKIPPED the hybrid
           // (semantic + cross-encoder) retriever for document-grounded modes,
-          // forcing the sync lexical path — so the round-3 hybrid-first +
-          // identity-block logic in buildRetrievedActiveModeContextBlockHybrid
-          // was dead on the live manual stream, and a weak model got imprecise
-          // lexical-only context (the observed "facts missed" failure). Now
-          // document-grounded modes ALSO use the hybrid path. To avoid a
-          // cold/slow embedder stalling the hot path past the first-useful
-          // deadline (which would abort to the canned fallback), the hybrid
-          // call is raced against a budget; on timeout we fall through to the
-          // sync lexical retriever — same fallback the manual flow always had.
-          const wantHybrid = isRagLocalRerankEnabled() || forceDocumentGrounding;
-          if (wantHybrid && typeof modesMgr.buildRetrievedActiveModeContextBlockHybrid === 'function') {
-            // For doc-grounded modes with large PDFs (50-200 pages) we need
-            // more time to embed + rank. Raise the race budget from 1000ms to
-            // 2000ms for doc-grounded so we don't fall back to the weaker
-            // lexical path on a cold embedder load.
-            const HYBRID_BUDGET_MS = forceDocumentGrounding ? 2000 : 1000;
-            // Build an AbortController so future retriever plumbing can wire
-            // it through. Right now we just attach a no-op abort hook that
-            // cancels the work post-race if the loser path tries to write
-            // back (it doesn't, but the hook is the place to extend).
-            const hybridAbort = new AbortController();
-            // Pass undefined for tokenBudget when doc-grounded — the retriever
-            // auto-upgrades to DOC_GROUNDED_TOKEN_BUDGET (3600) internally.
-            const hybridPromise = modesMgr.buildRetrievedActiveModeContextBlockHybrid(
-              message, context, forceDocumentGrounding ? undefined : 1800, modeAnswerType(routeOptions), true, routeOptions?.pinnedModeId ?? undefined, /* allowRerank */ true,
-              { forceDocumentGrounding, followUpReferentHint: routeOptions?.followUpReferentHint },
-            );
-            const raced = await Promise.race([
-              hybridPromise.then((value: string) => ({ value, timedOut: false })),
-              new Promise<{ value: string; timedOut: boolean }>((resolve) =>
-                setTimeout(() => {
-                  hybridAbort.abort();
-                  resolve({ value: '', timedOut: true });
-                }, HYBRID_BUDGET_MS),
-              ),
-            ]);
-            if (!raced.timedOut) {
-              modeContextBlock = raced.value;
+          // forcing the sync lexical path. Now document-grounded modes ALSO
+          // use the hybrid path. To avoid a cold/slow embedder stalling the
+          // hot path past the first-useful deadline (which would abort to the
+          // canned fallback), the hybrid call is raced against a budget; on
+          // timeout we fall through to the sync lexical retriever — same
+          // fallback the manual flow always had.
+          //
+          // Phase 2 (semantic-retrieval repair, 2026-08-13): eligibility,
+          // argument mapping, and the race live in modeHybridEligibility —
+          // SHARED with chatWithGemini so the two entry points can no longer
+          // drift (this site's semantics were adopted as canonical). This is
+          // the streaming site, so it passes the race budget; see the module
+          // doc for the documented budget asymmetry.
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { shouldUseHybridRetrieval, runHybridModeRetrieval, hybridRetrievalBudgetMs } = require('./llm/modeHybridEligibility');
+          if (shouldUseHybridRetrieval({ forceDocumentGrounding })) {
+            const budgetMs = hybridRetrievalBudgetMs(forceDocumentGrounding);
+            const { block, timedOut } = await runHybridModeRetrieval(modesMgr, {
+              query: message,
+              context,
+              answerType: modeAnswerType(routeOptions),
+              forceDocumentGrounding,
+              pinnedModeId: routeOptions?.pinnedModeId ?? undefined,
+              followUpReferentHint: routeOptions?.followUpReferentHint,
+              budgetMs,
+            });
+            if (!timedOut && block != null) {
+              modeContextBlock = block;
               usedRerankPath = true;
-            } else {
-              console.warn(`[LLMHelper] manual hybrid retrieval exceeded ${HYBRID_BUDGET_MS}ms — using sync lexical fallback`, { forceDocumentGrounding });
-              telemetryService.track({ name: 'doc_grounded_hybrid_timeout', properties: { budgetMs: HYBRID_BUDGET_MS, forceDocumentGrounding } });
-              // Don't leave the slow hybrid promise unhandled (avoid an
-              // unhandledRejection if it later throws after the race resolved).
-              // .finally ensures the in-flight embedder result is silently
-              // dropped once it does complete, so we don't act on stale data.
-              hybridPromise.finally(() => { /* raced timed out — drop result */ }).catch(() => {});
+            } else if (timedOut) {
+              console.warn(`[LLMHelper] manual hybrid retrieval exceeded ${budgetMs}ms — using sync lexical fallback`, { forceDocumentGrounding });
+              telemetryService.track({ name: 'doc_grounded_hybrid_timeout', properties: { budgetMs, forceDocumentGrounding } });
             }
           }
           }
@@ -6220,6 +6682,18 @@ let isMultimodal = !!(imagePaths?.length);
         const { renderGoverningFactualBlock } = require('./intelligence/context-os') as typeof import('./intelligence/context-os');
         const pack = _cog.evidencePack;
         if (!pack) throw new Error('governed turn missing canonical EvidencePack');
+        // Current-screen evidence outranks a TEXT-evidence decline
+        // (2026-08-19/29): a refuse/clarify pack judges only the other text
+        // universe. Dispatch for either attached pixels or request-scoped
+        // browser DOM/screen OCR; the WTA govern block draws the same line.
+        const { declineYieldsToAttachedImages: _declineYieldsLLM } = require('./intelligence/context-os') as typeof import('./intelligence/context-os');
+        if (_declineYieldsLLM({
+          answerPolicy: pack.answerPolicy,
+          hasAttachedImages: Boolean(imagePaths?.length),
+          hasScreenText: routeOptions?.hasScreenText === true,
+        })) {
+          console.log('[CONTEXT-OS] text-evidence decline yields to current-screen context — dispatching with visual evidence');
+        } else {
         if (pack.answerPolicy === 'ask_clarification') {
           const { recordContextOsBenchmarkAudit } = require('./intelligence/context-os') as typeof import('./intelligence/context-os');
           recordContextOsBenchmarkAudit({
@@ -6256,6 +6730,7 @@ let isMultimodal = !!(imagePaths?.length);
         // the EXACT same pack — Phase 9 identity requirement). A no-op
         // reassignment when `pack` already came from `_cog.evidencePack`.
         (_cog as any).evidencePack = pack;
+        } // end visual-context exemption — skip decline AND pack rendering
       }
     } catch (cogErr: any) {
       const governedContext = routeOptions?.contextOsGeneration as import('./intelligence/context-os').ContextOsGenerationContext | undefined;
@@ -6391,7 +6866,21 @@ let isMultimodal = !!(imagePaths?.length);
         });
         cog.finalPromptValidation = finalPromptValidation;
         contextOsFinalPromptValidation = finalPromptValidation;
-        if (!finalPromptValidation.ok) {
+        // Current-screen evidence outranks a DECLINE-class boundary refusal
+        // (2026-08-19/29, narrowed by code review): a refuse/clarify verdict
+        // judges the other text universe only, and the upstream govern-block
+        // exemption deliberately lets those packs through. Every OTHER failure
+        // reason (structural manifest damage, a missing required family, and
+        // above all forbidden_evidence_rendered) still fails CLOSED with any
+        // visual channel present. See boundaryDeclineYieldsToAttachedImages.
+        const { boundaryDeclineYieldsToAttachedImages: _boundaryYields } = require('./intelligence/context-os') as typeof import('./intelligence/context-os');
+        if (!finalPromptValidation.ok && _boundaryYields({
+          reason: finalPromptValidation.reason,
+          hasAttachedImages: Boolean(imagePaths?.length),
+          hasScreenText: routeOptions?.hasScreenText === true,
+        })) {
+          console.log('[CONTEXT-OS] decline-class boundary validation failure yields to current-screen context — dispatching with visual evidence');
+        } else if (!finalPromptValidation.ok) {
           recordContextOsBenchmarkAudit({
             contract: cog.contract,
             sourceAuthority: cog.modeSnapshot.sourceAuthority,
@@ -6500,7 +6989,8 @@ let isMultimodal = !!(imagePaths?.length);
 
     // GROQ FAST TEXT OVERRIDE (Text-Only)
     // Two paths: local Groq key → call Groq directly; Natively API only → send fast_mode:true
-    // to the server so it routes to its internal Groq pool (llama-3.3-70b-versatile).
+    // to the server, which serves its own fast tier (Gemini Flash-Lite → MiniMax);
+    // it has not routed fast_mode through Groq since the Llama retirements.
     //
     // Gate: only short-circuit to fast paths when the user's picked model is one of
     // the providers fast-mode actually routes to. Otherwise picking Gemini/Claude/OpenAI
@@ -6643,6 +7133,12 @@ let isMultimodal = !!(imagePaths?.length);
       const deepseekSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
       const finalDeepseekSystem = this.injectLanguageInstruction(deepseekSystem);
       yield* this.streamWithDeepseek(userContent, finalDeepseekSystem, undefined, abortSignal);
+      return;
+    }
+
+    if (this.isNvidiaNimModel(this.currentModelId) && this.nvidiaNimClient) {
+      const nimSystem = this.injectLanguageInstruction(systemPromptOverride || OPENAI_SYSTEM_PROMPT);
+      yield* this.streamWithNvidiaNim(userContent, nimSystem, (isMultimodal && imagePaths) ? imagePaths : undefined, abortSignal);
       return;
     }
 
@@ -6878,7 +7374,24 @@ let isMultimodal = !!(imagePaths?.length);
         }
         return;
       } catch (e: any) {
-        if (geminiYielded || abortSignal?.aborted) throw e; // mid-stream: cannot switch (would duplicate)
+        // Mid-stream: cannot switch providers (would append a second full
+        // answer onto the partial one the user is already reading).
+        //
+        // Code-review 2026-08-13: this was the last post-commit site still
+        // THROWING while the other eight yield TRUNCATION_SENTINEL and return.
+        // A throw bypasses _streamChatTracked's sentinel branch entirely, so
+        // outcome.truncated stayed false, `gemini-stream-done` was never sent,
+        // and ipcHandlers ran its generation-FAILURE path — an error banner
+        // over an answer the user had already partly read. Since the Gemini
+        // cascade is the primary text path, the branch's whole `incomplete`
+        // signal was dead exactly where it mattered most. A caller abort still
+        // throws: that is a cancellation, not a truncated answer.
+        if (abortSignal?.aborted) throw e;
+        if (geminiYielded) {
+          console.warn('[LLMHelper] Gemini cascade failed AFTER first token — ending stream rather than appending a second answer:', e?.message || e);
+          yield LLMHelper.TRUNCATION_SENTINEL;
+          return;
+        }
         console.warn('[LLMHelper] Gemini cascade failed pre-commit — falling through to next provider:', e?.message || e);
         // fall through to the Natively last-resort below
       }
@@ -6959,7 +7472,7 @@ let isMultimodal = !!(imagePaths?.length);
    * Yields the full response in small word-batches so the UI typing effect still plays.
    * Throws on empty response so the fallback chain tries the next provider.
    */
-  private async * streamWithNatively(userContent: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal, connectTimeoutMs: number = INTERACTIVE_CONNECT_TIMEOUT_MS): AsyncGenerator<string, void, unknown> {
+  private async * streamWithNatively(userContent: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal, connectTimeoutMs: number = INTERACTIVE_CONNECT_TIMEOUT_MS, directMode = false): AsyncGenerator<string, void, unknown> {
     // ── REAL SSE STREAM (replaces the fake word-by-word simulation) ──────────
     // Previous implementation called generateWithNatively() (blocking, waited for
     // the full response), then drip-fed words with setTimeout delays — pure theater.
@@ -6982,10 +7495,16 @@ let isMultimodal = !!(imagePaths?.length);
       messages: [{ role: 'user', content: userContent }],
       stream: true,
     };
-    if (this.groqFastTextMode) body.fast_mode = true;
+    // Direct Assist must preserve the selected gateway path. Legacy fast mode
+    // is an implicit server-side model substitution, so it is never sent for a
+    // direct request.
+    if (!directMode && this.groqFastTextMode) body.fast_mode = true;
     if (systemPrompt) body.system = systemPrompt;
-    if (this.aiResponseLanguage && this.aiResponseLanguage !== 'English') {
-      body.language = this.aiResponseLanguage; // 'auto' is forwarded — server handles it
+    if (!directMode && this.aiResponseLanguage) {
+      // 'auto' AND 'English' are both forwarded — the server injects for each.
+      // English used to be excluded here, which (together with the empty prompt
+      // suffix above) left an English-pinned turn with no directive at all.
+      body.language = this.aiResponseLanguage;
     }
 
     // Attach images — compress before sending (same as non-streaming generateWithNatively).
@@ -7004,14 +7523,22 @@ let isMultimodal = !!(imagePaths?.length);
             images.push({ mime_type: 'image/jpeg', data: compressed.toString('base64') });
           } catch (compressErr: any) {
             // Fallback: send raw if sharp fails (e.g. unsupported format)
-            console.warn('[LLMHelper] streamWithNatively: image compression failed, sending raw:', compressErr.message);
+            console.warn(
+              '[LLMHelper] streamWithNatively: image compression failed, sending raw:',
+              directMode ? '[details omitted]' : compressErr.message,
+            );
             const imageData = await fs.promises.readFile(p);
             if (imageData.length > 500 * 1024) {
-              console.warn('[LLMHelper] streamWithNatively: raw fallback image too large, skipping:', p);
+              if (directMode) {
+                throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be prepared for the selected provider.');
+              }
+              console.warn('[LLMHelper] streamWithNatively: raw fallback image too large, skipping:', directMode ? '[path omitted]' : p);
               continue;
             }
             images.push({ mime_type: 'image/png', data: imageData.toString('base64') });
           }
+        } else if (directMode) {
+          throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment is no longer available.');
         }
       }
       if (images.length) body.images = images;
@@ -7042,7 +7569,9 @@ let isMultimodal = !!(imagePaths?.length);
       if (!trialToken) throw new Error('Trial token not found');
       streamHeaders['x-trial-token'] = trialToken;
     } else {
-      streamHeaders['x-natively-key'] = nativelyKey;
+      // Non-null: this `else` implies `e2eLocalToken` is falsy, and the guard above
+      // (`if (!nativelyKey && !e2eLocalToken) throw`) already threw for a null key.
+      streamHeaders['x-natively-key'] = nativelyKey!;
     }
 
     // Early-bail if the caller has already aborted (e.g., user superseded
@@ -7072,7 +7601,17 @@ let isMultimodal = !!(imagePaths?.length);
     };
     abortSignal?.addEventListener('abort', onCallerAbort, { once: true });
 
-    let response: Response;
+    // Definite-assignment: `response` is always assigned before the `response.ok`
+    // read below, via an invariant tsc cannot see.
+    //   - attempt 0 cannot take the `signal.aborted` break: the caller-abort
+    //     early-bail above returns, and there is no `await` between it and the
+    //     loop, so the connect-timeout `setTimeout` cannot have fired yet.
+    //   - attempts 1-2 are only reached from the DNS-retry path, which always
+    //     leaves `lastErr` set, so `if (lastErr) throw lastErr` fires first.
+    // NOTE: this invariant is fragile — introducing an `await` before the loop
+    // would make the abort break reachable and `response.ok` would throw a
+    // TypeError.
+    let response!: Response;
     try {
       // Retry on transient DNS failures (ENOTFOUND / EAI_AGAIN).
       // Railway's 1s TTL means the OS resolver can return ENOTFOUND for 2-3s
@@ -7087,12 +7626,14 @@ let isMultimodal = !!(imagePaths?.length);
         if (streamController.signal.aborted) break;
         try {
           const serializedBody = JSON.stringify(body);
-          require('./llm/providerPayloadCapture').captureProviderPayload({
-            provider: 'natively_gateway',
-            classification: 'exact_serialized_provider_payload',
-            payload: body,
-            serializedPayload: serializedBody,
-          });
+          if (!directMode) {
+            require('./llm/providerPayloadCapture').captureProviderPayload({
+              provider: 'natively_gateway',
+              classification: 'exact_serialized_provider_payload',
+              payload: body,
+              serializedPayload: serializedBody,
+            });
+          }
           response = await fetch(endpointUrl, {
             method: 'POST',
             headers: streamHeaders,
@@ -7117,17 +7658,33 @@ let isMultimodal = !!(imagePaths?.length);
               provider: 'natively',
               connectTimeoutMs,
               durationMs,
-              error: summarizeFetchError(fetchErr),
+              error: directMode ? '[omitted for Direct Assist]' : summarizeFetchError(fetchErr),
               aborted: streamController.signal.aborted,
-              abortReason: (streamController.signal as any).reason?.message ?? (streamController.signal as any).reason,
+              abortReason: directMode
+                ? undefined
+                : (streamController.signal as any).reason?.message ?? (streamController.signal as any).reason,
             });
+            if (directMode) {
+              if (abortSignal?.aborted) {
+                throw new DirectAssistError('CANCELLED', 'The request was cancelled.');
+              }
+              if (streamController.signal.aborted) {
+                throw new DirectAssistError('CONNECT_TIMEOUT', 'The selected provider timed out.', true);
+              }
+              throw new DirectAssistError('PROVIDER_ERROR', 'The selected provider could not start the stream.', true);
+            }
             throw new Error(`Natively API stream request failed before response requestId=${requestId} endpoint=${endpointUrl} method=POST timeoutMs=${connectTimeoutMs} durationMs=${durationMs} ${formatFetchError(fetchErr)}`);
           }
           console.warn(`[streamWithNatively] DNS failure req=${requestId} (${fetchErr.cause?.code ?? fetchErr.code}), retry ${attempt + 1}/2 in 500ms`);
           await new Promise<void>(r => setTimeout(r, 500));
         }
       }
-      if (lastErr) throw lastErr;
+      if (lastErr) {
+        if (directMode) {
+          throw new DirectAssistError('PROVIDER_ERROR', 'The selected provider could not start the stream.', true);
+        }
+        throw lastErr;
+      }
     } finally {
       // Connection established (or failed) — stop the connect-phase timer.
       // The stream body will now be read without any timeout (until/unless
@@ -7147,13 +7704,18 @@ let isMultimodal = !!(imagePaths?.length);
         method: 'POST',
         stage: 'http_status',
         status: response.status,
-        statusText: response.statusText,
+        statusText: directMode ? undefined : response.statusText,
         model: this.currentModelId,
         provider: 'natively',
         connectTimeoutMs,
         durationMs: Math.round(nowMs() - streamStartedAt),
-        responseBody: errText.slice(0, 1000),
+        responseBody: directMode ? '[omitted for Direct Assist]' : errText.slice(0, 1000),
       });
+      if (directMode) {
+        const error = new Error(`Natively API stream HTTP ${response.status}`) as Error & { status?: number };
+        error.status = response.status;
+        throw error;
+      }
       throw new Error(`Natively API stream HTTP ${response.status} requestId=${requestId} serverRequestId=${serverRequestId || 'n/a'} endpoint=${endpointUrl}: ${errData.error || errText.slice(0, 300) || 'unknown'}`);
     }
 
@@ -7214,9 +7776,16 @@ let isMultimodal = !!(imagePaths?.length);
               connectTimeoutMs,
               tfftMs: firstTokenAt ? Math.round(firstTokenAt - streamStartedAt) : null,
               durationMs: Math.round(nowMs() - streamStartedAt),
-              error: chunk.error,
-              message: chunk.message,
+              error: directMode ? '[omitted for Direct Assist]' : chunk.error,
+              message: directMode ? undefined : chunk.message,
             });
+            if (directMode) {
+              throw new DirectAssistError(
+                'PROVIDER_ERROR',
+                'The selected provider reported a streaming failure.',
+                true,
+              );
+            }
             throw new Error(`Natively API stream server error requestId=${requestId} serverRequestId=${serverRequestId || 'n/a'} model=${providerModel || 'unknown'} error=${chunk.error}`);
           }
           if (typeof chunk.delta === 'string' && chunk.delta) {
@@ -7243,8 +7812,19 @@ let isMultimodal = !!(imagePaths?.length);
         durationMs: Math.round(nowMs() - streamStartedAt),
         tokens: tokenCount,
         chars: charCount,
-        error: summarizeFetchError(streamErr),
+        error: directMode ? '[omitted for Direct Assist]' : summarizeFetchError(streamErr),
       });
+      if (directMode) {
+        if (streamErr instanceof DirectAssistError) throw streamErr;
+        if (abortSignal?.aborted) {
+          throw new DirectAssistError('CANCELLED', 'The request was cancelled.');
+        }
+        throw new DirectAssistError(
+          'PROVIDER_ERROR',
+          'The selected provider stream ended unexpectedly.',
+          true,
+        );
+      }
       throw new Error(`Natively API stream failed during read requestId=${requestId} serverRequestId=${serverRequestId || 'n/a'} stage=${firstTokenAt ? 'during_stream' : 'before_first_token'} model=${providerModel || 'unknown'} ${formatFetchError(streamErr)}`);
     } finally {
       const totalMs = Math.max(1, nowMs() - streamStartedAt);
@@ -7287,7 +7867,7 @@ let isMultimodal = !!(imagePaths?.length);
    * `userMessage`) so Groq's prefix cache hits across turns. See generateWithGroq
    * for the full rationale. The single-arg form is retained for legacy callers.
    */
-  private async * streamWithGroq(userMessage: string, modelId: string = GROQ_MODEL, systemPrompt?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGroq(userMessage: string, modelId: string = GROQ_MODEL, systemPrompt?: string, abortSignal?: AbortSignal, strictModel = false): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.groqClient) throw new Error("Groq client not initialized");
     this.assertOutboundScopes('groq', userMessage);
@@ -7313,7 +7893,7 @@ let isMultimodal = !!(imagePaths?.length);
     require('./llm/providerPayloadCapture').captureProviderPayload({
       provider: 'groq', classification: 'sdk_request_object_before_serialization', payload: request,
     });
-    const stream = await this.groqClient.chat.completions.create(request, { signal: abortSignal });
+    const stream = await this.createGroqCompletion(request, { signal: abortSignal, strictModel });
 
     try {
       for await (const chunk of stream) {
@@ -7331,7 +7911,7 @@ let isMultimodal = !!(imagePaths?.length);
   /**
    * Stream multimodal (image + text) response from Groq using Llama 4 Scout as a last resort
    */
-  private async * streamWithGroqMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGroqMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, abortSignal?: AbortSignal, modelId: string = GROQ_VISION_MODEL): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.groqClient) throw new Error("Groq client not initialized");
     this.assertOutboundScopes('groq', userMessage, imagePaths);
@@ -7344,7 +7924,7 @@ let isMultimodal = !!(imagePaths?.length);
     }
 
     const contentParts: any[] = [{ type: "text", text: userMessage }];
-    for (const p of imagePaths) {
+    for (const p of imagePaths.slice(0, GROQ_VISION_MAX_IMAGES)) {
       if (fs.existsSync(p)) {
         // Process image: resize to max 1536px + JPEG 80% to stay within Groq's request size limit
         const { mimeType, data } = await this.processImage(p);
@@ -7355,7 +7935,7 @@ let isMultimodal = !!(imagePaths?.length);
 
     if (abortSignal?.aborted) return;
     const stream = await this.groqClient.chat.completions.create({
-      model: "meta-llama/llama-4-scout-17b-16e-instruct",
+      model: modelId,
       messages,
       stream: true,
       max_tokens: 8192,
@@ -7529,21 +8109,21 @@ let isMultimodal = !!(imagePaths?.length);
    * DeepSeek streaming path: scope-gated, rate-limited, abort-aware. Images are
    * forwarded when present and the upstream model decides vision support.
    */
-  private async * streamWithLiteLLM(userMessage: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+  private async * streamWithLiteLLM(userMessage: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal, modelId?: string): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.litellmClient) throw new Error("LiteLLM client not initialized");
     this.assertOutboundScopes('litellm', userMessage, imagePaths);
 
     await this.rateLimiters.litellm.acquire();
 
-    const litellmModel = this.currentModelId.replace('litellm/', '');
+    const litellmModel = (modelId || this.currentModelId).replace('litellm/', '');
     const messages: any[] = [];
     if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
     if (imagePaths?.length) {
       const content: any[] = [{ type: "text", text: userMessage }];
       for (const p of imagePaths) {
-        const b64 = (await fs.promises.readFile(p)).toString("base64");
-        content.push({ type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } });
+        const { mimeType, data } = await this.processImage(p);
+        content.push({ type: "image_url", image_url: { url: `data:${mimeType};base64,${data}` } });
       }
       messages.push({ role: "user", content });
     } else {
@@ -7572,6 +8152,27 @@ let isMultimodal = !!(imagePaths?.length);
     } finally {
       if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
+  }
+
+  private async * streamWithNvidiaNim(userMessage: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal, modelId?: string): AsyncGenerator<string, void, unknown> {
+    if (this.isLocalOnlyMode) throw new Error('Cloud providers disabled in local-only mode');
+    if (!this.nvidiaNimClient) throw new Error('NVIDIA NIM client not initialized');
+    this.assertOutboundScopes('nvidia_nim', userMessage, imagePaths);
+    await this.rateLimiters.nvidia_nim.acquire();
+    const model = (modelId || this.currentModelId).replace('nvidia_nim/', '');
+    const messages: any[] = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+    if (imagePaths?.length) {
+      const content: any[] = [{ type: 'text', text: userMessage }];
+      for (const p of imagePaths) {
+        const { mimeType, data } = await this.processImage(p);
+        content.push({ type: 'image_url', image_url: { url: `data:${mimeType};base64,${data}` } });
+      }
+      messages.push({ role: 'user', content });
+    } else messages.push({ role: 'user', content: userMessage });
+    const stream = await this.createNvidiaNimCompletion({ model, messages, stream: true }, { signal: abortSignal });
+    try { for await (const chunk of stream) { if (abortSignal?.aborted) return; const content = chunk.choices[0]?.delta?.content; if (content) yield content; } }
+    finally { if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort(); }
   }
 
   /**
@@ -7903,7 +8504,7 @@ let isMultimodal = !!(imagePaths?.length);
   }
 
   // --- OLLAMA STREAMING (uses /api/chat with proper messages array) ---
-  private async * streamWithOllama(message: string, context?: string, systemPrompt: string = TINY_SYSTEM_PROMPT, imagePaths?: string[], abortSignal?: AbortSignal, modelOverride?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithOllama(message: string, context?: string, systemPrompt: string = TINY_SYSTEM_PROMPT, imagePaths?: string[], abortSignal?: AbortSignal, modelOverride?: string, strictErrors = false): AsyncGenerator<string, void, unknown> {
     // When a screenshot is attached and the primary model is text-only, the
     // caller passes the resolved vision-capable model here so the image is
     // actually understood instead of silently dropped.
@@ -7931,6 +8532,9 @@ let isMultimodal = !!(imagePaths?.length);
           const data = await fs.promises.readFile(p);
           encoded.push(data.toString("base64"));
         } catch (e) {
+          if (strictErrors) {
+            throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
+          }
           console.warn("[LLMHelper] streamWithOllama: failed to read image, skipping:", p, e);
         }
       }
@@ -8045,14 +8649,89 @@ let isMultimodal = !!(imagePaths?.length);
         }
       }
     } catch (e: any) {
+      if (strictErrors) throw e;
       console.error('[LLMHelper] Ollama streaming failed:', e?.message || e);
       yield `Error: Failed to stream from Ollama (${e?.message || 'unknown'}).`;
     }
   }
 
+  /** One-shot, abort-aware raw cURL adapter for Direct Assist. */
+  private async *streamWithDirectCurl(
+    provider: CurlProvider,
+    userMessage: string,
+    systemPrompt: string,
+    imagePaths: string[],
+    abortSignal?: AbortSignal,
+  ): AsyncGenerator<string, void, unknown> {
+    if (customProviderIsLocal(provider)) {
+      if (this.isProviderDisabled('custom') || this.isProviderDisabled(provider.id)) {
+        throw new ProviderDisabledError(provider.id);
+      }
+    } else {
+      this.assertOutboundScopes('custom_curl', userMessage, imagePaths);
+    }
+    if (abortSignal?.aborted) return;
+
+    // @ts-ignore third-party parser has no useful declaration for its result
+    const curlConfig = curl2Json(provider.curlCommand);
+    let base64Image = '';
+    const imagePath = imagePaths[0];
+    if (imagePath) {
+      try {
+        base64Image = (await fs.promises.readFile(imagePath)).toString('base64');
+      } catch {
+        throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
+      }
+    }
+
+    const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${userMessage}` : userMessage;
+    const variables = {
+      TEXT: JSON.stringify(fullPrompt).slice(1, -1),
+      IMAGE_BASE64: base64Image,
+    };
+    const url = deepVariableReplacer(curlConfig.url, variables);
+    const headers = deepVariableReplacer(curlConfig.header || {}, variables);
+    let data = deepVariableReplacer(curlConfig.data || {}, variables);
+    if (base64Image && imagePath) data = injectImageIntoMessages(data, base64Image, imagePath);
+
+    const { validateUrlForSsrf } = require('./utils/curlUtils');
+    const validation = validateUrlForSsrf(url);
+    if (!validation.isValid) {
+      throw new DirectAssistError('INVALID_REQUEST', 'The custom provider URL was blocked by network safety policy.');
+    }
+
+    const response = await axios({
+      method: curlConfig.method || 'POST',
+      url,
+      headers,
+      data,
+      timeout: 60_000,
+      signal: abortSignal,
+      // The initial URL is validated immediately above. Refuse redirects so
+      // Axios cannot resend Direct Assist data to an unvalidated destination.
+      maxRedirects: 0,
+    });
+    if (abortSignal?.aborted) return;
+
+    const answer = provider.responsePath
+      ? getByPath(response.data, provider.responsePath)
+      : response.data;
+    if (typeof answer === 'string') {
+      yield answer;
+      return;
+    }
+    if (answer !== undefined) yield JSON.stringify(answer);
+  }
+
   // --- CUSTOM PROVIDER STREAMING ---
-  private async * streamWithCustom(message: string, context?: string, imagePaths?: string[], systemPrompt: string = UNIVERSAL_SYSTEM_PROMPT, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
-    if (!this.customProvider) return;
+  private async * streamWithCustom(message: string, context?: string, imagePaths?: string[], systemPrompt: string = UNIVERSAL_SYSTEM_PROMPT, abortSignal?: AbortSignal, providerOverride?: CustomProvider, strictErrors = false, bypassCloudDataScopes = false): AsyncGenerator<string, void, unknown> {
+    // Direct Assist passes an immutable provider snapshot. Legacy callers omit
+    // it and retain the active-provider behaviour.
+    const selectedCustomProvider = providerOverride || this.customProvider;
+    if (!selectedCustomProvider) {
+      if (strictErrors) throw new Error('Custom provider not configured');
+      return;
+    }
     // We reuse the executeCustomProvider logic but we need it to stream.
     // If the user provided a curl command, it might support streaming (SSE) or not.
     // If we execute it via Child Process, we can read stdout stream.
@@ -8062,42 +8741,71 @@ let isMultimodal = !!(imagePaths?.length);
     // But we can't easily reuse the function since it awaits the whole fetch.
     // So we'll implement a simplified streaming version using our existing variable replacer and node-fetch.
 
-    this.assertOutboundScopes('custom_provider', message, imagePaths);
+    if (bypassCloudDataScopes) {
+      if (this.isProviderDisabled('custom') || this.isProviderDisabled(selectedCustomProvider.id)) {
+        throw new ProviderDisabledError(selectedCustomProvider.id);
+      }
+    } else {
+      this.assertOutboundScopes('custom_provider', message, imagePaths);
+    }
 
-    const curlCommand = this.customProvider.curlCommand;
+    const curlCommand = selectedCustomProvider.curlCommand;
     const requestConfig = curl2Json(curlCommand);
 
     let base64Image = "";
+    let preparedImagePath: string | undefined;
     if (imagePaths?.length) {
+      const sourcePath = imagePaths[0];
+      // Raw fallback bytes retain the source file's MIME/extension. Successful
+      // optimization replaces this with ImageOptimizer's MIME-correct temp
+      // path (balanced commonly converts PNG to .jpg).
+      preparedImagePath = sourcePath;
       try {
         // 2026-07-19: same image-size fix as executeCustomProvider (see that
         // method for the full rationale). Optimize before base64-encoding so the
         // wire payload stays under the 10 MB Anthropic per-image limit.
         // Use the first image for custom providers (they typically only support one).
-        const sourcePath = imagePaths[0];
         const optimized = await getImageOptimizer().optimize(sourcePath, {
           profile: 'balanced',
           provider: 'custom',
           cacheKey: sourcePath,
         });
         base64Image = await getImageOptimizer().getBase64(optimized);
+        preparedImagePath = optimized.path;
       } catch (e) {
-        console.warn(
-          "[LLMHelper] streamWithCustom: image optimization failed, falling back to raw read:",
-          e,
-        );
+        if (!strictErrors) {
+          console.warn(
+            "[LLMHelper] streamWithCustom: image optimization failed, falling back to raw read:",
+            e,
+          );
+        }
         try {
-          const data = await fs.promises.readFile(imagePaths[0]);
+          const data = await fs.promises.readFile(sourcePath);
           base64Image = data.toString("base64");
-        } catch (e2) { /* keep empty */ }
+          preparedImagePath = sourcePath;
+        } catch (e2) {
+          if (strictErrors) {
+            throw new DirectAssistError('INVALID_ATTACHMENT', 'The image attachment could not be read.');
+          }
+          /* keep empty for legacy callers */
+        }
       }
     }
 
     const combinedMessage = context ? `${context}\n\n${message}` : message;
+    const directCustomMode = strictErrors && Boolean(providerOverride);
+    const templateUsesSystemPrompt = /\{\{\s*SYSTEM_PROMPT\s*\}\}/i.test(curlCommand);
+    // Many saved custom templates expose only {{TEXT}}/{{PROMPT}}. Legacy
+    // callers keep their byte-for-byte variable contract, while Direct folds
+    // its short system contract into those generic fields only when the
+    // template has no separate system slot.
+    const genericPromptValue = directCustomMode && systemPrompt && !templateUsesSystemPrompt
+      ? `${systemPrompt}\n\n${combinedMessage}`
+      : combinedMessage;
 
     const variables = {
-      TEXT: combinedMessage,
-      PROMPT: combinedMessage,
+      TEXT: genericPromptValue,
+      PROMPT: genericPromptValue,
       SYSTEM_PROMPT: systemPrompt,
       USER_MESSAGE: message,
       CONTEXT: context || "",
@@ -8110,8 +8818,21 @@ let isMultimodal = !!(imagePaths?.length);
 
     // Auto-upgrade last user message to multimodal content array when an image is present.
     // No-op for non-OpenAI formats and templates already containing a proper image_url part.
-    if (base64Image && imagePaths?.[0]) {
-      body = injectImageIntoMessages(body, base64Image, imagePaths[0]);
+    if (base64Image && preparedImagePath) {
+      body = injectImageIntoMessages(body, base64Image, preparedImagePath);
+    }
+
+    // SECURITY (P1): Validate URL against SSRF before dispatching, same as
+    // streamWithDirectCurl and chatWithCurl.
+    const { validateUrlForSsrf } = require('./utils/curlUtils');
+    const urlValidation = validateUrlForSsrf(url);
+    if (!urlValidation.isValid) {
+      if (strictErrors) {
+        throw new DirectAssistError('INVALID_REQUEST', 'The custom provider URL was blocked by network safety policy.');
+      }
+      console.error(`[LLMHelper] streamWithCustom: SSRF blocked: ${urlValidation.reason}`);
+      yield `Error: SSRF protection blocked URL (${urlValidation.reason})`;
+      return;
     }
 
     const streamAbort = new AbortController();
@@ -8133,10 +8854,20 @@ let isMultimodal = !!(imagePaths?.length);
         headers: headers,
         body: JSON.stringify(body),
         signal: streamAbort.signal,
+        // WHATWG fetch follows redirects by default and can replay this body
+        // and its credentials to a destination that never passed provider
+        // selection or network-safety checks. Treat every redirect as an HTTP
+        // error instead of following it.
+        redirect: 'manual',
       });
       clearTimeout(streamTimeout);
 
       if (!response.ok) {
+        if (strictErrors) {
+          const error = new Error(`Custom Provider returned HTTP ${response.status}`) as Error & { status?: number };
+          error.status = response.status;
+          throw error;
+        }
         console.error('[LLMHelper] Custom Provider stream HTTP error', { status: response.status });
         yield `Error: Custom Provider returned HTTP ${response.status}`;
         return;
@@ -8147,16 +8878,42 @@ let isMultimodal = !!(imagePaths?.length);
       // Collect all chunks to handle both SSE streaming and non-SSE JSON responses
       let fullBody = "";
       let yieldedAny = false;
+      const streamDecoder = new TextDecoder();
+      let lineBuffer = "";
+      const parseCompleteChunkFrame = (): { complete: boolean; item: string | null } => {
+        const trimmed = lineBuffer.trim();
+        if (!trimmed) return { complete: false, item: null };
+        if (trimmed.startsWith('data: ')) {
+          const payload = trimmed.slice(6).trim();
+          if (payload === '[DONE]') return { complete: true, item: null };
+          try {
+            JSON.parse(payload);
+            return { complete: true, item: this.parseStreamLine(trimmed) };
+          } catch {
+            return { complete: false, item: null };
+          }
+        }
+        if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+          try {
+            JSON.parse(trimmed);
+            return { complete: true, item: this.parseStreamLine(trimmed) };
+          } catch {
+            return { complete: false, item: null };
+          }
+        }
+        return { complete: false, item: null };
+      };
 
       // @ts-ignore
       for await (const chunk of response.body) {
         // Per-chunk caller-cancel check (the abort above already closed the
         // socket, but a buffered chunk could still be in the iterator).
         if (abortSignal?.aborted) return;
-        const text = new TextDecoder().decode(chunk);
+        const text = streamDecoder.decode(chunk, { stream: true });
         fullBody += text;
-
-        const lines = text.split('\n');
+        lineBuffer += text;
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() ?? "";
         for (const line of lines) {
           if (line.trim().length === 0) continue;
 
@@ -8165,6 +8922,31 @@ let isMultimodal = !!(imagePaths?.length);
             yield items;
             yieldedAny = true;
           }
+        }
+        // Some legacy custom endpoints use each HTTP chunk as the frame and
+        // omit newlines. Consume a syntactically-complete JSON/SSE frame now;
+        // otherwise retain it as a fragmented line for the next chunk.
+        const chunkFrame = parseCompleteChunkFrame();
+        if (chunkFrame.complete) {
+          lineBuffer = "";
+          if (chunkFrame.item) {
+            yield chunkFrame.item;
+            yieldedAny = true;
+          }
+        }
+      }
+
+      // Flush a split UTF-8 code point and the final non-newline-terminated
+      // SSE/JSON line. This keeps legacy extraction semantics while preventing
+      // a valid delta split across TCP chunks from disappearing.
+      const decoderTail = streamDecoder.decode();
+      fullBody += decoderTail;
+      lineBuffer += decoderTail;
+      if (lineBuffer.trim().length > 0) {
+        const item = this.parseStreamLine(lineBuffer);
+        if (item) {
+          yield item;
+          yieldedAny = true;
         }
       }
 
@@ -8184,6 +8966,7 @@ let isMultimodal = !!(imagePaths?.length);
 
     } catch (e) {
       clearTimeout(streamTimeout);
+      if (strictErrors) throw e;
       console.error("Custom streaming failed", e);
       yield "Error streaming from custom provider.";
     } finally {
@@ -8266,6 +9049,21 @@ let isMultimodal = !!(imagePaths?.length);
     return this.isCodexAvailable() && (
       this.isCodexCliModel(this.currentModelId) || this.groqFastTextMode === true
     );
+  }
+
+  /**
+   * True when this turn routes through natively-api's SEQUENTIAL server-side
+   * provider cascade (`${NATIVELY_API_URL}/v1/chat`) rather than straight to a
+   * provider.
+   *
+   * F-301: the client's first-useful deadline must stay ABOVE the server's
+   * AI_TTFT_BUDGET_MS (10s) on this route, because the server's cutover to the
+   * next provider is the thing that actually RESCUES a slow turn — the client
+   * can only give up. Callers use this to pick the deadline; see
+   * firstUsefulDeadlineMs(). Mirrors isUsingOllama()/isUsingCodexCli().
+   */
+  public isUsingNativelyServerCascade(): boolean {
+    return this.currentModelId === 'natively';
   }
 
   public async getOllamaModels(): Promise<string[]> {
@@ -8501,6 +9299,304 @@ let isMultimodal = !!(imagePaths?.length);
   }
 
   /**
+   * Snapshot the exact provider/model pair used by Direct Assist. Unlike the
+   * legacy getCurrentProvider(), this identifies every supported provider and
+   * never labels OpenAI/Claude/Groq selections as Gemini.
+   */
+  public getDirectAssistSelection(): DirectAssistSelection {
+    let provider: DirectAssistProvider;
+    let model: string;
+
+    if (this.customProvider) {
+      provider = 'custom';
+      model = this.customProvider.id;
+    } else if (this.activeCurlProvider) {
+      provider = 'curl';
+      model = this.activeCurlProvider.id;
+    } else if (this.useOllama) {
+      provider = 'ollama';
+      model = this.ollamaModel;
+    } else {
+      const selected = this.currentModelId;
+      model = selected;
+      // Gateway IDs can contain a nested vendor/model name (for example,
+      // litellm/openai/gpt-4o). Classify those explicit prefixes before the
+      // generic vendor predicates or the request escapes through the wrong
+      // credential/client boundary.
+      if (selected === 'natively') provider = 'natively';
+      else if (this.isCodexCliModel(selected)) {
+        provider = 'codex-cli';
+        model = this.getSelectedCodexCliModel(false);
+      } else if (this.isNvidiaNimModel(selected)) provider = 'nvidia_nim';
+      else if (this.isLiteLLMModel(selected)) provider = 'litellm';
+      else if (this.isGroqModel(selected)) provider = 'groq';
+      else if (this.isOpenAiModel(selected)) provider = 'openai';
+      else if (this.isClaudeModel(selected)) provider = 'claude';
+      else if (this.isDeepseekModel(selected)) provider = 'deepseek';
+      else if (this.isGeminiModel(selected)) provider = 'gemini';
+      else throw new DirectAssistError('MODEL_UNAVAILABLE', 'The selected model has no Direct Assist adapter.');
+    }
+
+    if (!model || !model.trim()) {
+      throw new DirectAssistError('NO_PROVIDER_CONFIGURED', 'No model is selected for Direct Assist.');
+    }
+    return Object.freeze({ provider, model });
+  }
+
+  /**
+   * Direct Assist provider boundary. The request is copied synchronously so a
+   * later Settings/model change cannot alter an in-flight dispatch. The
+   * returned generator invokes exactly one adapter and contains no fallback.
+   */
+  public streamDirectAssist(
+    request: DirectAssistDispatchRequest,
+    abortSignal?: AbortSignal,
+  ): AsyncGenerator<string, void, unknown> {
+    if (!request?.selection?.provider || !request.selection.model) {
+      throw new DirectAssistError('NO_PROVIDER_CONFIGURED', 'Direct Assist requires a selected provider and model.');
+    }
+
+    const frozenRequest: DirectAssistDispatchRequest = Object.freeze({
+      requestId: request.requestId,
+      selection: Object.freeze({
+        provider: request.selection.provider,
+        model: request.selection.model,
+      }),
+      systemPrompt: request.systemPrompt,
+      userPrompt: request.userPrompt,
+      imagePaths: Object.freeze([...request.imagePaths]),
+    });
+    const custom = request.selection.provider === 'custom'
+      ? this.snapshotDirectCustomProvider(request.selection.model)
+      : null;
+    const curl = request.selection.provider === 'curl' && this.activeCurlProvider?.id === request.selection.model
+      ? Object.freeze({ ...this.activeCurlProvider })
+      : null;
+
+    return this.streamDirectAssistFrozen(frozenRequest, custom, curl, abortSignal);
+  }
+
+  private snapshotDirectCustomProvider(modelId: string): CustomProvider | null {
+    const provider = this.customProvider?.id === modelId
+      ? this.customProvider
+      : this.configuredCustomProviders.find((candidate) => candidate.id === modelId) ?? null;
+    return provider ? Object.freeze({ ...provider }) : null;
+  }
+
+  private directSelectionSupportsImages(
+    selection: DirectAssistSelection,
+    custom: CustomProvider | null,
+    curl: CurlProvider | null,
+  ): boolean {
+    switch (selection.provider) {
+      case 'natively':
+      case 'codex-cli':
+        return true;
+      case 'custom':
+        return customProviderSupportsVision(custom);
+      case 'curl':
+        return customProviderSupportsVision(curl);
+      case 'ollama':
+        return this.ollamaVisionCache.get(selection.model)
+          ?? getModelCapabilities(selection.model, true).supportsImages;
+      case 'litellm':
+      case 'nvidia_nim':
+        // These adapters are image-forwarding gateways whose catalogues can
+        // contain newly-added upstream vision models that are unknown to the
+        // app's static capability table. Preserve the image and exact model;
+        // an unsupported upstream returns a normal provider error, never a
+        // fallback or a text-only retry.
+        return true;
+      case 'deepseek':
+        return false;
+      default:
+        return getModelCapabilities(selection.model, false).supportsImages;
+    }
+  }
+
+  private async *streamDirectAssistFrozen(
+    request: DirectAssistDispatchRequest,
+    custom: CustomProvider | null,
+    curl: CurlProvider | null,
+    abortSignal?: AbortSignal,
+  ): AsyncGenerator<string, void, unknown> {
+    if (abortSignal?.aborted) return;
+
+    const { provider, model } = request.selection;
+    const imagePaths = [...request.imagePaths];
+    for (const imagePath of imagePaths) {
+      try {
+        if (!fs.statSync(imagePath).isFile()) throw new Error('not a regular file');
+      } catch {
+        throw new DirectAssistError('INVALID_ATTACHMENT', 'An image attachment is no longer available.');
+      }
+    }
+    const disabledFamily = provider === 'codex-cli'
+      ? 'codex-cli'
+      : provider === 'curl' || provider === 'custom'
+        ? 'custom'
+        : provider;
+    if (this.isProviderDisabled(disabledFamily)) {
+      throw new ProviderDisabledError(provider);
+    }
+    if (imagePaths.length && !this.directSelectionSupportsImages(request.selection, custom, curl)) {
+      throw new DirectAssistError(
+        'MODEL_DOES_NOT_SUPPORT_IMAGES',
+        `The selected ${model} model does not support image input.`,
+      );
+    }
+    if ((provider === 'custom' || provider === 'curl') && imagePaths.length > 1) {
+      throw new DirectAssistError(
+        'INVALID_ATTACHMENT',
+        'The selected custom provider accepts at most one image per request.',
+      );
+    }
+
+    // Direct Assist bypasses the legacy context assembler, so enforce the
+    // existing provider-data-scope policy here before the sole dispatch. The
+    // request builder emits the same recognized scope tags as legacy/V3.
+    const directProviderIsLocal = provider === 'ollama'
+      || (provider === 'custom' && customProviderIsLocal(custom))
+      || (provider === 'curl' && customProviderIsLocal(curl));
+    if (this.isLocalOnlyMode && !directProviderIsLocal) {
+      throw new DirectAssistError('PROVIDER_ERROR', 'Cloud providers are disabled in local-only mode.');
+    }
+    // This is the shared last boundary for every Direct image dispatch. The
+    // provider-specific streamers are intentionally not trusted to remember
+    // private_vision: a cloud Natively request, for example, otherwise reaches
+    // its transport without passing through assertOutboundScopes. Verified
+    // local Direct providers may still perform private vision on-device.
+    if (imagePaths.length > 0 && !directProviderIsLocal) {
+      this.assertOutboundImagesAllowed(provider, true);
+    }
+    const directScopes = this.inferEmbeddedMessageScopes(request.userPrompt);
+    const deniedScopes = directProviderIsLocal
+      ? []
+      : this.getDeniedOutboundScopes(request.userPrompt, imagePaths, directScopes);
+    if (deniedScopes.includes('screenshots')) {
+      throw new DirectAssistError(
+        'SCREENSHOT_BLOCKED_BY_PRIVACY',
+        'Screenshots and current page data are disabled for cloud providers.',
+      );
+    }
+    // scopesForPayload()'s 'transcript' tag is a last-boundary backstop that
+    // fires on ANY non-empty prompt text, not only when the prompt actually
+    // carries transcript-derived content — Direct Assist's userPrompt always
+    // has a "CURRENT REQUEST" section, so it fires on every request.
+    //
+    // directScopes.includes('transcript') is NOT the right gate either:
+    // meetingTranscript (the live session's last 180s, added unconditionally
+    // to every Direct Assist request) is correctly tagged
+    // <evidence source_type="MEETING_TRANSCRIPT">, so directScopes includes
+    // 'transcript' on almost every request during a live meeting. Gating the
+    // hard block on that would re-fail every typed/reference-file question
+    // the instant any meeting audio exists, regardless of relevance.
+    //
+    // The only case that must hard-fail rather than silently strip-and-
+    // continue is screenshot's CURRENT TURN SPEECH: it IS the current
+    // request (see this file's system-prompt authority line), so answering
+    // with it removed would answer a different, incomplete question.
+    // meetingTranscript, history and everything else are optional context by
+    // design — stripDeniedScopedBlocksFromMessage below removes them and the
+    // request proceeds, same as the legacy chat path.
+    if (deniedScopes.includes('transcript') && request.userPrompt.includes(DIRECT_ASSIST_CURRENT_TURN_SPEECH_MARKER)) {
+      throw new DirectAssistError(
+        'TRANSCRIPT_BLOCKED_BY_PRIVACY',
+        'Transcript data is disabled for cloud providers, so this request was not sent.',
+      );
+    }
+    const directUserPrompt = deniedScopes.length
+      ? this.stripDeniedScopedBlocksFromMessage(request.userPrompt, deniedScopes)
+      : request.userPrompt;
+    const capabilityModel = provider === 'litellm'
+      ? model.replace(/^litellm\//, '')
+      : provider === 'nvidia_nim'
+        ? model.replace(/^nvidia_nim\//, '')
+        : model;
+    const directCapabilities = getModelCapabilities(capabilityModel, provider === 'ollama');
+    const directInputTokens = estimateTokens(request.systemPrompt) + estimateTokens(directUserPrompt);
+    if (directInputTokens + directCapabilities.outputBudgetTokens > directCapabilities.maxContextTokens) {
+      throw new DirectAssistError(
+        'CONTEXT_TOO_LARGE',
+        'The Direct Assist request exceeds the selected model context limit.',
+      );
+    }
+
+    // Every branch yields from one exact adapter and returns. There is no
+    // provider race, model ladder or cross-provider recovery below this point.
+    switch (provider) {
+      case 'natively':
+        yield* this.streamWithNatively(
+          directUserPrompt,
+          request.systemPrompt,
+          imagePaths,
+          abortSignal,
+          INTERACTIVE_CONNECT_TIMEOUT_MS,
+          true,
+        );
+        return;
+      case 'gemini':
+        yield* this.streamWithGeminiModel(directUserPrompt, model, imagePaths, request.systemPrompt, abortSignal);
+        return;
+      case 'openai':
+        if (imagePaths.length) {
+          yield* this.streamWithOpenaiMultimodal(directUserPrompt, imagePaths, request.systemPrompt, model, abortSignal);
+        } else {
+          yield* this.streamWithOpenai(directUserPrompt, request.systemPrompt, model, abortSignal);
+        }
+        return;
+      case 'claude':
+        if (imagePaths.length) {
+          yield* this.streamWithClaudeMultimodal(directUserPrompt, imagePaths, request.systemPrompt, model, abortSignal);
+        } else {
+          yield* this.streamWithClaude(directUserPrompt, request.systemPrompt, model, abortSignal);
+        }
+        return;
+      case 'groq':
+        if (imagePaths.length) {
+          yield* this.streamWithGroqMultimodal(directUserPrompt, imagePaths, request.systemPrompt, abortSignal, model);
+        } else {
+          yield* this.streamWithGroq(directUserPrompt, model, request.systemPrompt, abortSignal, true);
+        }
+        return;
+      case 'deepseek':
+        yield* this.streamWithDeepseek(directUserPrompt, request.systemPrompt, model, abortSignal);
+        return;
+      case 'nvidia_nim':
+        yield* this.streamWithNvidiaNim(directUserPrompt, request.systemPrompt, imagePaths, abortSignal, model);
+        return;
+      case 'litellm':
+        yield* this.streamWithLiteLLM(directUserPrompt, request.systemPrompt, imagePaths, abortSignal, model);
+        return;
+      case 'ollama':
+        yield* this.streamWithOllama(directUserPrompt, undefined, request.systemPrompt, imagePaths, abortSignal, model, true);
+        return;
+      case 'codex-cli':
+        if (!this.isCodexAvailable()) throw new Error('Codex CLI provider not configured');
+        yield* this.streamWithCodexCli(directUserPrompt, request.systemPrompt, false, imagePaths, abortSignal, model);
+        return;
+      case 'custom':
+        if (!custom) throw new Error('Custom provider not configured');
+        if (this.isLocalOnlyMode && !customProviderIsLocal(custom)) {
+          throw new Error('Cloud providers disabled in local-only mode');
+        }
+        yield* this.streamWithCustom(directUserPrompt, undefined, imagePaths, request.systemPrompt, abortSignal, custom, true, directProviderIsLocal);
+        return;
+      case 'curl':
+        if (!curl) throw new Error('cURL provider not configured');
+        if (this.isLocalOnlyMode && !customProviderIsLocal(curl)) {
+          throw new Error('Cloud providers disabled in local-only mode');
+        }
+        yield* this.streamWithDirectCurl(curl, directUserPrompt, request.systemPrompt, imagePaths, abortSignal);
+        return;
+      default: {
+        const exhaustive: never = provider;
+        throw new DirectAssistError('MODEL_UNAVAILABLE', `No Direct Assist adapter exists for ${exhaustive}.`);
+      }
+    }
+  }
+
+  /**
    * Human-readable label for the active model. Prefer this for UI rendering
    * and never compare the result to option IDs (use {@link getCurrentModelId}).
    */
@@ -8662,7 +9758,7 @@ let isMultimodal = !!(imagePaths?.length);
       try {
         console.log(`[LLMHelper] 🚀 Mode-specific Groq stream starting...`);
         await this.rateLimiters.groq.acquire();
-        const stream = await this.groqClient.chat.completions.create({
+        const stream = await this.createGroqCompletion({
           model: GROQ_MODEL,
           messages: [{ role: "user", content: groqMessage }],
           stream: true,
@@ -8847,7 +9943,7 @@ let isMultimodal = !!(imagePaths?.length);
    * 3. Gemini Flash (Retry 2x)
    * 4. Gemini Pro (Retry 5x)
    */
-  public async generateMeetingSummary(systemPrompt: string, context: string, groqSystemPrompt?: string): Promise<string> {
+  public async generateMeetingSummary(systemPrompt: string, context: string, groqSystemPrompt?: string, opts?: MeetingSummaryCallOpts): Promise<string> {
     console.log(`[LLMHelper] generateMeetingSummary called. Context length: ${context.length}`);
     // Short-circuit on empty/whitespace context. With no transcript content to
     // summarise, the provider fallback chain (Natively → Codex → Groq → Gemini
@@ -8875,6 +9971,8 @@ let isMultimodal = !!(imagePaths?.length);
     const tokenCount = estimateTokens(context);
     console.log(`[LLMHelper] Estimated tokens: ${tokenCount}`);
 
+    const contents = [{ text: `${systemPrompt}\n\nCONTEXT:\n${context}` }];
+
     // ATTEMPT 0: Custom Provider (highest priority — user explicitly chose this)
     if (this.customProvider || this.activeCurlProvider) {
       try {
@@ -8882,15 +9980,26 @@ let isMultimodal = !!(imagePaths?.length);
         // Collect the async generator into a Promise so withTimeout works.
         // ignoreKnowledgeMode=true: meeting summaries must never go through the
         // profile/knowledge intercept — it would corrupt the output.
+        // streamChatLongForm, not streamChat: the live output cap is sized for
+        // what_to_answer answers (p100 2530 chars) and silently truncated long
+        // summaries, which then passed the length check below and were
+        // persisted as complete. `outcome` also lets that be DETECTED rather
+        // than inferred from the text.
+        const { stream, outcome } = this.streamChatLongForm(`Context:\n${context}`, undefined, undefined, systemPrompt, true);
         const collectChunks = async (): Promise<string> => {
           let result = '';
-          for await (const chunk of this.streamChat(`Context:\n${context}`, undefined, undefined, systemPrompt, true)) {
+          for await (const chunk of stream) {
             result += chunk;
           }
           return result;
         };
         const text = await this.withTimeout(collectChunks(), 60000, 'Custom Provider Summary');
-        if (text.trim().length > 0) {
+        if (outcome.truncated) {
+          // Do not persist an incomplete summary as the meeting's summary, and
+          // do not silently swap the user's chosen provider either — fall to
+          // the next ATTEMPT the same way any other failure here does.
+          console.warn(`[LLMHelper] ⚠️ Custom provider summary stopped early (${outcome.reason}) — falling back rather than saving a partial summary.`);
+        } else if (text.trim().length > 0) {
           console.log(`[LLMHelper] ✅ Custom provider summary generated successfully.`);
           return this.processResponse(text);
         }
@@ -8900,14 +10009,20 @@ let isMultimodal = !!(imagePaths?.length);
     }
 
     // ATTEMPT 1: Natively API (if configured — first in chain)
-    // Inner fetch timeout: 8s (AbortSignal.timeout in generateWithNatively).
-    // Outer safety net: 10s — covers JSON parsing + any overhead after the fetch resolves.
+    // Inner fetch timeout: caller's timeoutMs, default 8s (AbortSignal.timeout in
+    // generateWithNatively). Outer safety net: timeoutMs + 5s (default 10s when the
+    // caller passes no opts, so uninvolved callers are unaffected) — the extra slack
+    // covers JSON parsing and any overhead after the fetch resolves, mirroring the
+    // headroom generateWithNatively's own OVERALL_DEADLINE_MS gives the body read.
     if (this.hasNatively()) {
       try {
         console.log(`[LLMHelper] Attempting Natively API for summary...`);
         const text = await this.withTimeout(
-          this.generateWithNatively(`Context:\n${context}`, systemPrompt),
-          10000,
+          this.generateWithNatively(`Context:\n${context}`, systemPrompt, undefined, {
+            ...(opts?.purpose ? { purpose: opts.purpose } : {}),
+            ...(opts?.timeoutMs ? { timeoutMs: opts.timeoutMs } : {}),
+          }),
+          opts?.timeoutMs ? opts.timeoutMs + 5000 : 10000,
           'Natively Summary'
         );
         if (text.trim().length > 0) {
@@ -8942,7 +10057,7 @@ let isMultimodal = !!(imagePaths?.length);
       try {
         const groqPrompt = groqSystemPrompt || systemPrompt;
         const response = await this.withTimeout(
-          this.groqClient.chat.completions.create({
+          this.createGroqCompletion({
             model: GROQ_MODEL,
             messages: [
               { role: "system", content: groqPrompt },
@@ -8969,8 +10084,6 @@ let isMultimodal = !!(imagePaths?.length);
         console.log(`[LLMHelper] Context too large for Groq (${tokenCount} tokens). Skipping straight to Gemini.`);
       }
     }
-
-    const contents = [{ text: `${systemPrompt}\n\nCONTEXT:\n${context}` }];
 
     // ATTEMPT 3: Gemini Flash-Lite (cheapest/fastest — leads the Gemini cascade).
     // 3 attempts with linear backoff before dropping to full Flash.
@@ -9180,9 +10293,20 @@ let isMultimodal = !!(imagePaths?.length);
    * Universal Chat (Non-streaming)
    */
   public async chat(message: string, imagePaths?: string[], context?: string, systemPromptOverride?: string, skipModeInjection: boolean = false): Promise<string> {
+    // F3 (code-review 2026-08-14): this is a BUFFERED caller — nothing is
+    // shown to a user mid-stream, so the streaming path's "end by returning,
+    // never throw" contract does not apply here. When the post-commit
+    // truncation sentinel fires (provider died after first token, runaway
+    // cap), a partial buffer must surface as an ERROR — callers like
+    // modes:generate-from-brief persist this return value as a completed
+    // generation, which is exactly how mid-sentence artifacts were saved.
+    const { stream, outcome } = this.streamChatWithOutcome(message, imagePaths, context, systemPromptOverride, false, skipModeInjection);
     let fullResponse = "";
-    for await (const chunk of this.streamChat(message, imagePaths, context, systemPromptOverride, false, skipModeInjection)) {
+    for await (const chunk of stream) {
       fullResponse += chunk;
+    }
+    if (outcome.truncated) {
+      throw new Error('Generation ended before completion (provider stream truncated) — partial output discarded rather than saved as complete.');
     }
     return fullResponse;
   }

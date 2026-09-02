@@ -49,6 +49,9 @@ import {
 // without intent this list forces an explicit update — it pins the public surface the
 // settings UI enumerates.
 const EXPECTED_KEYS = [
+  // WTA audit flags (2026-08-18, default OFF).
+  'questionLedgerShadow',
+  'wtaClauseCoverageRepair',
   'trace',
   'durableMemoryWindow',
   'profileTreeV2',
@@ -121,6 +124,14 @@ const EXPECTED_KEYS = [
   'contextOsImpossibleStateGateEnforceForbidden',
   // Prompt System v2 (2026-08-01) — default OFF everywhere.
   'promptSystemV2',
+  // WTA governance yields to a V3-composed turn (2026-08-28) — default ON,
+  // literal (never isInternalDevTestContext): it restores the !v3OwnedTurn
+  // invariant LLMHelper already enforces, and a fix for a production-only
+  // failure must not resolve differently in dev/test.
+  'wtaGovernanceYieldsToV3',
+  // The doc-grounded validator checks the block that was SENT (2026-08-28) —
+  // default ON, literal (never isInternalDevTestContext).
+  'docGroundedValidatorUsesSentEvidence',
 ];
 
 // All NATIVELY_* env vars these flags read — cleared before/after so a leaked env from the
@@ -156,9 +167,19 @@ const DEFAULT_ON_KEYS = new Set([
   // Prompt System v2 — promoted to production default-ON (2026-08-02) after the
   // 8-run benchmark campaign (see the intelligenceFlags.ts promotion comment).
   'promptSystemV2',
+  // WTA governance yields to a V3-composed turn (2026-08-28) — default ON,
+  // literal (never isInternalDevTestContext): it restores the !v3OwnedTurn
+  // invariant LLMHelper already enforces, and a fix for a production-only
+  // failure must not resolve differently in dev/test.
+  'wtaGovernanceYieldsToV3',
+  // The doc-grounded validator checks the block that was SENT (2026-08-28) —
+  // default ON, literal (never isInternalDevTestContext).
+  'docGroundedValidatorUsesSentEvidence',
 ]);
 
 const ALL_ENV_VARS = [
+  'NATIVELY_QUESTION_LEDGER_SHADOW',
+  'NATIVELY_WTA_CLAUSE_COVERAGE_REPAIR',
   'NATIVELY_INTELLIGENCE_TRACE',
   'NATIVELY_DURABLE_MEMORY_WINDOW',
   'NATIVELY_PROFILE_TREE_V2',

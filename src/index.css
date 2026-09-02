@@ -104,6 +104,12 @@
   /* User Spec: Icons & Input Backgrounds */
   --bg-item-active: #2C2C2C;
   /* Selected state */
+  /* Beta pill — SOLID fill, Apple style. systemYellow is brighter in the dark
+     appearance and slightly deeper in light, so it is a token pair rather than
+     one hex. The foreground is near-black in both: white on yellow is roughly
+     1.6:1 and unreadable, #1C1C1E is ~12:1. */
+  --badge-beta-bg: #FFD60A;
+  --badge-beta-fg: #1C1C1E;
   --bg-row-hover: #2E2E32;
   /* Neutral hover fill for full-width list rows sitting on --bg-item-surface.
      Needed because --bg-item-active is blue-tinted in the light theme, and a
@@ -268,6 +274,8 @@
   --bg-component:      #F3F4F6;   /* Secondary button fill (gray-100)             */
   --bg-item-surface:   #EAECEF;   /* Row hover — clearly visible against canvas   */
   --bg-item-active:    rgba(37, 99, 235, 0.09); /* Blue-tinted selection (Linear/Notion style) */
+  --badge-beta-bg:     #FFCC00;   /* systemYellow (light appearance)              */
+  --badge-beta-fg:     #1C1C1E;   /* near-black — ~11:1 on the yellow             */
   --bg-row-hover:      #E1E4E8;   /* Neutral list-row hover (see dark-theme note) */
   --text-danger:       #B91C1C;   /* Destructive label — red-700 for contrast on light fills */
   --bg-toggle-switch:  #D1D5DB;   /* Toggle off-state track (gray-300)            */
@@ -2584,6 +2592,95 @@ body {
     inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }
 
+/* ── Streaming word materialization ────────────────────────────────────────
+   Each newly revealed word (see src/lib/textRevealAnimation.mjs) is wrapped
+   in a span carrying these animations plus a NEGATIVE animation-delay equal
+   to how long ago it was revealed — so the browser renders the correct frame
+   immediately and finishes on its own, even though paintRevealedNow rebuilds
+   these nodes every frame and the rAF ticker stops between tokens.
+
+   TWO animations, not one, because opacity and blur should not settle
+   together. Opacity finishes in 90ms — the word is PRESENT and legible
+   almost at once, so nothing is ever waiting to be read. Blur takes the full
+   160ms on a gentler curve, so the word sharpens after it arrives. That
+   ordering is what separates "resolving into focus" from a plain crossfade;
+   sharing one curve makes presence and sharpness land at the same instant,
+   which is correct but characterless.
+
+   Both durations MUST match WORD_OPACITY_DURATION_MS / WORD_FADE_DURATION_MS
+   in that module — the negative delay indexes into these timelines.
+
+   Deliberately opacity + blur ONLY — no transform, no display change.
+   `filter` applies to non-replaced inline elements and costs no layout, so
+   the spans can be added and removed every frame without ever reflowing the
+   text. A translateY would have needed `display: inline-block`, which alters
+   line-breaking — meaning text could shift by a pixel at the moment a word
+   settled and its span was unwrapped. */
+@keyframes reveal-word-opacity {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes reveal-word-blur {
+  from { filter: blur(2px); }
+  to   { filter: blur(0); }
+}
+
+.reveal-word {
+  animation:
+    /* Presence: strong ease-out. Emil's curve — the built-in `ease-out` is
+       too weak to read as intentional this short. */
+    reveal-word-opacity 90ms cubic-bezier(0.23, 1, 0.32, 1) forwards,
+    /* Focus: the iOS curve (Ionic's drawer easing). Eases in gently and
+       settles firmly, so the blur clears evenly across the whole window
+       instead of dumping most of its travel in the first few frames the way
+       a strong ease-out would. */
+    reveal-word-blur 160ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+  /* Guards the un-animated frame: if a span is ever created before the
+     animation applies, it must not paint at opacity 0. */
+  opacity: 1;
+}
+
+/* The trailing gist chip is excluded from the per-word walk, so it gets its
+   own single materialization — otherwise it snaps in under a paragraph that
+   arrived smoothly. Slower and softer than a word: it is a summary settling
+   into place, not text being read as it lands. */
+@keyframes reveal-gist-in {
+  from { opacity: 0; filter: blur(3px); }
+  to   { opacity: 1; filter: blur(0); }
+}
+
+.overlay-gist-chip[style*="animation-delay"] {
+  animation: reveal-gist-in 220ms cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+/* Reduced motion (WCAG 2.3.3, and Apple's own guidance): gentler, not none.
+   tickPacer's reducedMotion branch drops the whole answer in a single frame,
+   so there is no per-word timing to honour — every word would share one
+   timestamp and the block would flash as a unit. The per-word wrapping is
+   skipped in JS; what replaces it is one short opacity cross-fade on the
+   block, which is the recommended non-vestibular equivalent. Blur and
+   stagger are dropped entirely. */
+@keyframes reveal-block-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.natively-reveal-block-fade {
+  animation: reveal-block-in 140ms ease forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal-word {
+    animation: none;
+    opacity: 1;
+    filter: none;
+  }
+  .overlay-gist-chip[style*="animation-delay"] {
+    animation: reveal-block-in 140ms ease forwards;
+  }
+}
+
 /* Bottom gist chip: the trailing [[GIST]] line — five-to-eight-word
    essence, never spoken — rendered as a small summary pill under the
    answer body. */
@@ -2663,6 +2760,62 @@ body {
   position: relative;
   z-index: 50;
   cursor: default;
+}
+
+/* Container query root for the overlay chat shell.
+   Scoped to its OWN class rather than .overlay-shell-surface: that class is
+   also on the settings popup, the model-selector panel and the settings
+   overlay, and `container-type: inline-size` brings layout + style containment
+   with it (a new stacking context, a new containing block for fixed-position
+   descendants, a new BFC). Only the chat shell needs to be queryable, so only
+   the chat shell becomes a container. */
+.overlay-shell-container {
+  container-type: inline-size;
+  container-name: overlay-shell;
+}
+
+.overlay-input-placeholder-compact { display: none; }
+
+@container overlay-shell (max-width: 560px) {
+  .overlay-input-placeholder-full { display: none; }
+  .overlay-input-placeholder-compact { display: inline; }
+}
+
+/* Resize handles. The hit strips are invisible; the cursor is the entire
+   affordance, so without these rules the feature is undiscoverable. `se` gets a
+   faint corner chevron on hover — the one handle worth advertising. */
+.resize-handle {
+  -webkit-app-region: no-drag;
+  touch-action: none;
+  /* Replaces preventDefault() on pointerdown, which would have suppressed the
+     compatibility mouse events that `dblclick` (the reset gesture) needs. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+.resize-handle-e { cursor: ew-resize; }
+.resize-handle-s { cursor: ns-resize; }
+.resize-handle-se { cursor: nwse-resize; }
+
+.resize-handle-se::after {
+  content: '';
+  position: absolute;
+  /* Kept inside the 12px strip below the footer controls, which now sit above
+     the handles (z-60) — so the chevron is never painted over. */
+  right: 3px;
+  bottom: 3px;
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  border-bottom-right-radius: 3px;
+  opacity: 0;
+  transition: opacity 140ms ease;
+  pointer-events: none;
+}
+.resize-handle-se:hover::after { opacity: 0.35; }
+
+@media (prefers-reduced-motion: reduce) {
+  .resize-handle-se::after { transition: none; }
 }
 
 .drag-region {
@@ -8132,10 +8285,40 @@ html[data-platform="linux"] body {
     --toggle-inset: 2.4px; --toggle-thumb-w: 31.2px; --toggle-thumb-h: 19.2px;
     --toggle-travel: 16.8px; --toggle-grow: 2.4px;
 }
+/* `sm` is the one variant pinned by WIDTH rather than by row height, because
+   its only consumer is the quick-settings popup (SettingsPopup.tsx), a FIXED
+   180px BrowserWindow (SettingsWindowHelper.createWindow) whose rows are
+   `justify-between` icon+label / toggle. Measured in that exact 180px box in
+   the app's real inherited font (`--font-system`, i.e. SF Pro on macOS — NOT
+   Inter; the html/body/#root rule below overrides Tailwind's font-sans) at
+   500 12px: 148px of row content width, and the widest labels need 147.7px
+   ("Fast Response") and 152.4px ("Interview Mode") beside a 39.6px track — so
+   BOTH rows wrapped to two lines (48px tall instead of 30) and the track
+   itself got flex-squashed to 37.9px. Against a 30px track the worst row
+   needs 142.8px and every row stays single-line, with 5px of slack for
+   Windows' Segoe UI metrics. 30px is also what the JSX has always declared
+   (`w-[30px]`); the aspect-preserving 39.6px silently overrode it.
+
+   Values below are the canonical 88x40/4/52x32/28/4 shape scaled UNIFORMLY by
+   30/88 = 0.34091 — so unlike `lg`/`xs` (which pin height and let width grow)
+   this one matches the reference on EVERY ratio including the two that read
+   as "shape": track 2.20:1 and knob 1.63:1. Deriving it from the 18px row
+   height instead gave a 1.23:1 knob — visibly rounder than every other toggle
+   in the app. Verified side by side against `lg` at 4x. */
 .t-toggle.t-toggle-sm {
-    width: 39.6px; height: 18px;
-    --toggle-inset: 1.8px; --toggle-thumb-w: 23.4px; --toggle-thumb-h: 14.4px;
-    --toggle-travel: 12.6px; --toggle-grow: 1.8px;
+    width: 30px; height: 13.64px;
+    --toggle-inset: 1.36px; --toggle-thumb-w: 17.73px; --toggle-thumb-h: 10.91px;
+    --toggle-travel: 9.55px; --toggle-grow: 1.36px;
+}
+/* The uniform scale costs height (13.64px vs the 18px the row used to give
+   it), so restore the click target without painting anything: a transparent
+   ::after bleeding 4px past every edge makes the hit box 38x21.6. The thumb
+   is a child <span>, so this pseudo-element is free. */
+.t-toggle.t-toggle-sm::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 999px;
 }
 .t-toggle.t-toggle-xs {
     width: 35.2px; height: 16px;
@@ -8172,16 +8355,17 @@ html[data-platform="linux"] body {
 .t-toggle[data-on="true"]:not(:disabled):active .t-toggle-thumb {
     transform: translateX(calc(var(--toggle-travel) - var(--toggle-grow)));
 }
-/* Opt out of the shared fill when a panel paints its own knob. This rule
-   exists because `background`/`box-shadow` above sit AFTER `@tailwind
-   utilities` in this file, so at equal specificity they beat a `bg-black` /
-   `shadow-sm` utility on the element — a Tailwind class alone cannot recolour
-   the thumb. The quick-settings popup needs a theme-INVERTED knob (black on
-   dark), so it adds this class and supplies both properties itself. */
-.t-toggle-thumb.t-toggle-thumb-custom {
-    background: none;
-    box-shadow: none;
-}
+/* NOTE: there used to be a `.t-toggle-thumb.t-toggle-thumb-custom { background:
+   none; box-shadow: none }` opt-out here, so the quick-settings popup could
+   paint a theme-INVERTED (black-on-dark) knob via a Tailwind class. It could
+   not work, and made the popup's knobs INVISIBLE: that selector is (0,2,0)
+   and lands after `@tailwind utilities`, so it beat the caller's own
+   `.bg-black` (0,1,0) too — and `background: none` resets background-color to
+   `transparent`. Verified in a browser against the compiled stylesheet: the
+   thumb computed to `rgba(0, 0, 0, 0)`. The popup now uses the shared thumb
+   like every other toggle, which is also what the `--toggle-*` contract above
+   asks for. Do not reintroduce a per-panel knob colour with a utility class;
+   a panel that genuinely needs one must set the custom property. */
 @media (prefers-reduced-motion: reduce) {
     .t-toggle-thumb { transition: none !important; }
 }

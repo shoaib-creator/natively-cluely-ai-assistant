@@ -807,6 +807,25 @@ const ToneDropdown: React.FC<{
 // cross-meeting recall) but are NOT rendered as the primary layout. Set true to surface them.
 const SHOW_STRUCTURED_BLOCKS = false;
 
+// The labelled "Next steps" block is switched off (2026-08-24 product decision): it
+// restated the action items the notes already carry, so every set of notes and every
+// follow-up mail ended with the same list twice. The generator-side switches live in
+// electron/services/meeting/MeetingSummaryReducer.ts (INCLUDE_NEXT_STEPS),
+// FollowUpDraftGenerator.ts and post-call/PostCallWorkflow.ts — flip all four together.
+// This renderer-side one also hides the section on meetings that were ALREADY generated
+// and saved with it, which the generator-side switches cannot reach.
+const SHOW_NEXT_STEPS = false;
+
+// Matches the next-steps note section across built-in templates and user-authored
+// sections: "Next steps", "Owners and next steps", "Asks / next steps",
+// "What happens next", "Recommended next step". Mirrors isNextStepsSectionTitle()
+// in MeetingSummaryReducer.ts (duplicated, not imported — this is renderer code).
+const isNextStepsSectionTitle = (title?: string | null): boolean => {
+    const t = (title || '').trim();
+    if (!t) return false;
+    return /next\s*steps?\b/i.test(t) || /^what\s+happens\s+next\b/i.test(t);
+};
+
 // Not every "quality warning" is a real problem. A note like "Removed 1 empty,
 // duplicate, or interim transcript segment." is a benign cleanup log and should
 // read as low-key info — not an alarming amber warning. Anything about speaker
@@ -939,56 +958,6 @@ const MeetingDetails: React.FC<MeetingDetailsProps> = ({ meeting: initialMeeting
     const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
     const [speakerDraft, setSpeakerDraft] = useState('');
     const prefersReducedMotion = useReducedMotion();
-
-    // Tabs sliding — refs into the segmented control so the pill can be
-    // positioned at the active tab. The pill's `transform`/`width` are
-    // written inline by JS; CSS owns the transition. We keep the active
-    // tab in React state (`activeTab`) so this component still drives
-    // content rendering — the pill is purely visual.
-    const meetingTabsBarRef = useRef<HTMLDivElement | null>(null);
-    const meetingTabsPillRef = useRef<HTMLSpanElement | null>(null);
-    const meetingTabsBtnRefs = useRef<Record<'summary' | 'transcript' | 'usage', HTMLButtonElement | null>>({
-        summary: null,
-        transcript: null,
-        usage: null,
-    });
-    useEffect(() => {
-        const bar = meetingTabsBarRef.current;
-        const pill = meetingTabsPillRef.current;
-        if (!bar || !pill) return;
-        const tab = meetingTabsBtnRefs.current[activeTab];
-        if (!tab) return;
-        // First-paint / active-change path. On first paint the pill starts
-        // at `translateX(0) width:0`; without suspending the transition it
-        // would animate in from that origin to the active tab. Suspend the
-        // transition, write, reflow, restore — so the pill snaps into
-        // position before any animation can run. Same trick on resize so a
-        // window resize doesn't replay the slide.
-        const prev = pill.style.transition;
-        pill.style.transition = 'none';
-        pill.style.transform = `translateX(${tab.offsetLeft}px)`;
-        pill.style.width = `${tab.offsetWidth}px`;
-        // Force the layout so the suspended transition is committed before
-        // we restore it. `void el.offsetWidth` is the standard reflow probe.
-        void pill.offsetWidth;
-        pill.style.transition = prev;
-    }, [activeTab]);
-    useEffect(() => {
-        const pill = meetingTabsPillRef.current;
-        if (!pill) return;
-        const handleResize = () => {
-            const tab = meetingTabsBtnRefs.current[activeTab];
-            if (!tab) return;
-            const prev = pill.style.transition;
-            pill.style.transition = 'none';
-            pill.style.transform = `translateX(${tab.offsetLeft}px)`;
-            pill.style.width = `${tab.offsetWidth}px`;
-            void pill.offsetWidth;
-            pill.style.transition = prev;
-        };
-        window.addEventListener('resize', handleResize);
-        return () => window.removeEventListener('resize', handleResize);
-    }, [activeTab]);
 
     const copyRecipe = (text: string) => {
         navigator.clipboard?.writeText(text || '').catch(() => { /* swallow */ });
@@ -1270,17 +1239,24 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                         {/* Dark well deepened from #121214 to #0D0D0F: against the old near-black
                             surface it read as a raised container, but on the elevated grey it was
                             within ~3 levels of the page and the control lost its shape. */}
-                        <div ref={meetingTabsBarRef} className="t-tabs" role="tablist">
-                            <span ref={meetingTabsPillRef} className="t-tabs-pill" aria-hidden="true" />
-                            {(['summary', 'transcript', 'usage'] as const).map((tab) => (
+                        <div className={`p-1 rounded-xl inline-flex items-center gap-0.5 ${isLight ? 'bg-[#E5E5EA] border border-black/[0.04]' : 'bg-[#0D0D0F] border border-white/[0.08]'}`}>
+                            {['summary', 'transcript', 'usage'].map((tab) => (
                                 <button
                                     key={tab}
-                                    ref={(el) => { meetingTabsBtnRefs.current[tab] = el; }}
-                                    role="tab"
-                                    aria-selected={activeTab === tab}
-                                    onClick={() => setActiveTab(tab)}
-                                    className="t-tab"
+                                    onClick={() => setActiveTab(tab as any)}
+                                    className={`
+                                        relative px-3 py-1 text-[13px] font-medium rounded-lg transition-all duration-200 z-10
+                                        ${activeTab === tab ? (isLight ? 'text-black' : 'text-[#E9E9E9]') : `${isLight ? 'text-text-secondary' : 'text-text-tertiary'} hover:text-text-primary`}
+                                    `}
                                 >
+                                    {activeTab === tab && (
+                                        <motion.div
+                                            layoutId="activeTabBackground"
+                                            className={`absolute inset-0 rounded-lg -z-10 shadow-sm ${isLight ? 'bg-white' : 'bg-[#3A3A3C]'}`}
+                                            initial={false}
+                                            transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                                        />
+                                    )}
                                     {tab === 'summary' ? t('Summary') : tab === 'transcript' ? t('Transcript') : t('Usage')}
                                 </button>
                             ))}
@@ -1311,7 +1287,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
                                 {/* Overview - Rendered as Markdown */}
                                 {meeting.detailedSummary?.overview && (
-                                <div className="mb-6 pb-6 border-b border-border-subtle prose prose-sm max-w-none">
+                                <div className="pb-5 border-b border-border-subtle prose prose-sm max-w-none">
                                     <ReactMarkdown
                                         remarkPlugins={[remarkGfm]}
                                         components={{
@@ -1500,7 +1476,9 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     Empty sections are dropped server-side. */}
                                 {isV3Summary && meeting.detailedSummary?.sectionsV3 && meeting.detailedSummary.sectionsV3.length > 0 && (
                                     <>
-                                        {meeting.detailedSummary.sectionsV3.map((section) => (
+                                        {meeting.detailedSummary.sectionsV3
+                                            .filter(section => SHOW_NEXT_STEPS || !isNextStepsSectionTitle(section.title))
+                                            .map((section) => (
                                             <section key={section.id} className="mb-8">
                                                 <h2 className="text-lg font-semibold text-text-primary mb-4">{section.title}</h2>
                                                 <ul className="space-y-3">
@@ -1808,7 +1786,7 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     Rendered ONLY when PostCallWorkflow has produced them
                                     (schemaVersion === 2). Falls through silently otherwise so
                                     pre-Phase-7 meetings still look the same. */}
-                                {!isV3Summary && meeting.detailedSummary?.actionItemsStructured && meeting.detailedSummary.actionItemsStructured.length > 0 && (
+                                {SHOW_NEXT_STEPS && !isV3Summary && meeting.detailedSummary?.actionItemsStructured && meeting.detailedSummary.actionItemsStructured.length > 0 && (
                                     <section className="mb-8">
                                         <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Next Steps')}</h2>
                                         <ul className="space-y-2">
@@ -1831,30 +1809,12 @@ ${meeting.detailedSummary.keyPoints?.map(item => `- ${item}`).join('\n') || 'Non
                                     </section>
                                 )}
 
-                                {/* Phase 7 — Coaching insights (mode-specific opportunities). */}
-                                {meeting.detailedSummary?.coachingInsights && meeting.detailedSummary.coachingInsights.length > 0 && (
-                                    <section className="mb-8">
-                                        <h2 className="text-lg font-semibold text-text-primary mb-4">{t('Coaching')}</h2>
-                                        <ul className="space-y-3">
-                                            {meeting.detailedSummary.coachingInsights.map(insight => {
-                                                const tone = insight.severity === 'warning'
-                                                    ? 'border-amber-400/40 bg-amber-500/5'
-                                                    : insight.severity === 'opportunity'
-                                                        ? 'border-blue-400/40 bg-blue-500/5'
-                                                        : 'border-text-tertiary/30 bg-transparent';
-                                                return (
-                                                    <li key={insight.id} className={`p-3 rounded-[10px] border ${tone}`}>
-                                                        <p className="text-sm font-semibold text-text-primary">{insight.title}</p>
-                                                        <p className="text-[12.5px] text-text-secondary mt-1 leading-relaxed">{insight.detail}</p>
-                                                        {insight.evidence && (
-                                                            <p className="text-[11px] text-text-tertiary mt-1.5 italic">"{insight.evidence}"</p>
-                                                        )}
-                                                    </li>
-                                                );
-                                            })}
-                                        </ul>
-                                    </section>
-                                )}
+                                {/* The "Coaching" section was removed on 2026-08-26 (product decision);
+                                    generation is switched off at INCLUDE_COACHING_INSIGHTS in
+                                    electron/services/post-call/PostCallWorkflow.ts. The
+                                    `coachingInsights` type above is kept so already-saved notes
+                                    still parse; restore this <section> from git history if the
+                                    flag is ever flipped back on. */}
 
                                 {/* Phase 7 — Follow-up email draft (legacy V2: string). V3 renders its own above. */}
                                 {!isV3Summary && typeof meeting.detailedSummary?.followUpDraft === 'string' && meeting.detailedSummary.followUpDraft.trim() && (

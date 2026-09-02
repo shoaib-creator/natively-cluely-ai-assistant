@@ -10,6 +10,8 @@ export { FollowUpLLM } from "./FollowUpLLM";
 export { FollowUpQuestionsLLM } from "./FollowUpQuestionsLLM";
 export { RecapLLM } from "./RecapLLM";
 export { WhatToAnswerLLM } from "./WhatToAnswerLLM";
+export { composeWtaSystemPrompt, ACTIVE_SKILL_HEADING } from "./wtaSystemPrompt";
+export type { ActiveSkillLike } from "./wtaSystemPrompt";
 export { shouldThrottleTrigger } from "./triggerGate";
 export type { TriggerGateInput } from "./triggerGate";
 export { clampResponse, validateResponse, reduceDashes, reduceDashesInChunk, StreamingDashReducer } from "./postProcessor";
@@ -43,7 +45,8 @@ export type { PlannerDecision, PlannerDecisionKind, PlannerInput } from "./Plann
 export { planAnswer, formatAnswerPlanForPrompt, isCodingAnswerType, shouldScaffold, isStealthEvasionQuestion, isJdFactualLookupNotNegotiationAdvice } from "./AnswerPlanner";
 export { detectAnswerStyle, styleSuppressesScaffold } from "./answerStyle";
 export type { AnswerStyle, AnswerStyleResult } from "./answerStyle";
-export { detectExplicitCodingContract, isCodingContinuation, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode } from "./codingFollowup";
+export { detectExplicitCodingContract, isCodingContinuation, isBareCodeRequest, looksLikeCodingAnswer, buildPriorCodingContextBlock, buildCodingContractPrompt, explicitContractProducesCode } from "./codingFollowup";
+export { resolveCodingPromptSignals, detectSuppliedCodeTemplate, codingTaskKindFor, isBuildTask, isDeicticAsk, type CodingPromptSignals, type CodingTaskKind } from "./codingPromptSignals";
 export type { ExplicitCodingContract, PriorCodingTurn } from "./codingFollowup";
 export { shouldHumanize, shouldHumanizeOutput, detectCorporateFiller, humanizeDirectiveFor, HUMANIZE_DIRECTIVE, humanizeSpokenAnswer, humanizeForAnswerType } from "./humanLikeness";
 export type { CorporateFillerVerdict } from "./humanLikeness";
@@ -112,10 +115,12 @@ export {
   LIVE_PROVIDER_FIRST_USEFUL_COMPLEX_TIMEOUT_MS, LIVE_TOTAL_HARD_TIMEOUT_MS,
   LIVE_LOCAL_FIRST_USEFUL_TIMEOUT_MS, LIVE_LOCAL_TOTAL_HARD_TIMEOUT_MS,
   LIVE_INTER_TOKEN_STALL_MS, BENCHMARK_PER_QUESTION_HARD_TIMEOUT_MS,
-  MAX_STREAM_OUTPUT_CHARS,
+  MAX_STREAM_OUTPUT_CHARS, MAX_SUMMARY_OUTPUT_CHARS,
+  CODING_REGEN_ABORT_CHARS,
+  isCompleteShortAnswer,
 } from "./liveDeadlines";
 export type { FollowUpContext, ResolvedFollowUp, FollowUpSurface } from "./FollowUpResolver";
-export { renderCodingAnswerMarkdown, repairCodingAnswer, repairCodingMarkdown, validateAnswerStructure, validateCodingMarkdown, buildCodingScaffold, detectAndExtractScaffoldMisfire, hasUnrecoveredScaffoldContamination } from "./AnswerValidator";
+export { renderCodingAnswerMarkdown, repairCodingAnswer, repairCodingMarkdown, validateAnswerStructure, validateCodingMarkdown, buildCodingScaffold, detectAndExtractScaffoldMisfire, hasUnrecoveredScaffoldContamination, hasStrictCodingScaffoldSignal, isScaffoldRegenerationEligible } from "./AnswerValidator";
 export type { AnswerValidationResult, CodingAnswer } from "./AnswerValidator";
 export { validateProfileOutput, buildProfileRepairInstruction, stripProfileTokensFromCoding, sanitizeCandidateAnswer, CANDIDATE_VOICE_ANSWER_TYPES, detectAssistantVoiceMisfire, ASSISTANT_VOICE_ANSWER_TYPES } from "./ProfileOutputValidator";
 export type { ProfileValidationResult, ProfileViolation, ProfileViolationCode, ProfileValidationInput, CandidateSanitizeResult, AssistantVoiceSanitizeResult } from "./ProfileOutputValidator";

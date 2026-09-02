@@ -273,7 +273,22 @@ import {
   splitStreamingCodeLines,
 } from '../lib/overlayStreamingCodeUi.mjs';
 import { widthDerivedScrollMax, verticalScrollCap } from '../lib/overlayScrollBudget.mjs';
-import { resolveChatStreamToken, resolveChatStreamDone, resolveLiveAnswerBatch } from '../lib/chatStreamGuard.mjs';
+import {
+  OVERLAY_DEFAULT_WINDOW_WIDTH,
+  readCustomOverlaySize,
+  writeCustomOverlaySize,
+  clearCustomOverlaySize,
+  maxWindowWidthFor,
+  maxWindowHeightFor,
+  collapsedWidthFor,
+  pinsHeightFor,
+  minWindowHeightFor,
+  OVERLAY_MIN_WINDOW_HEIGHT,
+  computeResizeFrame,
+  type OverlayResizeDirection,
+} from '../lib/overlayCustomSize.mjs';
+import { resolveChatStreamToken, resolveChatStreamDone, resolveLiveAnswerBatch, resolveChatStreamSurfaceError } from '../lib/chatStreamGuard.mjs';
+import { buildDirectWhatToSayPayload } from '../lib/directAssistWhatToSayPayload.mjs';
 import {
   applyFirstStreamingToken,
   commitStreamingFlush,
@@ -287,6 +302,19 @@ import {
   INITIAL_BUFFER_MS,
   STREAM_RENDER_CONFIG,
 } from '../lib/textRevealPacing.mjs';
+import {
+  createRevealHistory,
+  resetRevealHistory,
+  pushRevealSample,
+  revealTimeForIndex,
+  animatedTailStart,
+  remainingFadeMs,
+  splitIntoWordRuns,
+  GIST_CHIP_FADE_MS,
+  WORD_FADE_DURATION_MS,
+  MAX_ANIMATED_WORDS,
+  REVEAL_WORD_CLASS,
+} from '../lib/textRevealAnimation.mjs';
 import SyntaxHighlighter from 'react-syntax-highlighter/dist/esm/prism-light';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { vividDarkCodeTheme, VIVID_DARK_LINE_NUMBER_COLOR } from '../lib/codeTheme';
@@ -387,8 +415,23 @@ interface Message {
   isStreaming?: boolean;
   hasScreenshot?: boolean;
   screenshotPreview?: string;
+  // Every attached screenshot's data-URL preview (screenshotPreview is the first
+  // one, kept for messages created before this field existed). The chat card
+  // renders these as thumbnails; without them a screenshot question showed only
+  // a "Screenshot attached" text label and the user never saw what was sent.
+  screenshotPreviews?: string[];
   // Synthetic user-role label pushed before a hotkey/button answer (e.g. "Recap") — excluded from LLM conversation-context building, same as a screenshot-question card.
   isQuickActionLabel?: boolean;
+  // Captured browser page context consumed by THIS question (title/url from the
+  // extension's capture meta). Renders a "Page attached · host — title" line on
+  // the card, mirroring the "Screenshot attached" label — without it the pill
+  // vanishes on use and nothing in the chat shows which page fed the answer.
+  pageContext?: { title?: string; url?: string };
+  // Field names Direct Assist dropped to fit the model's context window (e.g.
+  // "referenceContext", "meetingTranscript") — never user content, just the
+  // name. Renders a small "context trimmed" notice on the question card so an
+  // incomplete-seeming answer isn't a silent mystery.
+  trimmedFields?: string[];
   isCode?: boolean;
   intent?: string;
   // Verified code execution: set when the code in this message passed N executed
@@ -409,6 +452,48 @@ interface Message {
     currency: string;
   };
 }
+
+type DirectAssistSource = 'typed' | 'stt' | 'screenshot';
+
+interface DirectAssistHistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+interface ActiveDirectAssistRequest {
+  requestId: string;
+  source: DirectAssistSource;
+  currentRequest: string;
+  placeholderId: string;
+  /** The user-role question card this request answers, so a 'start' event's
+   *  trimmedFields can be stamped onto the right card. */
+  userMessageId?: string;
+  lastSequence: number;
+  answerText: string;
+  completed?: boolean;
+}
+
+type DirectAssistRendererEvent =
+  | { type: 'start'; requestId: string; provider: string; model: string; trimmedFields: string[] }
+  | { type: 'delta'; requestId: string; sequence: number; text: string }
+  | { type: 'done'; requestId: string; sequence: number; provider: string; model: string; fullText?: string }
+  | { type: 'error'; requestId: string; sequence: number; error: { code: string; message: string; retryable: boolean } }
+  | { type: 'cancel'; requestId: string; sequence: number };
+
+const createDirectAssistRequestId = (): string => {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `direct-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
+
+const directAssistSkillId = (request: string): string | undefined => {
+  const match = request.match(/^\s*[/$]([a-z0-9][a-z0-9_-]*)(?=\s|$)/i);
+  return match?.[1];
+};
+
+const directAssistErrorText = (code: string, message: string): string =>
+  `❌ ${code}: ${message}`;
 
 interface NativelyInterfaceProps {
   onEndMeeting?: () => void;
@@ -825,6 +910,20 @@ const hostnameFromUrl = (url?: string): string | undefined => {
   }
 };
 
+// Human-readable label for a Direct Assist trimmedFields entry (a field name
+// from requestBuilder.ts). Falls back to the raw name for a field this map
+// hasn't been updated for, rather than rendering nothing.
+const DIRECT_ASSIST_TRIMMED_FIELD_LABELS: Record<string, string> = {
+  transcript: 'spoken text',
+  meetingTranscript: 'recent transcript',
+  history: 'conversation history',
+  referenceContext: 'reference files',
+  pageContext: 'screen content',
+  manualContext: 'manual notes',
+};
+const directAssistTrimmedFieldLabel = (field: string): string =>
+  DIRECT_ASSIST_TRIMMED_FIELD_LABELS[field] ?? field;
+
 // Smart Browser Context v2 — category-specific chip label. Falls back to the
 // host + "page ready" for legacy plain-string captures (no envelope category).
 const CATEGORY_CHIP_LABEL: Record<string, string> = {
@@ -873,6 +972,8 @@ const MessageRow = React.memo(
     renderMessageText,
   }: MessageRowProps) {
     const t = useT();
+    // Which attached screenshot (if any) is currently enlarged in this card.
+    const [expandedPreview, setExpandedPreview] = React.useState<number | null>(null);
     const isCodeMsg = msg.role === 'system' && (msg.isCode || msg.text.includes('```'));
     // bubbleMaxClass: user bubbles are tighter; system + code use the same width.
     const bubbleMaxClass =
@@ -923,12 +1024,96 @@ const MessageRow = React.memo(
               </div>
             )}
             {msg.role === 'user' && msg.hasScreenshot && (
-              <div
-                className={`flex items-center gap-1 text-[10px] opacity-70 mb-1 border-b pb-1 ${isLightTheme ? 'border-black/10' : 'border-white/10'}`}
-              >
-                <Image className="w-2.5 h-2.5" />
-                <span>{t('Screenshot attached')}</span>
-              </div>
+              /* Render the actual screenshots, not just a text label. Until
+                 2026-08-18 this card printed "Screenshot attached" and nothing
+                 else, so the user could never see what was actually sent with
+                 the question. `screenshotPreviews` carries every attachment;
+                 `screenshotPreview` is the pre-existing single-image field and
+                 is the fallback for messages created before that field. */
+              (() => {
+                const previews =
+                  msg.screenshotPreviews && msg.screenshotPreviews.length > 0
+                    ? msg.screenshotPreviews
+                    : msg.screenshotPreview
+                    ? [msg.screenshotPreview]
+                    : [];
+                if (previews.length === 0) {
+                  // Legacy/preview-less message: keep the old text affordance
+                  // rather than showing an empty frame.
+                  return (
+                    <div
+                      className={`flex items-center gap-1 text-[10px] opacity-70 mb-1 border-b pb-1 ${isLightTheme ? 'border-black/10' : 'border-white/10'}`}
+                    >
+                      <Image className="w-2.5 h-2.5" />
+                      <span>{t('Screenshot attached')}</span>
+                    </div>
+                  );
+                }
+                const single = previews.length === 1;
+                const frameClass = `relative overflow-hidden rounded-[14px] border ${
+                  isLightTheme ? 'border-black/10 bg-black/[0.03]' : 'border-white/15 bg-white/[0.06]'
+                }`;
+                return (
+                  <div
+                    className={`mb-2 grid gap-1.5 ${single ? 'grid-cols-1' : 'grid-cols-2'}`}
+                  >
+                    {previews.map((src, idx) => {
+                      const isOpen = expandedPreview === idx;
+                      return (
+                        <button
+                          key={`${msg.id}-shot-${idx}`}
+                          type="button"
+                          onClick={() => setExpandedPreview(isOpen ? null : idx)}
+                          title={isOpen ? t('Shrink') : t('Enlarge')}
+                          className={`${frameClass} ${
+                            isOpen ? 'col-span-full' : ''
+                          } block w-full p-0 transition-transform duration-200 hover:scale-[1.01] active:scale-[0.99] focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-400/60`}
+                          /* Fixed frame height keeps the bubble's layout (and the
+                             overlay's measured content height) stable while the
+                             data-URL decodes — a bare auto-height <img> would
+                             reflow the whole panel on load. */
+                          style={{ height: isOpen ? 240 : single ? 132 : 74 }}
+                        >
+                          <img
+                            src={src}
+                            alt={t('Attached screenshot')}
+                            draggable={false}
+                            className={`h-full w-full ${isOpen ? 'object-contain' : 'object-cover'} ${
+                              isOpen ? '' : 'object-top'
+                            }`}
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()
+            )}
+            {/* Captured page context consumed by this question — the "Screenshot
+                attached" equivalent for browser captures (⌘/Ctrl+Shift+Y or
+                auto-attach). Shows host — title so the user can see WHICH page
+                fed the answer; the transient status pill vanished on use. */}
+            {msg.role === 'user' && msg.pageContext && (
+              (() => {
+                const host = hostnameFromUrl(msg.pageContext.url);
+                const title = msg.pageContext.title?.trim();
+                const label =
+                  host && title && title !== host
+                    ? `${host} — ${title}`
+                    : title || host || '';
+                return (
+                  <div
+                    className={`flex items-center gap-1 text-[10px] opacity-70 mb-1 border-b pb-1 ${isLightTheme ? 'border-black/10' : 'border-white/10'}`}
+                    title={msg.pageContext.url || title}
+                  >
+                    <Globe className="w-2.5 h-2.5 flex-shrink-0" />
+                    <span className="truncate max-w-[260px]">
+                      {t('Page attached')}
+                      {label ? ` · ${label}` : ''}
+                    </span>
+                  </div>
+                );
+              })()
             )}
             {/* Correction header: this message fixes an earlier wrong answer. */}
             {msg.role === 'system' && msg.isCorrection && (
@@ -938,6 +1123,22 @@ const MessageRow = React.memo(
               </div>
             )}
             {renderMessageText(msg)}
+            {/* Direct Assist dropped one or more context fields to fit the
+                model's context window (see requestBuilder's per-source drop
+                order) — surfaced so a thin-looking answer isn't a silent
+                mystery. Field names only, never the dropped content. */}
+            {msg.role === 'user' && msg.trimmedFields && msg.trimmedFields.length > 0 && (
+              <div className="flex items-center gap-1 mt-1.5 text-[10px] opacity-60">
+                <HelpCircle className="w-2.5 h-2.5 flex-shrink-0" />
+                <span className="truncate max-w-[260px]">
+                  {t('Context trimmed')}
+                  {' · '}
+                  {msg.trimmedFields.map((field) => t(directAssistTrimmedFieldLabel(field))).join(', ')}
+                  {' '}
+                  {t('omitted (over context limit)')}
+                </span>
+              </div>
+            )}
             {/* Verified badge: the code in this message passed executed tests. */}
             {msg.role === 'system' && msg.codeVerified && (
               <div className="flex items-center gap-1 mt-1.5 text-[10px] font-medium text-green-500" title={`Ran ${msg.codeVerified.total} test case(s) successfully`}>
@@ -1030,10 +1231,32 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     missing?: string[];
   } | null>(null);
 
+  // Why the last Cmd/Ctrl+Shift+Y page capture fell back to a screenshot
+  // (extension not connected, site not granted, timeout, …). Surfaced as a
+  // warn-tone status pill — previously the fallback was silent and the hotkey
+  // looked broken ("Screenshot attached" with no explanation, 2026-08-18).
+  const [captureFallback, setCaptureFallback] = useState<
+    import('../types/electron').PageCaptureFallbackNotice & { at: number } | null
+  >(null);
+
   // The structured capture (Smart Browser Context v2) that arrived with the last
   // page context, if any. Held in a ref so it survives re-renders and is consumed
   // once (cleared) when the answer request reads it.
   const capturedEnvelopeRef = useRef<import('../types/electron').ContextEnvelope | null>(null);
+
+  // Title/URL of the last capture (from the extension's DomCaptureMeta). A ref,
+  // not state: handleWhatToSay reads it right after the auto-context await, when
+  // a setPageContext from the IPC listener may not have flushed yet. Consumed
+  // (and cleared) together with capturedEnvelopeRef to stamp the question card's
+  // "Page attached" line.
+  const capturedMetaRef = useRef<{ title?: string; url?: string } | null>(null);
+
+  // Timestamp of a ⌘/Ctrl+Y capture currently IN FLIGHT (main announced it,
+  // delivery hasn't arrived yet). The one-motion flow — hold ⌘, tap Y then
+  // Enter — would otherwise race: handleWhatToSay reads lastCapturedDOM
+  // synchronously and the /dom POST can land a beat later. Cleared on
+  // delivery (onDomContextReceived) and on the screenshot-fallback notice.
+  const pendingPageCaptureAtRef = useRef<number | null>(null);
 
   // Multi-tab picker: when the user wants to choose which browser tab to capture
   // (e.g. the auto-pick grabbed the wrong one), we ask the extension for its open
@@ -1167,7 +1390,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // Stash the structured envelope (Smart Browser Context v2) so handleWhatToSay
         // can thread it into the answer request alongside the legacy domContext string.
         capturedEnvelopeRef.current = envelope ?? null;
+        capturedMetaRef.current = meta?.title || meta?.url ? { title: meta?.title, url: meta?.url } : null;
+        pendingPageCaptureAtRef.current = null;
         if (typeof dom === 'string' && dom.trim().length > 0) {
+          // A page context arrived — retire any stale "fell back to screenshot"
+          // notice so the pills can't contradict each other.
+          setCaptureFallback(null);
           setPageContext({
             title: meta?.title?.trim() || hostnameFromUrl(meta?.url) || 'Captured page',
             url: meta?.url,
@@ -1192,6 +1420,42 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       }
     };
   }, []);
+
+  // Page capture → screenshot fallback notices from main (Cmd/Ctrl+Shift+Y).
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    try {
+      unsub = window.electronAPI?.onPageCaptureFallback?.((notice) => {
+        if (!notice || typeof notice.label !== 'string') return;
+        pendingPageCaptureAtRef.current = null;
+        setCaptureFallback({ ...notice, at: Date.now() });
+      });
+    } catch (e) {
+      console.warn('[PageCapture] Failed to register onPageCaptureFallback listener:', e);
+    }
+    return () => {
+      try { unsub?.(); } catch (_) {}
+    };
+  }, []);
+
+  // Track in-flight ⌘/Ctrl+Y captures (see pendingPageCaptureAtRef).
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    try {
+      unsub = window.electronAPI?.onPageCaptureStarted?.(() => {
+        pendingPageCaptureAtRef.current = Date.now();
+      });
+    } catch (_) { /* older preload without the channel */ }
+    return () => { try { unsub?.(); } catch (_) {} };
+  }, []);
+
+  // Auto-expire the fallback notice — it explains a one-off event, so it should
+  // not linger like the page-context pill (which arms the next answer).
+  useEffect(() => {
+    if (!captureFallback) return;
+    const timer = setTimeout(() => setCaptureFallback(null), 20_000);
+    return () => clearTimeout(timer);
+  }, [captureFallback]);
 
   // Auto-expire the captured page-context pill if it's never consumed. The DOM
   // itself is cleared on use (handleWhatToSay) or dismiss; this just stops the
@@ -1449,6 +1713,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // freeze height reporting. A deadline lapses on its own. Set to 0 to release
   // immediately (session reset).
   const heightReportSuppressedUntilRef = useRef(0);
+  // True for the duration of a user resize drag. Declared up here because the
+  // ResizeObserver (above the drag handler) gates its height reporting on it.
+  const isResizingRef = useRef(false);
   // ── Streaming-height headroom-buffer state ────────────────────────────
   // See STREAMING_HEIGHT_GROW_BUFFER_PX's comment near the top of this file
   // for the full rationale (an earlier springed/interpolated version of this
@@ -1501,6 +1768,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
   // Settings State with Persistence
   const [isUndetectable, setIsUndetectable] = useState(false);
+  // Direct Assist is a persisted SettingsManager flag (default OFF, with a
+  // main-process kill switch). It is deliberately not mirrored to localStorage:
+  // every renderer must observe the same effective value the backend enforces.
+  const [directAssistEnabled, setDirectAssistEnabled] = useState(false);
   const [hideChatHidesWidget, setHideChatHidesWidget] = useState(() => {
     const stored = localStorage.getItem('natively_hideChatHidesWidget');
     return stored ? stored === 'true' : true;
@@ -1632,6 +1903,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     });
     return () => unsubscribe();
   }, [refreshCurrentModel]);
+
+  useEffect(() => {
+    let mounted = true;
+    window.electronAPI?.getDirectAssistEnabled?.()
+      .then((enabled) => {
+        if (mounted) setDirectAssistEnabled(enabled === true);
+      })
+      .catch(() => {
+        if (mounted) setDirectAssistEnabled(false);
+      });
+    const unsubscribe = window.electronAPI?.onDirectAssistEnabledChanged?.((enabled) => {
+      if (mounted) setDirectAssistEnabled(enabled === true);
+    });
+    return () => {
+      mounted = false;
+      unsubscribe?.();
+    };
+  }, []);
 
   // Dynamic Action Button Mode (Recap vs Brainstorm)
   const [actionButtonMode, setActionButtonMode] = useState<'recap' | 'brainstorm'>('recap');
@@ -1888,15 +2177,79 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // on every frame (correct at every in-between width — no clip/scale/transform).
   // Only HEIGHT flows to the OS, via the ResizeObserver / reportShellSize (and
   // a rate-limited channel during the tween).
-  const SHELL_WIDTH_COLLAPSED = 600;
-  const SHELL_WIDTH_EXPANDED = 732;
-  // The OS overlay window's FIXED width. MUST equal
-  // WindowHelper.OVERLAY_DEFAULT_WIDTH (the window's birth width — the
-  // startup-slide invariant) and SHELL_WIDTH_EXPANDED (the panel fills the
-  // window edge-to-edge when expanded; the old 780 gutter existed only for
-  // the resize toggle, which now has its own aux window).
+  // The user's persisted overlay size, read ONCE via a lazy initialiser — this
+  // component re-renders on every streaming token, so a bare localStorage read
+  // in the body would run thousands of times per answer for a value only the
+  // mount uses.
+  const [restoredOverlaySize] = useState(() =>
+    readCustomOverlaySize(typeof window !== 'undefined' ? window.localStorage : null),
+  );
+  // ── Overlay window size ───────────────────────────────────────────────────
+  // The OS window's width used to be a compile-time constant (732). It is now a
+  // value the USER can change by dragging a resize handle — but it is still
+  // FIXED for the entire lifetime of an expand/collapse spring, so there is
+  // still no width setBounds during an animation (the flicker that the old
+  // fixed-width design existed to prevent).
+  //
+  // Critically, this is the SINGLE SOURCE OF TRUTH: the three consumers that
+  // derive geometry from the window width — the toggle aux window's anchor
+  // (sendOverlayToggleAnchor below), the settings/model popover margin
+  // (WindowHelper.getOverlayPanelLeftMargin) and the click-through hover gate —
+  // all read it, so they cannot disagree about how wide the window is.
+  // See src/lib/overlayCustomSize.mjs for the full rationale.
+  // Two different numbers, previously conflated into one:
+  //   customWindowWidth  — what the USER pinned. Persisted. Drives the REQUEST.
+  //   appliedWindowWidth — what the main process actually granted after its
+  //                        floor(workArea * 0.9) clamp. Session-only. Drives
+  //                        every geometry consumer, so the panel never renders
+  //                        wider than the window it lives in.
+  // Collapsing them made a clamp sticky: on a display too small for the 732
+  // default the clamped value became the renderer's "custom" width and was
+  // re-requested verbatim forever, so moving to a larger display never restored
+  // the default.
+  const [customWindowWidth, setCustomWindowWidth] = useState<number | null>(
+    restoredOverlaySize.width,
+  );
+  const [appliedWindowWidth, setAppliedWindowWidth] = useState<number | null>(null);
+  // The pinned window HEIGHT is a ref, not state: nothing RENDERS from it (the
+  // scroll budget flows through the `verticalCap` motion value, and the size
+  // reporters read it imperatively), so holding it in state would only add a
+  // re-render of this whole component on every frame of a height drag.
+  const customOverlayHeightRef = useRef<number | null>(restoredOverlaySize.height);
+
+  // The panel fills the window when expanded; the collapsed width scales with
+  // it. collapsedWidthFor(732) === 600 exactly, so with no custom size these
+  // are bit-identical to the constants they replace. Recomputed per render like
+  // the old literals were — every dependency array that listed the literals
+  // already lists these, so no memoisation is needed or wanted.
+  // What we ASK the OS for — the user's pin, else the default. Never the
+  // clamped result, or a clamp would latch permanently.
+  const REQUESTED_WINDOW_WIDTH = customWindowWidth ?? OVERLAY_DEFAULT_WINDOW_WIDTH;
+  // What the window actually IS. All panel/anchor/hover-gate geometry uses this.
+  const SHELL_WIDTH_EXPANDED = appliedWindowWidth ?? REQUESTED_WINDOW_WIDTH;
+  const SHELL_WIDTH_COLLAPSED = collapsedWidthFor(SHELL_WIDTH_EXPANDED);
+  // The OS overlay window's width. Equals SHELL_WIDTH_EXPANDED always (the
+  // panel fills the window edge-to-edge when expanded), and at its default
+  // equals WindowHelper.OVERLAY_DEFAULT_WIDTH (the window's birth width — the
+  // startup-slide invariant).
   const OVERLAY_WINDOW_WIDTH = SHELL_WIDTH_EXPANDED;
-  const shellWidth = useMotionValue(SHELL_WIDTH_COLLAPSED);
+  // Latest-value ref for the two long-lived subscriptions below (the toggle
+  // anchor stream and the hover gate). They must read the LIVE window width but
+  // must NOT re-subscribe when it changes: a drag updates it ~30x/second, and
+  // depending on it would tear down and rebuild both subscriptions every frame
+  // — re-sending the hover-gate handshake IPC each time.
+  const overlayWindowWidthRef = useRef(OVERLAY_WINDOW_WIDTH);
+  overlayWindowWidthRef.current = OVERLAY_WINDOW_WIDTH;
+  // The size reporters ask for this, not for the effective width.
+  const requestedWindowWidthRef = useRef(REQUESTED_WINDOW_WIDTH);
+  requestedWindowWidthRef.current = REQUESTED_WINDOW_WIDTH;
+  // The PANEL always starts COLLAPSED. A restored custom size sizes the
+  // WINDOW, not the panel's expand state — seeding the panel with the window
+  // width would boot it visually expanded while codeExpandedRef and
+  // isShellWide both still read "collapsed".
+  const shellWidth = useMotionValue(
+    collapsedWidthFor(restoredOverlaySize.width ?? OVERLAY_DEFAULT_WINDOW_WIDTH),
+  );
   // Vertical budget cap for the chat scroll area. Default Infinity = "not yet
   // measured / unbounded", so the width-derived aesthetic max applies until we
   // know the display height. measureVerticalCap (below) sets the real value:
@@ -1905,6 +2258,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // ≤ the budget the OS window will be granted, so the footer (model selector /
   // settings / send) can never be cropped below the clamped window edge.
   const verticalCap = useMotionValue(Infinity);
+  // 1 while the user has pinned a window height. widthDerivedScrollMax tops out
+  // at 560, and the shell is an auto-height column, so with the width bound
+  // still applied the PANEL could never exceed chrome+560 however tall the
+  // WINDOW was told to be — leaving a tall transparent strip below the panel
+  // that still swallowed clicks (the hover gate tests clientX only). When a
+  // height is pinned, the measured cap is the only bound that should apply.
+  const heightIsPinned = useMotionValue(0);
   // scrollMaxH is the chat viewport's MAX-HEIGHT, derived from the LIVE
   // `shellWidth` motion value (the panel's actual animating width) mins'd against
   // the measured vertical budget cap. Binding it to the live width means the
@@ -1912,16 +2272,24 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // spring runs (widthDerivedScrollMax: 320px collapsed → 560px expanded), so the
   // visible chat region tracks the panel size frame-for-frame. This is a motion
   // value bound to a style, so it updates without a React re-render.
-  const scrollMaxH = useTransform([shellWidth, verticalCap], ([w, cap]: number[]) =>
-    // Pass the real collapsed/expanded panel widths so the 320→560 scroll-height
-    // ramp reaches its max at the actual expanded width (732), not the default 780.
-    Math.min(
-      widthDerivedScrollMax(w, {
-        collapsedWidth: SHELL_WIDTH_COLLAPSED,
-        expandedWidth: SHELL_WIDTH_EXPANDED,
-      }),
-      cap,
-    ),
+  // A user-pinned window height does NOT get its own branch here: it is folded
+  // into `verticalCap` by measureVerticalCap, which already knows the measured
+  // chrome height. That keeps one code path, reuses the tested
+  // verticalScrollCap helper instead of an ad-hoc `height - 160`, and — because
+  // verticalCap is a motion value — makes a pure-height drag (the `s` handle,
+  // which never changes shellWidth) actually recompute the scroll budget.
+  const scrollMaxH = useTransform(
+    [shellWidth, verticalCap, heightIsPinned],
+    ([w, cap, pinned]: number[]) =>
+      pinned
+        ? cap
+        : Math.min(
+            widthDerivedScrollMax(w, {
+              collapsedWidth: SHELL_WIDTH_COLLAPSED,
+              expandedWidth: SHELL_WIDTH_EXPANDED,
+            }),
+            cap,
+          ),
   );
   // NOTE: the resize toggle and the TopPill no longer render in this window at
   // all — each lives in its OWN tiny BrowserWindow (see
@@ -2174,6 +2542,53 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     streamingHeightCommittedRef.current = height;
   }, []);
 
+  // measureVerticalCap is declared below (it needs reportShellSize's neighbours);
+  // adoptAppliedSize has to reach it without listing it as a dependency.
+  const measureVerticalCapRef = useRef<(() => void) | null>(null);
+
+  // Adopt the size the main process ACTUALLY applied.
+  //
+  // This runs on EVERY report, not only at the end of a drag. The restore path
+  // is the case that matters: a width persisted on a 1920px external monitor is
+  // re-applied on a 1366px laptop, where the main process clamps it to
+  // floor(1366*0.9). If the renderer kept the requested width, the panel would
+  // render wider than its window and be clipped, the toggle anchor would stream
+  // (requested + panelW)/2 while getOverlayPanelLeftMargin measures the REAL
+  // width, and the two would disagree by exactly the offset that method exists
+  // to prevent. Converges in one extra round-trip: adopting re-reports the
+  // clamped value, which main applies verbatim and echoes back unchanged.
+  const adoptAppliedSize = useCallback((applied?: { width: number; height: number }) => {
+    if (!applied) return;
+    const { width, height } = applied;
+    if (typeof width === 'number' && width > 0 && width !== overlayWindowWidthRef.current) {
+      // The PANEL has to move with the window. Leaving shellWidth alone let a
+      // width restored from a bigger display sit wider than the window it was
+      // clamped into: the hover gate then computes a NEGATIVE margin and
+      // reports the whole window interactive, and the streamed panelRight
+      // points past the window's own right edge. Setting it is also the only
+      // thing that re-anchors the toggle and popover windows at all — that
+      // stream fires from shellWidth's 'change', nothing else.
+      const wasExpanded = shellWidth.get() >= overlayWindowWidthRef.current - 1;
+      // Written before the state update so the toggle-anchor stream and the
+      // hover gate — both of which read this ref — are correct immediately,
+      // not one render late.
+      overlayWindowWidthRef.current = width;
+      setAppliedWindowWidth(width);
+      shellWidth.set(wasExpanded ? width : collapsedWidthFor(width));
+    }
+    // Only reconcile the height when the user actually pinned one; otherwise
+    // the window is content-sized and there is nothing to hold.
+    if (
+      typeof height === 'number' &&
+      height > 0 &&
+      customOverlayHeightRef.current !== null &&
+      height !== customOverlayHeightRef.current
+    ) {
+      customOverlayHeightRef.current = height;
+      measureVerticalCapRef.current?.();
+    }
+  }, [shellWidth]);
+
   // Single canonical size-reporter. Width is ALWAYS the fixed
   // OVERLAY_WINDOW_WIDTH (the OS window never width-resizes — the CSS panel
   // animates inside it), so this is effectively a height-only reporter;
@@ -2200,6 +2615,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // window to re-rasterize in the background. Re-enabled the moment
     // isExpanded flips back to true.
     if (!isExpandedRef.current) return;
+    // A user resize drag owns the size channel for its duration: it reports at
+    // its own ~30fps cadence. Without this guard, every setCustomWindowWidth
+    // during the drag changes this callback's identity, re-runs the sizing
+    // effect, and fires a SECOND rAF-scheduled report per frame against the
+    // same window.
+    if (isResizingRef.current) return;
     // offsetHeight is the LAYOUT (untransformed) border-box height. We must NOT
     // use getBoundingClientRect().height here: that returns the POST-transform
     // box, so the shell's scale 0.95→1 / y 20→0 entry animation would feed a
@@ -2208,12 +2629,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // clock — the startup shake. Layout height is immune to descendant
     // transforms, so genuine content growth still flows through while the
     // entry flourish stays purely compositor-side.
-    // The OS window is a FIXED WIDTH (OVERLAY_WINDOW_WIDTH = 732) and never
-    // width-resizes — ALWAYS report that fixed width, never the live
-    // in-between CSS shell width. setOverlayDimensionsAnchored therefore sees
-    // widthDelta 0 on every call: a pure height-only, top-anchored resize.
-    const width = OVERLAY_WINDOW_WIDTH;
-    const height = contentRef.current.offsetHeight;
+    // The WINDOW width — never the live CSS panel width. The panel tweens
+    // inside the window; reporting its in-between width would push a native
+    // width setBounds on every frame of the spring (re-rastering a transparent
+    // blurred window) and would desynchronise the toggle anchor, the popover
+    // margin and the hover gate, all of which are computed against the window.
+    const width = requestedWindowWidthRef.current;
+    // A user-pinned height wins over measured content: the chat scrolls inside
+    // the chosen size rather than growing the window (measureVerticalCap has
+    // already bounded the scroll area to match).
+    const height = customOverlayHeightRef.current || contentRef.current.offsetHeight;
     if (process.env.NODE_ENV === 'development') {
       const scrollEl = scrollContainerRef.current;
       console.log('[overlay-resize] reportShellSize', {
@@ -2225,14 +2650,22 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         screenAvailHeight: window.screen?.availHeight,
       });
     }
-    const api = window.electronAPI as any;
-    if (api?.updateContentDimensionsCentered) {
-      api.updateContentDimensionsCentered({ width, height });
+    if (window.electronAPI?.updateContentDimensionsCentered) {
+      void window.electronAPI
+        .updateContentDimensionsCentered({ width, height })
+        .then(adoptAppliedSize)
+        .catch(() => {
+          /* window gone; nothing to reconcile against */
+        });
     } else {
-      window.electronAPI?.updateContentDimensions({ width, height });
+      void window.electronAPI?.updateContentDimensions({ width, height });
     }
     syncStreamingHeightBaseline(height);
-  }, [attachedContext.length, OVERLAY_WINDOW_WIDTH, syncStreamingHeightBaseline]);
+    // Deliberately NOT dependent on OVERLAY_WINDOW_WIDTH — it reads the ref. A
+    // drag changes that width ~30x/second, and depending on it would give this
+    // callback a new identity every frame, tearing down and rebuilding the
+    // ResizeObserver (and every effect keyed on it) each time.
+  }, [attachedContext.length, syncStreamingHeightBaseline, adoptAppliedSize]);
 
   // Compute the vertical budget cap for the chat scroll area and push it into
   // the `verticalCap` motion value (which scrollMaxH mins against the
@@ -2257,7 +2690,20 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     }
     const availHeight = typeof window !== 'undefined' ? window.screen?.availHeight ?? 0 : 0;
     const chromeHeight = contentEl.offsetHeight - scrollEl.clientHeight;
-    const nextCap = verticalScrollCap({ availHeight, chromeHeight });
+    // When the user has pinned a window height, THAT is the vertical budget —
+    // not workArea*0.9. Passing budgetRatio 1 makes verticalScrollCap subtract
+    // the measured chrome from the pinned height, so the chat scrolls inside
+    // the size the user chose instead of overflowing it.
+    // A pinned height is still subject to the main-process clamp. Taking the
+    // min means a height restored from a taller display cannot size the scroll
+    // area for a window the OS will never grant — which would lay the
+    // overflow-hidden shell out taller than its window and clip the footer.
+    const pinnedHeight = customOverlayHeightRef.current;
+    const grantableHeight =
+      pinnedHeight !== null ? Math.min(pinnedHeight, maxWindowHeightFor(availHeight)) : null;
+    const nextCap = grantableHeight
+      ? verticalScrollCap({ availHeight: grantableHeight, chromeHeight, budgetRatio: 1 })
+      : verticalScrollCap({ availHeight, chromeHeight });
     if (process.env.NODE_ENV === 'development') {
       console.log('[overlay-resize] measureVerticalCap', {
         availHeight,
@@ -2269,7 +2715,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       });
     }
     verticalCap.set(nextCap);
-  }, [attachedContext.length, verticalCap]);
+    heightIsPinned.set(grantableHeight !== null ? 1 : 0);
+  }, [attachedContext.length, verticalCap, heightIsPinned]);
+  measureVerticalCapRef.current = measureVerticalCap;
 
   // NOTE: the old per-frame "chase" subscriber that pushed the live shell width
   // to setBounds every frame is GONE. The OS window is a fixed width (732) for
@@ -2299,7 +2747,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // the flicker. measureVerticalCap above keeps the scroll area bounded
         // meanwhile; the single authoritative height settle is deferred to the
         // transition's onComplete (one setBounds, not one per frame).
-        if (Date.now() < heightReportSuppressedUntilRef.current) {
+        // `isResizingRef` covers a user resize drag, which has no deadline —
+        // it ends when the pointer is released. Gating on the ref rather than a
+        // long timestamp means a lost pointerup can never wedge height
+        // reporting off for a fixed number of seconds; the drag's own teardown
+        // (including its pointercancel / lostpointercapture / blur paths) is
+        // the single thing that clears it.
+        if (isResizingRef.current || Date.now() < heightReportSuppressedUntilRef.current) {
           return;
         }
         // While a message is actively streaming, route through the
@@ -2336,13 +2790,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // both re-derive the vertical cap (a screenshot strip grows chrome) and
   // re-run the canonical reporter — no more "what width should I use right
   // now?" branching against animation flags.
+  // `customWindowWidth` is in the deps because reportShellSize is now
+  // identity-stable across width changes (it reads a ref). A reset, or a
+  // restored size at mount, therefore has no other path to the OS.
   useEffect(() => {
     const id = requestAnimationFrame(() => {
       measureVerticalCap();
       reportShellSize();
     });
     return () => cancelAnimationFrame(id);
-  }, [attachedContext, reportShellSize, measureVerticalCap]);
+  }, [attachedContext, customWindowWidth, reportShellSize, measureVerticalCap]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -2379,16 +2836,21 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   const resizeOverlayWindow = useCallback(
     (height: number) => {
       if (height <= 0) return;
-      // Width is ALWAYS the fixed window width → widthDelta 0 in the main
-      // process; this collapses to a pure height-only resize.
-      const api = window.electronAPI as any;
-      if (api?.updateContentDimensionsCentered) {
-        api.updateContentDimensionsCentered({ width: OVERLAY_WINDOW_WIDTH, height });
+      // Window width, not panel width — see reportShellSize. During the spring
+      // this is constant, so the main process still sees widthDelta 0 and the
+      // resize collapses to a pure height-only, top-anchored setBounds.
+      const width = requestedWindowWidthRef.current;
+      const targetHeight = customOverlayHeightRef.current || height;
+      if (window.electronAPI?.updateContentDimensionsCentered) {
+        void window.electronAPI
+          .updateContentDimensionsCentered({ width, height: targetHeight })
+          .then(adoptAppliedSize)
+          .catch(() => {});
       } else {
-        window.electronAPI?.updateContentDimensions({ width: OVERLAY_WINDOW_WIDTH, height });
+        void window.electronAPI?.updateContentDimensions({ width, height: targetHeight });
       }
     },
-    [OVERLAY_WINDOW_WIDTH],
+    [adoptAppliedSize],
   );
 
   // Height channel used by the ResizeObserver WHILE a message is actively
@@ -2492,6 +2954,13 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
   const startTransition = useCallback(
     (targetWidth: number) => {
+      // The user's drag owns `shellWidth` for its duration. Without this the
+      // first token of a code answer arriving mid-drag would call
+      // startTransition (queueToken's eager-expand path) and animate the panel
+      // out from under the pointer, fighting the drag's own .set() every frame.
+      // Guarding the single choke point covers all four callers — the manual
+      // toggle, checkCodeVisibility, the aux-window action and queueToken.
+      if (isResizingRef.current) return;
       codeExpandedRef.current = targetWidth === SHELL_WIDTH_EXPANDED;
 
       const fromWidth = Math.round(shellWidth.get());
@@ -2647,6 +3116,255 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     startTransition(target);
   }, [shellWidth, startTransition, SHELL_WIDTH_COLLAPSED, SHELL_WIDTH_EXPANDED]);
 
+  // ── Free-form resize handles ──────────────────────────────────────────────
+  // EAST-side directions only ('e', 's', 'se'). A west-side handle would need
+  // the window's X origin to move, which setOverlayDimensionsAnchored
+  // deliberately never does: an X-origin move flashes for a frame on macOS
+  // because Chromium does not sync setBounds to renderer paint. Growing
+  // rightward from a left-anchored window is the only artifact-free direction,
+  // so it is the only one offered — rather than shipping 'w'/'sw' handles that
+  // compute (startWidth - dx) while the window still grows rightward, which
+  // makes dragging the west edge leftward push the panel to the RIGHT.
+  //
+  // Pointer events are the single input path, so Windows never starts a
+  // duplicate mouse drag session alongside the pointer one.
+  const handleResizePointerDown = useCallback(
+    (direction: OverlayResizeDirection, e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== 0 || isResizingRef.current) return;
+      // NOT preventDefault(): calling it on pointerdown suppresses the
+      // compatibility mouse events, and with them the `dblclick` that the
+      // reset gesture is built on. Text selection is prevented by
+      // `user-select: none` on .resize-handle instead, and window dragging by
+      // its -webkit-app-region: no-drag.
+      e.stopPropagation();
+
+      const handleEl = e.currentTarget;
+      const { pointerId } = e;
+      // Capture keeps the move stream coming even when the pointer leaves the
+      // 16px strip; best-effort because a detached node can reject it.
+      try {
+        handleEl.setPointerCapture(pointerId);
+      } catch {
+        /* capture is an optimisation, not a requirement */
+      }
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      // The panel fills the window for the duration of a drag, so in CLIENT
+      // coordinates the panel's right edge IS the window width. Seeding from
+      // the pointer's x therefore makes that edge track the cursor with no
+      // constant offset. Seeding from OVERLAY_WINDOW_WIDTH instead (732) while
+      // the panel sat collapsed (600, centred, right edge at 666) made the very
+      // first 1px move jump the panel 132px wider and left the handle
+      // permanently ~67px off the pointer for the rest of the drag.
+      const widthDriven = direction === 'e' || direction === 'se';
+      const startWidth = widthDriven ? Math.round(e.clientX) : OVERLAY_WINDOW_WIDTH;
+      // Whether the HEIGHT was already pinned before this drag. An east-only
+      // drag must not silently freeze the height as a side effect of widening.
+      const pinsHeight = pinsHeightFor(direction, customOverlayHeightRef.current !== null);
+      // Mirror of pinsHeight. writeCustomOverlaySize's contract is that each
+      // axis is pinned by the handle that actually drove it; persisting a width
+      // after a pure `s` drag would silently freeze it too.
+      const pinsWidth = customWindowWidth !== null || widthDriven;
+      const startHeight =
+        customOverlayHeightRef.current ??
+        contentRef.current?.offsetHeight ??
+        OVERLAY_MIN_WINDOW_HEIGHT;
+      // Stop exactly where the MAIN PROCESS clamps (floor(workArea * 0.9)), so
+      // the drag cannot run past the largest window it will ever be granted and
+      // persist a size that can never be applied.
+      const maxWidth = maxWindowWidthFor(window.screen?.availWidth ?? 0);
+      const maxHeight = maxWindowHeightFor(window.screen?.availHeight ?? 0);
+      // Measured floor, not the bare 216 constant: the shell is
+      // overflow-hidden, so anything shorter than (chrome + a usable scroll
+      // viewport) clips the footer instead of scrolling.
+      const scrollEl = scrollContainerRef.current;
+      const contentEl = contentRef.current;
+      const minHeight =
+        scrollEl && contentEl
+          ? minWindowHeightFor(contentEl.offsetHeight - scrollEl.clientHeight)
+          : OVERLAY_MIN_WINDOW_HEIGHT;
+
+      isResizingRef.current = true;
+      let latest = { width: startWidth, height: startHeight };
+      // A pointerdown that never moves is a CLICK, not a resize. Without this
+      // every click on a handle would pin the overlay at its current size —
+      // and, because the two clicks of a double-click each run this handler,
+      // the trailing end()'s async persist would race the reset that the
+      // dblclick just performed and write the cleared size straight back.
+      let moved = false;
+
+      // Push a size into the renderer's own state. Deduped per dimension so an
+      // 'e' drag (height never changes) costs one setState per frame, not two.
+      const applyLocal = (next: { width: number; height: number }) => {
+        if (next.width !== latest.width) {
+          setCustomWindowWidth(next.width);
+          overlayWindowWidthRef.current = next.width;
+          // The panel now fills the window, i.e. it IS at the expanded width.
+          // codeExpandedRef is otherwise only written by startTransition, so
+          // without this the code-visibility watcher (`if
+          // (codeExpandedRef.current)`) would never collapse the panel again
+          // after a drag — it would sit at full width until the next code
+          // answer happened to run a transition.
+          codeExpandedRef.current = true;
+          // The panel fills the window while dragging, so the edge under the
+          // pointer IS the panel's edge. This also keeps the streamed toggle
+          // anchor — (windowWidth + panelWidth) / 2 — on the real corner.
+          shellWidth.set(next.width);
+        }
+        // Only a height-driving drag pins the height. computeResizeFrame also
+        // CLAMPS the pass-through height, so an east-only drag that starts
+        // taller than the display budget would otherwise pin it as a side
+        // effect of the clamp alone.
+        if (pinsHeight && next.height !== latest.height) {
+          customOverlayHeightRef.current = next.height;
+        }
+        latest = next;
+        // Re-derive the scroll budget from the new pinned height so the chat
+        // scrolls inside the chosen size instead of overflowing it.
+        measureVerticalCap();
+      };
+
+      // Rate-limited to ~30fps, matching the width spring's height channel:
+      // every setBounds re-rasters the transparent backdrop-blur window, so a
+      // per-frame native resize is exactly the flicker avoided elsewhere.
+      const RESIZE_REPORT_INTERVAL_MS = 33;
+      let lastSentAt = 0;
+
+      // Pointer TRAVEL, not "the computed frame differs from the start frame".
+      // computeResizeFrame clamps the pass-through height to the measured
+      // floor, so on a short chat the very first frame already differs at ZERO
+      // delta — which made an ordinary click pin and persist a size.
+      const DRAG_THRESHOLD_PX = 3;
+
+      const move = (event: PointerEvent) => {
+        if (!isResizingRef.current) return;
+        // Self-healing net: if the button is already up we missed the pointerup
+        // (capture stolen by an OS gesture, release outside every Natively
+        // window). Ending here on the next move cannot false-positive the way a
+        // window 'blur' listener would — the overlay is a non-activating panel
+        // and blurs for reasons that have nothing to do with the drag.
+        if (event.buttons === 0) {
+          end();
+          return;
+        }
+        const dx = event.clientX - startX;
+        const dy = event.clientY - startY;
+        if (!moved) {
+          if (Math.abs(dx) <= DRAG_THRESHOLD_PX && Math.abs(dy) <= DRAG_THRESHOLD_PX) return;
+          moved = true;
+        }
+        const next = computeResizeFrame({
+          direction,
+          dx,
+          dy,
+          startWidth,
+          startHeight,
+          maxWidth,
+          maxHeight,
+          minHeight,
+        });
+        if (next.width === latest.width && next.height === latest.height) return;
+        applyLocal(next);
+        const now = Date.now();
+        if (now - lastSentAt < RESIZE_REPORT_INTERVAL_MS) return;
+        lastSentAt = now;
+        void window.electronAPI?.updateContentDimensionsCentered?.(next);
+      };
+
+      const detach = () => {
+        window.removeEventListener('pointermove', move, true);
+        window.removeEventListener('pointerup', end, true);
+        window.removeEventListener('pointercancel', end, true);
+        window.removeEventListener('lostpointercapture', end, true);
+      };
+
+      function end() {
+        if (!isResizingRef.current) return;
+        // Cleared FIRST and unconditionally: the ResizeObserver gates on this
+        // ref, so nothing below can leave height reporting wedged off.
+        isResizingRef.current = false;
+        detach();
+        try {
+          handleEl.releasePointerCapture(pointerId);
+        } catch {
+          /* already released, or the node is gone */
+        }
+        // Nothing moved: this was a click (or one half of a double-click).
+        // Report nothing, persist nothing, leave the pin exactly as it was.
+        if (!moved) return;
+        // Adopt the size the window ACTUALLY became. The main process clamps to
+        // its own view of the work area, which can differ from
+        // window.screen.availWidth on a multi-monitor setup; without adopting
+        // the echo, the panel width, the toggle anchor and the hover-gate
+        // margin would all drift from the real window for the rest of the
+        // session AND be persisted in that drifted state.
+        void Promise.resolve(
+          window.electronAPI?.updateContentDimensionsCentered?.(latest),
+        )
+          .then((applied) => {
+            const settledWidth =
+              typeof applied?.width === 'number' ? applied.width : latest.width;
+            const settledHeight =
+              typeof applied?.height === 'number' ? applied.height : latest.height;
+            overlayWindowWidthRef.current = settledWidth;
+            setAppliedWindowWidth(settledWidth);
+            if (pinsWidth) setCustomWindowWidth(settledWidth);
+            shellWidth.set(settledWidth);
+            if (pinsHeight) {
+              customOverlayHeightRef.current = settledHeight;
+            }
+            measureVerticalCap();
+            if (
+              !writeCustomOverlaySize(
+                typeof window !== 'undefined' ? window.localStorage : null,
+                {
+                  width: pinsWidth ? settledWidth : null,
+                  height: pinsHeight ? settledHeight : null,
+                },
+              )
+            ) {
+              console.warn(
+                '[overlay-resize] custom overlay size could not be persisted — this size is session-only',
+              );
+            }
+          })
+          .catch(() => {
+            /* the window went away mid-drag; local state is already correct */
+          });
+      }
+
+      window.addEventListener('pointermove', move, { passive: false, capture: true });
+      window.addEventListener('pointerup', end, { capture: true });
+      window.addEventListener('pointercancel', end, { capture: true });
+      // Safety net: a pointer stream can end without a pointerup when the
+      // capture is stolen (an OS gesture, a window-manager grab). Together with
+      // the buttons===0 check in `move`, this is what guarantees a drag cannot
+      // stay "live" and leave height reporting suppressed.
+      window.addEventListener('lostpointercapture', end, { capture: true });
+    },
+    [OVERLAY_WINDOW_WIDTH, shellWidth, measureVerticalCap],
+  );
+
+  // Double-click any handle to forget the custom size and return to
+  // auto-sizing. Without this the very first drag pins the overlay forever —
+  // the pin survives relaunches via localStorage, and nothing else clears it.
+  const handleResizeReset = useCallback(() => {
+    if (isResizingRef.current) return;
+    clearCustomOverlaySize(typeof window !== 'undefined' ? window.localStorage : null);
+    customOverlayHeightRef.current = null;
+    setCustomWindowWidth(null);
+    setAppliedWindowWidth(null);
+    manualWidthOverrideRef.current = null;
+    shellWidth.set(collapsedWidthFor(OVERLAY_DEFAULT_WINDOW_WIDTH));
+    // No manual re-report needed: the sizing effect lists `customWindowWidth`
+    // in its deps, so clearing it re-runs that effect and reports the DEFAULT
+    // width. (reportShellSize's own identity no longer changes with the width —
+    // it reads a ref — so it is the effect dep, not the callback identity, that
+    // does this now.) Reporting here instead would send the stale width
+    // captured in this render's closure.
+  }, [shellWidth]);
+
   // ── Aux-window bridge ─────────────────────────────────────────────────────
   // The TopPill and resize toggle live in their own BrowserWindows. Broadcast
   // the UI state they render from; execute the actions they send back.
@@ -2701,7 +3419,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   useEffect(() => {
     let lastSent = -1;
     const send = (w: number) => {
-      const panelRight = Math.round((OVERLAY_WINDOW_WIDTH + w) / 2);
+      const panelRight = Math.round((overlayWindowWidthRef.current + w) / 2);
       if (panelRight === lastSent) return;
       lastSent = panelRight;
       window.electronAPI?.sendOverlayToggleAnchor?.({ panelRight }).catch(() => {});
@@ -2709,7 +3427,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     send(shellWidth.get());
     const unsubscribe = shellWidth.on('change', send);
     return () => unsubscribe();
-  }, [shellWidth, OVERLAY_WINDOW_WIDTH]);
+  }, [shellWidth]);
 
   // Hover hit-test → margins click-through. The fixed window is wider than
   // the collapsed panel (66px transparent margin each side); while the
@@ -2731,16 +3449,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     window.electronAPI?.setOverlayHoverInteractive?.(true).catch(() => {});
     const PAD = 8;
     const onMouseMove = (e: MouseEvent) => {
-      const margin = (OVERLAY_WINDOW_WIDTH - shellWidth.get()) / 2;
-      const inside =
-        e.clientX >= margin - PAD && e.clientX <= OVERLAY_WINDOW_WIDTH - margin + PAD;
+      const windowWidth = overlayWindowWidthRef.current;
+      const margin = (windowWidth - shellWidth.get()) / 2;
+      const inside = e.clientX >= margin - PAD && e.clientX <= windowWidth - margin + PAD;
       if (inside === interactive) return;
       interactive = inside;
       window.electronAPI?.setOverlayHoverInteractive?.(inside).catch(() => {});
     };
     window.addEventListener('mousemove', onMouseMove);
     return () => window.removeEventListener('mousemove', onMouseMove);
-  }, [shellWidth, OVERLAY_WINDOW_WIDTH]);
+  }, [shellWidth]);
 
   // Derive the resize-button icon state from the live shell width. Subscribing
   // to the motion value (rather than tracking each startTransition caller)
@@ -3255,6 +3973,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       console.log('[NativelyInterface] Resetting session state...');
       window.electronAPI?.cancelChatStream?.();
       chatStreamIdRef.current = null;
+      chatStreamSourceRef.current = null;
       requestStartTimeRef.current = null;
       setMessages([]);
       eagerCodeExpansionHoldRef.current = false;
@@ -3431,7 +4150,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // the pacer's revealedLen — so any queued-but-not-yet-revealed text is
   // always shown in full, instantly, the moment a stream ends (this matters
   // MORE now than under the old model: a done event can arrive with
-  // thousands of chars still unrevealed at a 180 char/s display cap). The
+  // thousands of chars still unrevealed at a 400 char/s display cap). The
   // reveal only paces what's shown WHILE a stream is actively open.
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -3573,6 +4292,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // on one channel from both the desktop and phone-mirror paths; this lets us drop
   // tokens/done from a superseded stream. null = no id adopted yet (back-compat).
   const chatStreamIdRef = useRef<number | null>(null);
+  // F-303: the surface that owns the currently-adopted chat stream ('desktop'
+  // or 'phone'). Supersession is scoped to a surface because both paths
+  // allocate stream ids from ONE shared counter in the main process.
+  const chatStreamSourceRef = useRef<string | null>(null);
+  // Direct Assist owns a separate request-correlated stream and a deliberately
+  // isolated history. Only a successful terminal `done` appends turns here;
+  // transcript cards, RAG, WTA, partial output and cancelled turns never enter it.
+  const activeDirectAssistRef = useRef<ActiveDirectAssistRequest | null>(null);
+  const directAssistHistoryRef = useRef<DirectAssistHistoryTurn[]>([]);
   // Active LIVE-ANSWER generation id (audit finding #3, full). The live what-to-
   // answer path streams on `intelligence-token-batch` (kind='suggested_answer')
   // keyed only on intent, so two back-to-back live answers share the same intent
@@ -3582,6 +4310,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // generation. null = no id adopted yet (id-less items are always accepted →
   // backward compatible with the code-hint / brainstorm streams that omit it).
   const liveAnswerGenIdRef = useRef<number | null>(null);
+  // Direct Assist supersedes every legacy WTA generation visible to this
+  // renderer. The numeric MAX tombstone rejects tagged generations through the
+  // existing newest-wins guard; this companion flag also rejects older/id-less
+  // finals after the Direct reveal has sealed and activeDirectAssistRef clears.
+  // A deliberate new legacy WTA/code-hint/brainstorm request revives the lane.
+  const legacyIntelligenceTombstonedRef = useRef(false);
   // Deferred-finalize bookkeeping. THE ONE mechanism for "commit this row's
   // final isStreaming:false only once the reveal ticker has actually caught
   // up to the full text" — used by BOTH:
@@ -3623,7 +4357,135 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // the streaming DOM node. Synchronous — called from revealTick (inside its
   // rAF) and once from registerStreamingNode (on mount, outside any rAF, to
   // avoid a blank frame between mount and the next tick).
-  const paintRevealedNow = useCallback(() => {
+  // Per-frame reveal-timestamp history feeding the word materialization
+  // animation (src/lib/textRevealAnimation.mjs). Reset alongside the pacer
+  // on every new msgId — see ensureRevealTicker.
+  const revealHistoryRef = useRef(createRevealHistory());
+  // When the gist chip first appeared in THIS stream, so its one-shot
+  // materialization can be resumed via negative delay across the innerHTML
+  // rebuild that happens every frame (same technique as the words). Null
+  // until a gist line actually streams in; reset per stream.
+  const gistFirstSeenRef = useRef<number | null>(null);
+  // Reduced-motion only: whether the one-shot block cross-fade has been armed
+  // for this stream. Armed on the first paint that has content, so the class
+  // is added exactly once and the animation is not restarted every frame.
+  const blockFadeArmedRef = useRef(false);
+
+  /**
+   * Wrap the trailing, still-animating words of the just-painted markdown in
+   * spans carrying a negative animation-delay, so each word fades+unblurs in
+   * as it appears. See textRevealAnimation.mjs for why the timeline is owned
+   * by CSS rather than computed per frame here.
+   *
+   * Runs on the rendered DOM rather than the markdown source because that is
+   * the only place the words actually exist: `**bold**` is four source
+   * characters longer than the word it renders to. That makes the source
+   * index derived below an APPROXIMATION (rendered-tail offset counted back
+   * from revealedLen) — off by however many markdown markers fall inside the
+   * ~260ms window. A few characters of skew shifts a word's delay by a
+   * handful of milliseconds, which is imperceptible; nothing downstream
+   * depends on the index being exact.
+   *
+   * The skew is larger in one specific case: `total` counts only the text
+   * this walker ACCEPTS (the gist chip and any pre block are rejected),
+   * while revealedLen counts every source character including those. While a
+   * trailing [[GIST]] line is streaming, the derived source index therefore
+   * runs behind by roughly the chip's length. Both failure modes are inert:
+   * an index past the newest sample returns null, and an index that skews
+   * too far back yields an age >= the fade duration. Either way the word is
+   * simply left as plain text — never mispainted, never held invisible.
+   */
+  const animateRevealedTail = useCallback((node: HTMLDivElement, revealedLen: number, nowMs: number) => {
+    const history = revealHistoryRef.current;
+    const tailStart = animatedTailStart(history, nowMs, revealedLen, WORD_FADE_DURATION_MS);
+    const tailChars = revealedLen - tailStart;
+    if (tailChars <= 0) return;
+
+    // Collect candidate text nodes in document order. The gist chip is
+    // EXCLUDED: paintRevealedNow appends it after the body HTML, so a naive
+    // walk from the end would spend the whole animation window on the chip's
+    // summary text instead of the prose tail. PRE is excluded too — code
+    // should not shimmer.
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, {
+      acceptNode(textNode) {
+        const parent = (textNode as Text).parentElement;
+        if (parent?.closest('.overlay-gist-chip, pre')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const textNodes: Text[] = [];
+    let total = 0;
+    for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) {
+      const t = n as Text;
+      textNodes.push(t);
+      total += t.data.length;
+    }
+    if (total === 0) return;
+
+    // Rendered-text offset at which the animated tail begins.
+    const renderedTailStart = Math.max(0, total - tailChars);
+
+    // Build the replacements first, then apply — mutating mid-walk would
+    // invalidate the offsets computed against the original node list.
+    const edits: Array<{ target: Text; fragment: DocumentFragment }> = [];
+    let wordBudget = MAX_ANIMATED_WORDS;
+    let cursor = total;
+
+    // Walk backwards so the word budget is spent on the NEWEST words: during
+    // a burst drain the tail can be wider than the budget, and the words that
+    // matter are the ones that just landed.
+    for (let i = textNodes.length - 1; i >= 0 && wordBudget > 0; i--) {
+      const textNode = textNodes[i];
+      const nodeStart = cursor - textNode.data.length;
+      cursor = nodeStart;
+      if (nodeStart + textNode.data.length <= renderedTailStart) break; // fully settled
+
+      const runs = splitIntoWordRuns(textNode.data);
+      const fragment = document.createDocumentFragment();
+      // Decide every run's fate before building the fragment: the budget is
+      // spent newest-first (backwards), but the fragment must be assembled in
+      // document order.
+      let runOffset = 0;
+      const decisions = runs.map((run) => {
+        const start = nodeStart + runOffset;
+        runOffset += run.text.length;
+        return { run, start, delayMs: null as number | null };
+      });
+      let animatedHere = 0;
+      for (let d = decisions.length - 1; d >= 0 && wordBudget > 0; d--) {
+        const dec = decisions[d];
+        if (!dec.run.isWord) continue;
+        if (dec.start < renderedTailStart) continue; // settled — leave as plain text
+        const sourceIndex = revealedLen - (total - dec.start);
+        if (sourceIndex < 0) continue; // skew ran past the start of the answer
+        const revealedAt = revealTimeForIndex(history, sourceIndex);
+        if (revealedAt === null) continue; // predates retained history: settled
+        const age = nowMs - revealedAt;
+        if (age >= WORD_FADE_DURATION_MS || age < 0) continue;
+        dec.delayMs = -age;
+        wordBudget--;
+        animatedHere++;
+      }
+      if (animatedHere === 0) continue;
+
+      for (const dec of decisions) {
+        if (dec.delayMs === null) {
+          fragment.appendChild(document.createTextNode(dec.run.text));
+        } else {
+          const span = document.createElement('span');
+          span.className = REVEAL_WORD_CLASS;
+          span.style.animationDelay = `${dec.delayMs}ms`;
+          span.textContent = dec.run.text;
+          fragment.appendChild(span);
+        }
+      }
+      edits.push({ target: textNode, fragment });
+    }
+
+    for (const edit of edits) edit.target.replaceWith(edit.fragment);
+  }, []);
+
+  const paintRevealedNow = useCallback((nowMs?: number) => {
     const node = streamingNodeRef.current;
     if (!node) return;
     const revealed = streamingTextRef.current.slice(0, revealPacerRef.current.revealedLen);
@@ -3653,7 +4515,36 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`
       : '';
     node.innerHTML = DOMPurify.sanitize(rawHtml + gistHtml);
-  }, []);
+    const now = nowMs ?? performance.now();
+
+    // Materialize the trailing words (opacity+blur). Skipped under reduced
+    // motion: tickPacer's reducedMotion branch reveals the entire arrived
+    // text in ONE tick, so every word would carry the same timestamp and the
+    // whole block would flash in as a single unit — louder than no animation
+    // at all, and exactly what the preference asks us not to do. What
+    // replaces it is the single block cross-fade armed below.
+    if (!prefersReducedMotionRef.current) {
+      animateRevealedTail(node, revealPacerRef.current.revealedLen, now);
+    } else if (!blockFadeArmedRef.current) {
+      blockFadeArmedRef.current = true;
+      node.classList.add('natively-reveal-block-fade');
+    }
+
+    // The gist chip is rebuilt by the innerHTML write above like everything
+    // else, so a plain CSS animation on it would restart every frame and it
+    // would sit permanently at its first keyframe. Resume it by the same
+    // negative-delay rule the words use. The inline delay doubles as the
+    // selector hook (.overlay-gist-chip[style*="animation-delay"]) so a
+    // finalized, non-streaming chip never animates.
+    if (revealedGist) {
+      if (gistFirstSeenRef.current === null) gistFirstSeenRef.current = now;
+      const age = now - gistFirstSeenRef.current;
+      if (age < GIST_CHIP_FADE_MS) {
+        const chip = node.querySelector<HTMLElement>('.overlay-gist-chip');
+        if (chip) chip.style.animationDelay = `${-Math.max(0, age)}ms`;
+      }
+    }
+  }, [animateRevealedTail]);
 
   // Mode-aware paint sink's "code" branch: same cursor-over-accumulated-text
   // shape as commitRagText (see ragRevealTick below — the existing, hardened
@@ -3688,6 +4579,32 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
   // revealTickerMsgIdRef/streamingMsgIdRef rather than closing over a msgId
   // captured at schedule time, so it can't act on stale state if something
   // reassigns those refs between one frame's schedule and fire.
+  // The stream's final visual handoff, in one place: drop the imperative
+  // refs and commit the finished row through React. Extracted so the
+  // fade-hold path below and the immediate path seal identically — two
+  // copies of this teardown would be a latent source of drift.
+  const sealPendingStream = useCallback((pending: { msgId: string; intent: string; text: string }) => {
+    pendingFinalizeRef.current = null;
+    if (pendingFinalizeTimeoutRef.current !== null) {
+      clearTimeout(pendingFinalizeTimeoutRef.current);
+      pendingFinalizeTimeoutRef.current = null;
+    }
+    streamingNodeRef.current = null;
+    streamingTextRef.current = '';
+    streamingMsgIdRef.current = null;
+    streamingIntentRef.current = null;
+    streamingRenderModeRef.current = 'imperative';
+    if (streamingCodeRafRef.current !== null) {
+      cancelAnimationFrame(streamingCodeRafRef.current);
+      streamingCodeRafRef.current = null;
+    }
+    const direct = activeDirectAssistRef.current;
+    if (direct?.completed && direct.placeholderId === pending.msgId) {
+      activeDirectAssistRef.current = null;
+    }
+    setMessages((prev) => commitStreamingFlush(prev, pending.msgId, pending.text));
+  }, []);
+
   const revealTick = useCallback((ts: number) => {
     streamingRafRef.current = null; // this frame's slot consumed
     const msgId = revealTickerMsgIdRef.current;
@@ -3708,6 +4625,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     const prevLen = pacer.revealedLen;
     tickPacer(pacer, fullText, ts, deltaMs, { reducedMotion: prefersReducedMotionRef.current });
     if (pacer.revealedLen !== prevLen) {
+      // Record WHEN these characters became visible, before painting — the
+      // paint reads this history back to derive each new word's fade offset.
+      pushRevealSample(revealHistoryRef.current, ts, pacer.revealedLen, WORD_FADE_DURATION_MS);
       // Mode-aware paint sink: prose paints straight into the imperative DOM
       // node; code commits the same paced-prefix shape through React state
       // (there is no DOM ref for the react-code branch — it renders via
@@ -3720,7 +4640,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       if (streamingRenderModeRef.current === 'react-code') {
         commitRevealedCodeText(msgId, fullText.slice(0, pacer.revealedLen));
       } else {
-        paintRevealedNow();
+        paintRevealedNow(ts);
       }
     }
     // Caught up to everything that has arrived: stop rescheduling instead of
@@ -3745,26 +4665,45 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // cursor, per the design brief).
       const pending = pendingFinalizeRef.current;
       if (pending && pending.msgId === msgId) {
-        pendingFinalizeRef.current = null;
-        if (pendingFinalizeTimeoutRef.current !== null) {
-          clearTimeout(pendingFinalizeTimeoutRef.current);
-          pendingFinalizeTimeoutRef.current = null;
+        // Let the closing words finish materializing before handing the row
+        // to React. The seal swaps this imperative node for React-rendered
+        // plain text, which would cut any still-running word fade dead —
+        // and the final word is the one the reader is most likely looking
+        // straight at. The hold is at most WORD_FADE_DURATION_MS and only
+        // ever delays the visual seal: the text on screen is already
+        // complete and unchanged throughout, and no cursor or thinking dot
+        // is showing at this point (both are gated on empty text), so
+        // nothing lingers — which is what the "seal at the exact instant
+        // the last character is revealed" rule was protecting against.
+        const holdMs = prefersReducedMotionRef.current
+          ? 0
+          : remainingFadeMs(revealHistoryRef.current, ts, pacer.revealedLen, WORD_FADE_DURATION_MS);
+        if (holdMs > 0) {
+          // Re-arm the shared timeout as the seal trigger. pendingFinalizeRef
+          // deliberately STAYS set: every stream teardown/supersede path
+          // already clears both it and this timeout together, so a new
+          // answer arriving mid-hold discards this seal exactly as it would
+          // have discarded the safety-net one.
+          if (pendingFinalizeTimeoutRef.current !== null) {
+            clearTimeout(pendingFinalizeTimeoutRef.current);
+          }
+          pendingFinalizeTimeoutRef.current = setTimeout(() => {
+            pendingFinalizeTimeoutRef.current = null;
+            const stillPending = pendingFinalizeRef.current;
+            // Re-check rather than closing over `pending`: the same guard the
+            // safety-net timeouts use. If a new stream claimed the refs
+            // during the hold, this seal is stale and must not fire.
+            if (!stillPending || stillPending.msgId !== msgId) return;
+            sealPendingStream(stillPending);
+          }, holdMs);
+          return;
         }
-        streamingNodeRef.current = null;
-        streamingTextRef.current = '';
-        streamingMsgIdRef.current = null;
-        streamingIntentRef.current = null;
-        streamingRenderModeRef.current = 'imperative';
-        if (streamingCodeRafRef.current !== null) {
-          cancelAnimationFrame(streamingCodeRafRef.current);
-          streamingCodeRafRef.current = null;
-        }
-        setMessages((prev) => commitStreamingFlush(prev, pending.msgId, pending.text));
+        sealPendingStream(pending);
       }
       return;
     }
     streamingRafRef.current = requestAnimationFrame(revealTick);
-  }, [paintRevealedNow, commitRevealedCodeText]);
+  }, [paintRevealedNow, commitRevealedCodeText, sealPendingStream]);
 
   // Ensure the reveal ticker is running for `msgId`. A new msgId resets the
   // pacer to a fresh state (see createPacerState — starts the initial
@@ -3787,6 +4726,19 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       }
       revealPacerRef.current = pacer;
       revealLastTsRef.current = null;
+      // MUST be reset in lockstep with the pacer: the history is indexed by
+      // character offset, and offsets restart at 0 for a new answer. Carrying
+      // the previous answer's samples over would hand this stream's opening
+      // words either a stale (already-expired) timestamp or, worse, a future
+      // one — holding real text invisible.
+      resetRevealHistory(revealHistoryRef.current);
+      // Same lockstep reason as the history: these are per-stream one-shots.
+      // A carried-over gist timestamp would leave the next answer's chip
+      // permanently past its animation (or, if the clock ran backwards,
+      // stuck invisible), and a carried-over armed flag would skip the
+      // reduced-motion cross-fade for every answer after the first.
+      gistFirstSeenRef.current = null;
+      blockFadeArmedRef.current = false;
       paintRevealedNow();
     }
     if (streamingRafRef.current === null) {
@@ -3854,6 +4806,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       streamingMsgIdRef.current = null;
       streamingIntentRef.current = null;
       streamingRenderModeRef.current = 'imperative';
+      const direct = activeDirectAssistRef.current;
+      if (direct?.completed && direct.placeholderId === pending.msgId) {
+        activeDirectAssistRef.current = null;
+      }
       setMessages((prev) => commitStreamingFlush(prev, pending.msgId, pending.text));
     }, safetyNetMs);
     if (!reuseMsgId) {
@@ -3904,6 +4860,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       streamingMsgIdRef.current = null;
       streamingIntentRef.current = null;
       streamingRenderModeRef.current = 'imperative';
+      const direct = activeDirectAssistRef.current;
+      if (direct?.completed && direct.placeholderId === pending.msgId) {
+        activeDirectAssistRef.current = null;
+      }
       setMessages((prev) => commitStreamingFlush(prev, pending.msgId, pending.text));
     }, safetyNetMs);
     ensureRevealTicker(msgId);
@@ -4190,9 +5150,285 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     }
   }, []);
 
-  const cancelActiveChatStream = useCallback(() => {
+  const consumeDirectPageContext = useCallback(() => {
+    const rawDom = (window as any).lastCapturedDOM;
+    const dom = typeof rawDom === 'string' && rawDom.trim().length > 0
+      ? rawDom.substring(0, DOM_CONTEXT_MAX_CHARS)
+      : undefined;
+    const meta = dom ? capturedMetaRef.current : null;
+
+    // Page context is single-use in Direct Assist. Clear all renderer copies at
+    // the same time so a later turn cannot silently inherit a previous page.
+    if (typeof (window as any).lastCapturedDOM === 'string') {
+      (window as any).lastCapturedDOM = '';
+    }
+    capturedEnvelopeRef.current = null;
+    capturedMetaRef.current = null;
+    if (dom) setPageContext(null);
+
+    return dom
+      ? {
+          dom,
+          ...(meta?.url ? { url: meta.url } : {}),
+          ...(meta?.title ? { title: meta.title } : {}),
+        }
+      : undefined;
+  }, []);
+
+  const settleDirectAssistIncomplete = useCallback((
+    active: ActiveDirectAssistRequest,
+    terminalLabel: string,
+  ) => {
+    if (streamingMsgIdRef.current === active.placeholderId) {
+      if (streamingRafRef.current !== null) {
+        cancelAnimationFrame(streamingRafRef.current);
+        streamingRafRef.current = null;
+      }
+      if (streamingCodeRafRef.current !== null) {
+        cancelAnimationFrame(streamingCodeRafRef.current);
+        streamingCodeRafRef.current = null;
+      }
+      pendingFinalizeRef.current = null;
+      if (pendingFinalizeTimeoutRef.current !== null) {
+        clearTimeout(pendingFinalizeTimeoutRef.current);
+        pendingFinalizeTimeoutRef.current = null;
+      }
+      streamingNodeRef.current = null;
+      streamingTextRef.current = '';
+      streamingMsgIdRef.current = null;
+      streamingIntentRef.current = null;
+      streamingRenderModeRef.current = 'imperative';
+    }
+
+    setMessages((prev) => {
+      const idx = prev.findLastIndex((message) => message.id === active.placeholderId);
+      if (idx === -1) return prev;
+      if (!active.answerText && terminalLabel === 'Request cancelled.') {
+        return prev.filter((_, messageIndex) => messageIndex !== idx);
+      }
+      const text = active.answerText
+        ? `${active.answerText}\n\n_Incomplete — ${terminalLabel}_`
+        : terminalLabel;
+      const updated = [...prev];
+      updated[idx] = {
+        ...updated[idx],
+        text,
+        isStreaming: false,
+        isCode: text.includes('```') || text.includes('#include'),
+      };
+      return updated;
+    });
+    setIsProcessing(false);
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onDirectAssistEvent) return;
+    const unsubscribe = window.electronAPI.onDirectAssistEvent((event: DirectAssistRendererEvent) => {
+      const active = activeDirectAssistRef.current;
+      if (!active || event.requestId !== active.requestId) return;
+      if (active.completed) return;
+
+      if (event.type === 'start') {
+        // Stamp which fields Direct Assist dropped to fit the context window
+        // onto the question card, so a thin-looking answer isn't a silent
+        // mystery. userMessageId is only set for surfaces that create a
+        // distinct question card (all current callers do).
+        if (event.trimmedFields?.length && active.userMessageId) {
+          const userMessageId = active.userMessageId;
+          setMessages((prev) => prev.map((message) =>
+            message.id === userMessageId
+              ? { ...message, trimmedFields: [...event.trimmedFields] }
+              : message,
+          ));
+        }
+        return;
+      }
+
+      if (event.type === 'delta') {
+        if (event.sequence <= active.lastSequence) return;
+        active.lastSequence = event.sequence;
+        if (!event.text) return;
+        active.answerText += event.text;
+        queueToken('chat', event.text);
+        return;
+      }
+
+      // Terminal events carry the last emitted delta sequence, not the next
+      // sequence. Accept equality so start -> delta(1) -> done(1) seals; only a
+      // genuinely older terminal event is stale.
+      if (event.sequence < active.lastSequence) return;
+      active.lastSequence = event.sequence;
+
+      if (event.type === 'done') {
+        const answer = event.fullText ?? active.answerText;
+        if (!answer) {
+          activeDirectAssistRef.current = null;
+          settleDirectAssistIncomplete(
+            active,
+            directAssistErrorText('INCOMPLETE_STREAM', 'The model returned no answer.'),
+          );
+          return;
+        }
+
+        // The ONLY Direct history write. Both rows are appended atomically after
+        // a successful terminal event, then bounded by completed turns.
+        const completedTurns: DirectAssistHistoryTurn[] = [
+          ...directAssistHistoryRef.current,
+          { role: 'user', content: active.currentRequest },
+          { role: 'assistant', content: answer },
+        ];
+        directAssistHistoryRef.current = completedTurns.slice(-24);
+        setIsProcessing(false);
+
+        if (streamingMsgIdRef.current === active.placeholderId) {
+          // Keep Direct ownership until the reveal actually seals. Clearing it
+          // at the provider's done event would let a late legacy token enter the
+          // still-streaming row during the paced final reveal.
+          active.completed = true;
+          finalizeWhenRevealCaughtUp(active.placeholderId, 'chat', answer);
+        } else {
+          activeDirectAssistRef.current = null;
+          setMessages((prev) => prev.map((message) =>
+            message.id === active.placeholderId
+              ? {
+                  ...message,
+                  text: answer,
+                  isStreaming: false,
+                  isCode: answer.includes('```') || answer.includes('#include'),
+                }
+              : message,
+          ));
+        }
+        return;
+      }
+
+      if (event.type === 'error') {
+        activeDirectAssistRef.current = null;
+        settleDirectAssistIncomplete(
+          active,
+          directAssistErrorText(event.error.code, event.error.message),
+        );
+        return;
+      }
+
+      activeDirectAssistRef.current = null;
+      settleDirectAssistIncomplete(active, 'Request cancelled.');
+    });
+    return () => unsubscribe?.();
+  }, [finalizeWhenRevealCaughtUp, queueToken, settleDirectAssistIncomplete]);
+
+  const beginDirectAssist = useCallback(async ({
+    source,
+    currentRequest,
+    imagePaths,
+    pageContext: directPageContext,
+    transcript,
+    userMessageId,
+  }: {
+    source: DirectAssistSource;
+    currentRequest: string;
+    imagePaths?: string[];
+    pageContext?: { dom?: string; ocr?: string; url?: string; title?: string };
+    transcript?: string;
+    userMessageId?: string;
+  }) => {
+    legacyIntelligenceTombstonedRef.current = true;
+    liveAnswerGenIdRef.current = Number.MAX_SAFE_INTEGER;
+
+    const previous = activeDirectAssistRef.current;
+    if (previous) {
+      activeDirectAssistRef.current = null;
+      if (!previous.completed) {
+        void window.electronAPI?.cancelDirectAssist?.(previous.requestId, previous.source).catch(() => {});
+        settleDirectAssistIncomplete(previous, 'Superseded by a newer request.');
+      }
+    }
+
+    // Direct and legacy streams share the single answer panel. Retire any legacy
+    // owner before reserving the Direct placeholder; requestId correlation then
+    // rejects every late Direct event from an older turn.
     window.electronAPI?.cancelChatStream?.();
     chatStreamIdRef.current = null;
+    chatStreamSourceRef.current = null;
+    forceFinalizeStaleRagStream();
+    flushToken();
+
+    const requestId = createDirectAssistRequestId();
+    const placeholderId = genMessageId();
+    const active: ActiveDirectAssistRequest = {
+      requestId,
+      source,
+      currentRequest,
+      placeholderId,
+      userMessageId,
+      lastSequence: -1,
+      answerText: '',
+    };
+    activeDirectAssistRef.current = active;
+    streamingMsgIdRef.current = placeholderId;
+    streamingIntentRef.current = 'chat';
+    streamingTextRef.current = '';
+    streamingNodeRef.current = null;
+    streamingRenderModeRef.current = 'imperative';
+    pinAnswerPanelRef.current();
+    setIsProcessing(true);
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: placeholderId,
+        role: 'system',
+        text: '',
+        intent: 'chat',
+        isStreaming: true,
+      },
+    ]);
+
+    try {
+      const response = await window.electronAPI.startDirectAssist({
+        requestId,
+        source,
+        // Preserve the current instruction byte-for-byte, including a /skill or
+        // $skill prefix. Main resolves `skillId`; it does not need renderer-side
+        // prompt rewriting or instruction injection.
+        currentRequest,
+        skillId: directAssistSkillId(currentRequest),
+        history: directAssistHistoryRef.current.slice(-24),
+        ...(directPageContext ? { pageContext: directPageContext } : {}),
+        ...(imagePaths && imagePaths.length > 0 ? { imagePaths } : {}),
+        ...(transcript ? { transcript } : {}),
+      });
+      if (activeDirectAssistRef.current?.requestId !== requestId) return;
+      if (!response.accepted || response.requestId !== requestId) {
+        activeDirectAssistRef.current = null;
+        const code = response.error?.code || 'DIRECT_ASSIST_REJECTED';
+        const message = response.error?.message || 'Direct Assist could not start this request.';
+        settleDirectAssistIncomplete(active, directAssistErrorText(code, message));
+      }
+    } catch (error) {
+      if (activeDirectAssistRef.current?.requestId !== requestId) return;
+      activeDirectAssistRef.current = null;
+      settleDirectAssistIncomplete(
+        active,
+        directAssistErrorText(
+          'DIRECT_ASSIST_UNAVAILABLE',
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
+  }, [flushToken, forceFinalizeStaleRagStream, settleDirectAssistIncomplete]);
+
+  const cancelActiveChatStream = useCallback(() => {
+    const direct = activeDirectAssistRef.current;
+    if (direct) {
+      activeDirectAssistRef.current = null;
+      if (!direct.completed) {
+        void window.electronAPI?.cancelDirectAssist?.(direct.requestId, direct.source).catch(() => {});
+        settleDirectAssistIncomplete(direct, 'Request cancelled.');
+      }
+    }
+    window.electronAPI?.cancelChatStream?.();
+    chatStreamIdRef.current = null;
+    chatStreamSourceRef.current = null;
     requestStartTimeRef.current = null;
     setIsProcessing(false);
     flushToken();
@@ -4219,7 +5455,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       cancelAnimationFrame(tokenBufRef.current.raf);
       tokenBufRef.current.raf = null;
     }
-  }, [flushToken]);
+  }, [flushToken, settleDirectAssistIncomplete]);
 
   const resetChatState = useCallback(() => {
     cancelActiveChatStream();
@@ -4228,6 +5464,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     setAnswerPanelPinned(false);
     lastManualSubmitRef.current = null;
     manualSubmitInFlightRef.current = false;
+    directAssistHistoryRef.current = [];
   }, [cancelActiveChatStream]);
 
   const finalizeStreamingByIntent = useCallback(
@@ -4493,6 +5730,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // AI Suggestions from native audio (legacy)
     cleanups.push(
       window.electronAPI.onSuggestionProcessingStart(() => {
+        if (activeDirectAssistRef.current) return;
+        // A processing-start event is the only trustworthy boundary for a new
+        // native legacy suggestion; revive after Direct's old generation was
+        // tombstoned, never merely because the Direct reveal finished.
+        legacyIntelligenceTombstonedRef.current = false;
+        liveAnswerGenIdRef.current = null;
         setIsProcessing(true);
         setIsExpanded(true);
       }),
@@ -4500,6 +5743,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onSuggestionGenerated((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         setIsProcessing(false);
         pinAnswerPanel();
         setMessages((prev) => [
@@ -4515,6 +5760,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onSuggestionError((err) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         setIsProcessing(false);
         setMessages((prev) => [
           ...prev,
@@ -4529,6 +5776,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceSuggestedAnswerToken((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         pinAnswerPanel();
         // Coaching now arrives via onIntelligenceNegotiationCoaching only —
         // sentinel detection on this stream has been removed.
@@ -4538,6 +5787,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceSuggestedAnswer((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         // Phase 4 defense-in-depth (forensic-report §6b): drop a final answer
         // belonging to a generation that's already been superseded by a newer
         // one — same supersession guard the streaming token path applies via
@@ -4574,6 +5825,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // path) so a late token batch can't append onto a row we're removing.
     cleanups.push(
       window.electronAPI.onIntelligenceSuggestedAnswerDiscard?.(() => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         setIsProcessing(false);
         if (streamingNodeRef.current) streamingNodeRef.current.innerHTML = '';
         streamingNodeRef.current = null;
@@ -4602,6 +5855,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // engine also guards by generationId; this is the renderer-side backstop.)
     cleanups.push(
       window.electronAPI.onIntelligenceCodeVerified?.((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           if (!last || last.role !== 'system') return prev; // superseded by a newer turn
@@ -4621,6 +5876,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // so a genuine correction is never silently dropped.
     cleanups.push(
       window.electronAPI.onIntelligenceCodeCorrection?.((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           const corrected = {
@@ -4650,9 +5907,11 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // safety nets and only fire if some other code path emits them.
     cleanups.push(
       window.electronAPI.onIntelligenceTokenBatch((data) => {
+        if (activeDirectAssistRef.current) return;
         const { kind, items } = data;
         if (!items || items.length === 0) return;
         if (kind === 'suggested_answer') {
+          if (legacyIntelligenceTombstonedRef.current) return;
           pinAnswerPanel();
           for (const it of items) {
             // #3 (full): drop tokens belonging to a superseded live answer so a
@@ -4688,6 +5947,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // tokens through suggested_answer anymore).
     cleanups.push(
       window.electronAPI.onIntelligenceNegotiationCoaching((data) => {
+        if (activeDirectAssistRef.current) return;
+        if (legacyIntelligenceTombstonedRef.current) return;
         // Flush any pending streamed tokens before swapping the streaming
         // row to a coaching card; otherwise rAF-buffered text would be
         // appended onto the card row's empty text after this setMessages.
@@ -4727,6 +5988,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // STREAMING: Refinement
     cleanups.push(
       window.electronAPI.onIntelligenceRefinedAnswerToken((data) => {
+        if (activeDirectAssistRef.current) return;
         // PERF: rAF-coalesce per-token state updates.
         queueToken(data.intent, data.token);
       }),
@@ -4734,6 +5996,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceRefinedAnswer((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         finalizeStreamingByIntent(data.intent, data.answer);
       }),
@@ -4742,12 +6005,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // STREAMING: Recap
     cleanups.push(
       window.electronAPI.onIntelligenceRecapToken((data) => {
+        if (activeDirectAssistRef.current) return;
         queueToken('recap', data.token);
       }),
     );
 
     cleanups.push(
       window.electronAPI.onIntelligenceRecap((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         finalizeStreamingByIntent('recap', data.summary);
       }),
@@ -4767,12 +6032,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceFollowUpQuestionsToken((data) => {
+        if (activeDirectAssistRef.current) return;
         queueToken('follow_up_questions', data.token);
       }),
     );
 
     cleanups.push(
       window.electronAPI.onIntelligenceFollowUpQuestionsUpdate((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         finalizeStreamingByIntent('follow_up_questions', data.questions);
       }),
@@ -4780,6 +6047,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceClarify((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         finalizeStreamingByIntent('clarify', data.clarification);
       }),
@@ -4787,6 +6055,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceManualStarted(() => {
+        if (activeDirectAssistRef.current) return;
         setIsExpanded(true);
         setIsProcessing(true);
         prepareIntelligenceStreamPlaceholder('chat');
@@ -4795,6 +6064,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceManualResult((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         finalizeStreamingByIntent('chat', `🎯 **Answer:**\n\n${data.answer}`);
       }),
@@ -4802,6 +6072,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
     cleanups.push(
       window.electronAPI.onIntelligenceError((data) => {
+        if (activeDirectAssistRef.current) return;
         setIsProcessing(false);
         setMessages((prev) => [
           ...prev,
@@ -4886,6 +6157,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // Also merge in any screenshot from the capture-and-process shortcut that
     // arrived via pendingCaptureRef before the React state flush (React 18 fix).
     const pending = pendingCaptureRef.current;
+    // The question card's id — kept so the "Page attached" line can be stamped
+    // onto it below, once we know whether captured page context was consumed.
+    const questionCardId = genMessageId();
     let currentAttachments = attachedContext;
     if (pending && !currentAttachments.some((s) => s.path === pending.path)) {
       currentAttachments = [...currentAttachments, pending].slice(-5);
@@ -4897,11 +6171,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       setMessages((prev) => [
         ...prev,
         {
-          id: genMessageId(),
+          id: questionCardId,
           role: 'user',
           text: 'What should I say about this?',
           hasScreenshot: true,
           screenshotPreview: currentAttachments[0].preview,
+          screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
         },
       ]);
       // Scroll to bottom when user sends message
@@ -4913,16 +6188,70 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // never appears with no preceding "question" bubble.
       setMessages((prev) => [
         ...prev,
-        { id: genMessageId(), role: 'user', text: QUICK_ACTION_LABELS.what_to_say, isQuickActionLabel: true },
+        { id: questionCardId, role: 'user', text: QUICK_ACTION_LABELS.what_to_say, isQuickActionLabel: true },
       ]);
     }
 
     // Create AI response placeholder AFTER user message so thinking dots + response
     // appear BELOW the question card (not above it)
-    prepareIntelligenceStreamPlaceholder('what_to_answer');
+    if (!directAssistEnabled) {
+      legacyIntelligenceTombstonedRef.current = false;
+      liveAnswerGenIdRef.current = null;
+      prepareIntelligenceStreamPlaceholder('what_to_answer');
+    }
     analytics.trackCommandExecuted('what_to_say');
 
     try {
+      if (directAssistEnabled) {
+        // Direct screenshot requests never trigger automatic page capture. A
+        // deliberate, already-captured page is still consumed once and can ride
+        // alongside the image because the user explicitly attached both.
+        const directPageContext = consumeDirectPageContext();
+        if (directPageContext) {
+          setMessages((prev) => prev.map((message) =>
+            message.id === questionCardId
+              ? {
+                  ...message,
+                  pageContext: {
+                    title: directPageContext.title,
+                    url: directPageContext.url,
+                  },
+                }
+              : message,
+          ));
+        }
+        // The rolling bar is already capped at 8 KiB. Keep the latest few STT
+        // segments so a question split by punctuation/finalization stays intact,
+        // while older meeting discussion cannot become the primary request.
+        const directTranscriptSnapshot = pendingRollingPartialRef.current
+          ? mergeRollingTranscriptPartial(rollingTranscript, pendingRollingPartialRef.current)
+          : rollingTranscript;
+        const interviewerRequest = directTranscriptSnapshot
+          .split('  ·  ')
+          .slice(-4)
+          .join('  ·  ')
+          .trim()
+          .slice(-8192);
+        const hasScreenshots = currentAttachments.length > 0;
+        const directWhatToSayPayload = buildDirectWhatToSayPayload({
+          interviewerRequest,
+          dynamicPromptInstruction,
+          hasScreenshots,
+        });
+        await beginDirectAssist({
+          source: directWhatToSayPayload.source,
+          currentRequest: directWhatToSayPayload.currentRequest,
+          imagePaths: currentAttachments.map((attachment) => attachment.path),
+          pageContext: directPageContext,
+          // When a screenshot is the request surface, retain STT provenance as a
+          // separate untrusted field so main can enforce transcript scope instead
+          // of disguising meeting audio as typed text.
+          transcript: directWhatToSayPayload.transcript,
+          userMessageId: questionCardId,
+        });
+        return;
+      }
+
       // Smart Browser Context v2 — just-in-time auto-attach. If NO manual context
       // is already captured, ask the extension for the best auto context (it only
       // attaches a high-confidence coding page; sensitive/unknown pages are
@@ -4931,10 +6260,33 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // is nothing to attach, so the answer is never blocked. The captured DOM (if
       // any) arrives via onDomContextReceived → window.lastCapturedDOM, which we
       // re-read below — reusing the proven domContext seam.
+      // One-motion ⌘Y→Enter: if a manual capture is IN FLIGHT (⌘Y pressed a
+      // beat ago, /dom not yet delivered), wait for it — up to the desktop's
+      // own capture timeout — instead of racing past it. Delivery or the
+      // fallback notice clears the pending flag and ends the wait early.
+      const pendingAt = pendingPageCaptureAtRef.current;
+      if (pendingAt && Date.now() - pendingAt < 5000) {
+        const waitDeadline = Date.now() + 3000;
+        while (
+          pendingPageCaptureAtRef.current
+          && Date.now() < waitDeadline
+          && !(typeof (window as any).lastCapturedDOM === 'string' && (window as any).lastCapturedDOM.trim().length > 0)
+        ) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
       const hasManualContext =
         typeof (window as any).lastCapturedDOM === 'string' &&
         (window as any).lastCapturedDOM.trim().length > 0;
-      if (!hasManualContext) {
+      // Screenshot wins over AUTOMATIC page capture (2026-08-19): a screenshot
+      // is the user deliberately pointing at something; the auto-attach is a
+      // guess about the active browser tab. When both would ride the same
+      // request they can describe DIFFERENT content (screenshot of app A,
+      // active tab B) and always double-bill the same page when they agree —
+      // so with screenshots attached, skip the auto request entirely. Manual
+      // ⌘/Ctrl+Shift+Y captures are just as deliberate as a screenshot and
+      // still attach alongside (hasManualContext path unchanged).
+      if (!hasManualContext && currentAttachments.length === 0) {
         try {
           await window.electronAPI.phoneMirrorRequestAutoContext?.();
         } catch {
@@ -4957,15 +6309,29 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       // once, alongside the legacy string, then cleared.
       const domContextEnvelope = domContext ? capturedEnvelopeRef.current ?? undefined : undefined;
 
+      // Title/URL of the consumed capture — read BEFORE the clears below.
+      const consumedPageMeta = domContext ? capturedMetaRef.current : null;
+
       // Clear the captured DOM immediately after reading it to ensure stale DOM context
       // from prior pages is never re-sent on subsequent requests.
       if (typeof (window as any).lastCapturedDOM === 'string') {
         (window as any).lastCapturedDOM = '';
       }
       capturedEnvelopeRef.current = null;
+      capturedMetaRef.current = null;
       // Retire the "Page context" pill the moment the context is actually consumed,
       // so the lifecycle reads: capture → pill appears → answer → pill disappears.
       if (domContext) setPageContext(null);
+
+      // Stamp the question card with the page that fed this answer — the pill
+      // above just vanished on consumption, so without this nothing in the chat
+      // ever showed WHICH page was attached (mirrors "Screenshot attached").
+      if (domContext) {
+        const pageMeta = consumedPageMeta ?? {};
+        setMessages((prev) =>
+          prev.map((m) => (m.id === questionCardId ? { ...m, pageContext: pageMeta } : m)),
+        );
+      }
 
       if (domContext) {
         console.debug(`[DOM Context] Forwarding captured active-tab DOM structure (${domContext.length} chars)`);
@@ -5038,7 +6404,9 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       pinAnswerPanel();
     } finally {
       endOverlayAction('what_to_say');
-      setIsProcessing(false);
+      // A Direct stream outlives the start IPC acknowledgement; its correlated
+      // terminal event owns the processing state. Legacy WTA is request/response.
+      if (!directAssistEnabled) setIsProcessing(false);
     }
   };
 
@@ -5166,6 +6534,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
       ]);
       return;
     }
+    legacyIntelligenceTombstonedRef.current = false;
+    liveAnswerGenIdRef.current = null;
     setIsExpanded(true);
     setIsProcessing(true);
     pinAnswerPanel();
@@ -5182,6 +6552,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           text: 'Give me a code hint for this',
           hasScreenshot: true,
           screenshotPreview: currentAttachments[0].preview,
+          screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
         },
       ]);
       // Scroll to bottom when user sends message
@@ -5218,6 +6589,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
 
   const handleBrainstorm = async () => {
     if (!tryBeginOverlayAction('brainstorm')) return;
+    legacyIntelligenceTombstonedRef.current = false;
+    liveAnswerGenIdRef.current = null;
     setIsExpanded(true);
     setIsProcessing(true);
     analytics.trackCommandExecuted('brainstorm');
@@ -5234,6 +6607,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           text: 'Brainstorm with this context',
           hasScreenshot: true,
           screenshotPreview: currentAttachments[0].preview,
+          screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
         },
       ]);
       // Scroll to bottom when user sends message
@@ -5281,8 +6655,15 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // without a streamId (back-compat) are always accepted.
     cleanups.push(
       window.electronAPI.onGeminiStreamToken((token, meta) => {
-        const decision = resolveChatStreamToken(chatStreamIdRef.current, meta?.streamId);
+        // Direct Assist owns this overlay row while active. A legacy token that
+        // was already queued before cancellation must never be adopted into it.
+        if (activeDirectAssistRef.current) return;
+        const decision = resolveChatStreamToken(
+          chatStreamIdRef.current, meta?.streamId,
+          chatStreamSourceRef.current, (meta as any)?.source,
+        );
         chatStreamIdRef.current = decision.activeId;
+        chatStreamSourceRef.current = decision.activeSource ?? null;
         if (!decision.accept) return;
         queueToken('chat', token);
       }),
@@ -5291,12 +6672,23 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // Stream Done
     cleanups.push(
       window.electronAPI.onGeminiStreamDone((data) => {
+        if (activeDirectAssistRef.current) return;
         // Ignore a done from a superseded stream (audit finding #3) so it can't
         // tear down a newer stream's row. A done without a streamId is honored
         // (back-compat). On an honored done we clear the adopted id.
-        const doneDecision = resolveChatStreamDone(chatStreamIdRef.current, data?.streamId);
+        const doneDecision = resolveChatStreamDone(
+          chatStreamIdRef.current, data?.streamId,
+          chatStreamSourceRef.current, (data as any)?.source,
+        );
         chatStreamIdRef.current = doneDecision.activeId;
-        if (!doneDecision.honor) return;
+        chatStreamSourceRef.current = doneDecision.activeSource ?? null;
+        if (!doneDecision.honor) {
+          // CR-01: a done we do not honor still ends the request THIS surface
+          // started. Without this the spinner runs forever whenever the user
+          // types while a phone-mirror answer is streaming.
+          if (doneDecision.release) setIsProcessing(false);
+          return;
+        }
         // finalText is set ONLY when the backend's coding validate→repair changed
         // the streamed answer — it authoritatively REPLACES the streamed row text
         // (in-place, by id) so the user sees the corrected six-section markdown.
@@ -5426,12 +6818,29 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // Stream Error
     cleanups.push(
       window.electronAPI.onGeminiStreamError((error, meta?: { streamId?: number | null; source?: string }) => {
+        if (activeDirectAssistRef.current) return;
         // Guard (2026-07-31): a tagged error belonging to another stream must
         // not tear down the one we're rendering. A phone-mirror failure carries
         // source:'phone-mirror' and no streamId; a desktop failure carries the
         // originating streamId — drop it unless it matches the adopted stream.
         // Untagged errors keep the legacy behavior exactly.
-        if (meta?.source === 'phone-mirror') return;
+        if (meta?.source === 'phone-mirror') {
+          // R-02: this branch deliberately keeps a phone failure out of the
+          // desktop UI, but it must still RELEASE the stream guard. Phone
+          // tokens are tagged source:'phone' (ipcHandlers.ts:12814) while this
+          // error is tagged 'phone-mirror' (:12851), and a provider that throws
+          // AFTER committing tokens never sends a `done` — so a phone turn that
+          // failed mid-answer left the guard pinned to the phone surface
+          // forever. Every later DESKTOP stream was then rejected as a
+          // cross-surface supersession (accept:false / honor:false): no text at
+          // all and a spinner that never stopped, until the user hit Escape.
+          // Releasing is safe here because this phone stream is definitively over.
+          if (resolveChatStreamSurfaceError(chatStreamSourceRef.current, meta.source).release) {
+            chatStreamIdRef.current = null;
+            chatStreamSourceRef.current = null;
+          }
+          return;
+        }
         if (typeof meta?.streamId === 'number'
           && chatStreamIdRef.current !== null
           && meta.streamId !== chatStreamIdRef.current) return;
@@ -5442,6 +6851,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         // next stream starts clean (audit finding #3). Safe today because ids are
         // monotonic, but keeps token/done/error ref management consistent.
         chatStreamIdRef.current = null;
+      chatStreamSourceRef.current = null;
         setMessages((prev) => {
           // Append error to the current message or add new one?
           // Let's add a new error block if the previous one confusing,
@@ -5473,6 +6883,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     // event adds the user turn + streaming placeholder before tokens arrive.
     cleanups.push(
       window.electronAPI.onPhoneMirrorIncomingChat(({ message }) => {
+        if (activeDirectAssistRef.current) return;
         flushToken();
         requestStartTimeRef.current = Date.now();
         const userId = genMessageId();
@@ -5599,6 +7010,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (window.electronAPI.onRAGStreamChunk) {
       cleanups.push(
         window.electronAPI.onRAGStreamChunk((data: { chunk: string }) => {
+          if (activeDirectAssistRef.current) return;
           ragArrivedTextRef.current += data.chunk;
           ensureRagRevealTicker();
         }),
@@ -5608,6 +7020,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (window.electronAPI.onRAGStreamComplete) {
       cleanups.push(
         window.electronAPI.onRAGStreamComplete(() => {
+          if (activeDirectAssistRef.current) return;
           setIsProcessing(false);
           requestStartTimeRef.current = null;
           if (STREAM_RENDER_CONFIG.flushImmediatelyOnComplete) {
@@ -5647,11 +7060,12 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
     if (window.electronAPI.onRAGStreamError) {
       cleanups.push(
         window.electronAPI.onRAGStreamError((data: { error: string }) => {
+          if (activeDirectAssistRef.current) return;
+          flushRagChunkBuffer();
           // Errors are always instant, never deferred — flushRagChunkBuffer
           // resets ragDoneRef/accumulator/pacer so a still-running ticker
           // (if any) can't later overwrite the error text appended below
           // with a stale `fullText.slice(0, revealedLen)` commit.
-          flushRagChunkBuffer();
           setIsProcessing(false);
           requestStartTimeRef.current = null;
           setMessages((prev) => {
@@ -5690,9 +7104,18 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         setIsManualRecording(false);
         setManualTranscript('');
 
-        window.electronAPI
-          .finalizeMicSTT()
-          .catch((err) => console.error('[NativelyInterface] Failed to send finalizeMicSTT:', err));
+        // Wait for the final STT flush acknowledgement before snapshotting refs.
+        // Older preloads may never acknowledge, so cap the wait and allow one
+        // short renderer turn for the final transcript IPC to land.
+        try {
+          await Promise.race([
+            window.electronAPI.finalizeMicSTT(),
+            new Promise<void>((resolve) => setTimeout(resolve, 750)),
+          ]);
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        } catch (err) {
+          console.error('[NativelyInterface] Failed to finalize mic STT:', err);
+        }
 
         const currentAttachments = attachedContext;
         setAttachedContext([]);
@@ -5739,20 +7162,50 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
           return;
         }
 
+        const userMessageId = genMessageId();
         setMessages((prev) => [
           ...prev,
           {
-            id: genMessageId(),
+            id: userMessageId,
             role: 'user',
             text: question,
             hasScreenshot: currentAttachments.length > 0,
             screenshotPreview: currentAttachments[0]?.preview,
+            screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
           },
         ]);
 
         setTimeout(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         }, 50);
+
+        if (directAssistEnabled) {
+          const directPageContext = consumeDirectPageContext();
+          if (directPageContext) {
+            setMessages((prev) => prev.map((message) =>
+              message.id === userMessageId
+                ? {
+                    ...message,
+                    pageContext: {
+                      title: directPageContext.title,
+                      url: directPageContext.url,
+                    },
+                  }
+                : message,
+            ));
+          }
+          await beginDirectAssist({
+            // A recording turn with no recognized speech is image-only. Mark it
+            // as screenshot input so transcript privacy does not reject a valid
+            // deliberate capture that contains no transcript at all.
+            source: question ? 'stt' : 'screenshot',
+            currentRequest: question || 'Analyze the attached screenshot.',
+            imagePaths: currentAttachments.map((attachment) => attachment.path),
+            pageContext: directPageContext,
+            userMessageId,
+          });
+          return;
+        }
 
         // A previous turn's RAG answer may still be deferred-draining (see
         // forceFinalizeStaleRagStream's declaration) — force it to its final
@@ -5809,6 +7262,14 @@ Instructions:
 Provide only the answer, nothing else.`;
           }
 
+          // R-17: claim the desktop surface BEFORE the round-trip. The stream's
+          // id does not exist until main allocates it, so without a claim a
+          // phone turn still streaming owns the guard and swallows this whole
+          // answer (see chatStreamGuard.mjs). Claiming also evicts that phone
+          // stream from the bubble, which is correct: the user just chose this
+          // surface. The desktop done/error handlers both clear it again.
+          chatStreamIdRef.current = null;
+          chatStreamSourceRef.current = 'desktop';
           requestStartTimeRef.current = Date.now();
           await window.electronAPI.streamGeminiChat(
             question,
@@ -5817,6 +7278,12 @@ Provide only the answer, nothing else.`;
             { skipSystemPrompt: true },
           );
         } catch (err) {
+          // R-17: a throw from invoke() never reaches the main process, so no
+          // gemini-stream-error follows and nothing else releases the claim we
+          // took above. Left set, it would pin the guard to 'desktop' and block
+          // every phone turn — the bug this fix removes, inverted.
+          chatStreamIdRef.current = null;
+          chatStreamSourceRef.current = null;
           setIsProcessing(false);
           setMessages((prev) => {
             const last = prev[prev.length - 1];
@@ -5868,6 +7335,7 @@ Provide only the answer, nothing else.`;
   const handleManualSubmit = async () => {
     if (!inputValue.trim() && attachedContext.length === 0) return;
 
+    const rawUserText = inputValue;
     const userText = inputValue.trim();
     const nowMs = Date.now();
     if (manualSubmitInFlightRef.current) return;
@@ -5886,7 +7354,6 @@ Provide only the answer, nothing else.`;
     lastManualSubmitRef.current = { text: userText, atMs: nowMs };
 
     const currentAttachments = attachedContext;
-    const conversationContextForSubmit = buildConversationContextFromMessages(messages);
 
     // Clear inputs immediately
     setInputValue('');
@@ -5912,14 +7379,16 @@ Provide only the answer, nothing else.`;
         : prev,
     );
 
+    const userMessageId = genMessageId();
     setMessages((prev) => [
       ...prev,
       {
-        id: genMessageId(),
+        id: userMessageId,
         role: 'user',
         text: userText || (currentAttachments.length > 0 ? 'Analyze this screenshot' : ''),
         hasScreenshot: currentAttachments.length > 0,
         screenshotPreview: currentAttachments[0]?.preview,
+        screenshotPreviews: currentAttachments.map((a) => a.preview).filter(Boolean),
       },
     ]);
 
@@ -5927,6 +7396,39 @@ Provide only the answer, nothing else.`;
     setTimeout(() => {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, 50);
+
+    if (directAssistEnabled) {
+      try {
+        const directPageContext = consumeDirectPageContext();
+        if (directPageContext) {
+          setMessages((prev) => prev.map((message) =>
+            message.id === userMessageId
+              ? {
+                  ...message,
+                  pageContext: {
+                    title: directPageContext.title,
+                    url: directPageContext.url,
+                  },
+                }
+              : message,
+          ));
+        }
+        await beginDirectAssist({
+          source: 'typed',
+          // Keep the user's typed instruction unchanged. Only an attachment-only
+          // turn needs a deterministic fallback because it has no text to retain.
+          currentRequest: rawUserText.trim().length > 0
+            ? rawUserText
+            : 'Analyze the attached screenshot.',
+          imagePaths: currentAttachments.map((attachment) => attachment.path),
+          pageContext: directPageContext,
+          userMessageId,
+        });
+      } finally {
+        manualSubmitInFlightRef.current = false;
+      }
+      return;
+    }
 
     // A previous turn's RAG answer may still be deferred-draining (see
     // forceFinalizeStaleRagStream's declaration) — force it to its final
@@ -5962,6 +7464,7 @@ Provide only the answer, nothing else.`;
     setIsExpanded(true);
     setIsProcessing(true);
     pinAnswerPanel();
+    const conversationContextForSubmit = buildConversationContextFromMessages(messages);
 
     try {
       // JIT RAG pre-flight: try to use indexed meeting context first
@@ -5974,6 +7477,10 @@ Provide only the answer, nothing else.`;
       }
 
       // Pass imagePath if attached, AND conversation context
+      // R-17: claim the desktop surface before the round-trip (see the note at
+      // the other streamGeminiChat call site).
+      chatStreamIdRef.current = null;
+      chatStreamSourceRef.current = 'desktop';
       requestStartTimeRef.current = Date.now();
       await window.electronAPI.streamGeminiChat(
         userText || 'Analyze this screenshot',
@@ -5981,6 +7488,9 @@ Provide only the answer, nothing else.`;
         conversationContextForSubmit, // Pass freshly-derived context so "answer this" works
       );
     } catch (err) {
+      // R-17: release the claim taken above — see the note at the other call site.
+      chatStreamIdRef.current = null;
+      chatStreamSourceRef.current = null;
       setIsProcessing(false);
       setMessages((prev) => {
         const last = prev[prev.length - 1];
@@ -6221,7 +7731,13 @@ Provide only the answer, nothing else.`;
       // We split by code blocks to keep the "Code Solution" UI intact for the code parts
       // But use ReactMarkdown for the text parts around it
       if (msg.isCode || (msg.role === 'system' && msg.text.includes('```'))) {
-        const parts = msg.text.split(/(```[\s\S]*?(?:```|$))/g);
+        // Teleprompter gist on CODE answers (live report 2026-08-23:
+        // "[[GIST]] Use a hash map for O(n) lookup" painted literally): this
+        // branch returned before the gist split below ever ran, so every
+        // fenced answer rendered the marker as text. Split it off here and
+        // render the same bottom chip the prose surfaces use.
+        const { body: codeGistBody, gist: codeGistLine } = splitGistLine(msg.text);
+        const parts = codeGistBody.split(/(```[\s\S]*?(?:```|$))/g);
         return (
           // code-card-mount-in: a one-time cross-fade (@starting-style, see
           // index.css) for the FIRST render of this branch — i.e. exactly
@@ -6322,6 +7838,7 @@ Provide only the answer, nothing else.`;
                   </div>
                 );
               })}
+              {codeGistLine ? <div className="overlay-gist-chip">{codeGistLine}</div> : null}
             </div>
           </div>
         );
@@ -7424,7 +8941,7 @@ Provide only the answer, nothing else.`;
   // Suppressed: mode label pill is not required in the UI.
   // Suppressed: LLM privacy label pill is not required in the UI.
   // Suppressed: vision pill ("Vision: provider") is not required in the UI.
-  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext;
+  const hasStatusPill = shouldShowSttSummaryPill || !!pageContext || !!captureFallback;
   const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/55 border-black/10' : 'bg-black/20 border-white/10'}`;
 
   // Suppress the shell's scale/translate entry animation until it has rendered
@@ -7451,6 +8968,7 @@ Provide only the answer, nothing else.`;
     const report = [
       '## STT Diagnostic Report',
       `App Version: ${version}`,
+      `Build Commit: ${import.meta.env.VITE_BUILD_COMMIT || 'unknown'}`,
       `Platform: ${osVersion} (${arch})`,
       `---`,
       `Microphone Provider: ${sttUserProvider}`,
@@ -7555,7 +9073,7 @@ Provide only the answer, nothing else.`;
             <motion.div
               ref={shellRef}
               data-shell-card=""
-              className={`relative max-w-full backdrop-blur-2xl border rounded-[24px] overflow-hidden flex flex-col draggable-area overlay-shell-surface ${overlayPanelClass}`}
+              className={`relative max-w-full backdrop-blur-2xl border rounded-[24px] overflow-hidden flex flex-col draggable-area overlay-shell-surface overlay-shell-container ${overlayPanelClass}`}
               style={{
                 ...appearance.shellStyle,
                 // The panel width is bound to the LIVE `shellWidth` motion value,
@@ -7633,6 +9151,23 @@ Provide only the answer, nothing else.`;
                           }
                         } catch (_) {}
                       }}
+                    >
+                      <X className="h-2.5 w-2.5" />
+                    </button>
+                  </div>
+                )}
+                {captureFallback && (
+                  <div
+                    className={`${statusPillBaseClass} ${getStatusToneClass('warn')} pr-1.5`}
+                    title={captureFallback.detail}
+                  >
+                    <Image className="h-3 w-3 opacity-70" />
+                    <span className="max-w-[260px] truncate">{captureFallback.label}</span>
+                    <button
+                      type="button"
+                      aria-label={t('Dismiss page capture notice')}
+                      className="ml-0.5 rounded-full p-0.5 opacity-60 hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/10 transition-opacity"
+                      onClick={() => setCaptureFallback(null)}
                     >
                       <X className="h-2.5 w-2.5" />
                     </button>
@@ -8277,7 +9812,7 @@ Provide only the answer, nothing else.`;
                   )}
                 </AnimatePresence>
                 <div
-                  className={`flex flex-nowrap justify-center items-center gap-1.5 px-4 pb-3 overflow-x-hidden ${rollingTranscript && showTranscript ? 'pt-1' : 'pt-3'}`}
+                  className={`flex flex-wrap justify-center items-center gap-1.5 px-4 pb-3 max-w-full overflow-visible ${rollingTranscript && showTranscript ? 'pt-1' : 'pt-3'}`}
                 >
                 <button
                   onClick={handleWhatToSay}
@@ -8366,7 +9901,7 @@ Provide only the answer, nothing else.`;
                           <img
                             src={ctx.preview}
                             alt={`Screenshot ${idx + 1}`}
-                            className={`h-10 w-auto rounded border ${isLightTheme ? 'border-black/15' : 'border-white/20'}`}
+                            className={`h-12 w-auto rounded-[10px] border object-cover shadow-sm ${isLightTheme ? 'border-black/15' : 'border-white/20'}`}
                           />
                           <button
                             onClick={() =>
@@ -8562,9 +10097,10 @@ Provide only the answer, nothing else.`;
 
                   {/* Custom Rich Placeholder */}
                   {!inputValue && (
-                    <div className="absolute left-3 top-1/2 -translate-y-1/2 flex items-center gap-1.5 pointer-events-none text-[13px] overlay-text-muted">
-                      <span>{t('Ask anything on screen or conversation, or')}</span>
-                      <div className="flex items-center gap-1 opacity-80">
+                    <div className="absolute inset-x-3 top-1/2 -translate-y-1/2 min-w-0 overflow-hidden whitespace-nowrap pointer-events-none text-[13px] overlay-text-muted">
+                      <span className="overlay-input-placeholder-full inline-flex items-center gap-1.5">
+                        <span>{t('Ask anything on screen or conversation, or')}</span>
+                      <span className="flex items-center gap-1 opacity-80">
                         {(
                           shortcuts.selectiveScreenshot || [getModifierSymbol('cmd'), 'Shift', 'H']
                         ).map((key, i) => (
@@ -8578,8 +10114,10 @@ Provide only the answer, nothing else.`;
                             </kbd>
                           </React.Fragment>
                         ))}
-                      </div>
+                      </span>
                       <span>{t('for selective screenshot')}</span>
+                      </span>
+                      <span className="overlay-input-placeholder-compact">{t('Ask anything…')}</span>
                     </div>
                   )}
 
@@ -8591,7 +10129,7 @@ Provide only the answer, nothing else.`;
                 </div>
 
                 {/* Bottom Row */}
-                <div className="flex items-center justify-between mt-3 px-0.5">
+                <div className="flex items-center justify-between mt-3 px-0.5 relative z-[60]">
                   <div className="flex items-center gap-1.5">
                     <button
                       data-model-selector-toggle="true"
@@ -8638,10 +10176,15 @@ Provide only the answer, nothing else.`;
                           if (currentModelDisplayName && currentModelDisplayName !== m) {
                             return currentModelDisplayName;
                           }
+                          if (m === 'gemini-3.7-flash') return 'Gemini 3.7 Flash';
+                          // Legacy id, still valid and still selectable from
+                          // persisted state — name it instead of showing the slug.
                           if (m === 'gemini-3.6-flash') return 'Gemini 3.6 Flash';
                           if (m === 'gemini-3.1-flash-lite') return 'Gemini 3.1 Flash Lite';
                           if (m === 'gemini-3.1-pro-preview') return 'Gemini 3.1 Pro';
-                          if (m === 'llama-3.3-70b-versatile') return 'Groq Llama 3.3';
+                          if (m === 'qwen/qwen3.6-27b') return 'Groq Qwen 3.6';
+                          if (m === 'openai/gpt-oss-120b') return 'Groq GPT-OSS 120B';
+                          if (m === 'openai/gpt-oss-20b') return 'Groq GPT-OSS 20B';
                           if (m === 'gpt-5.4') return 'GPT 5.4';
                           if (m === 'claude-sonnet-4-6') return 'Sonnet 4.6';
                           return m;
@@ -8649,6 +10192,16 @@ Provide only the answer, nothing else.`;
                       </span>
                       <ChevronDown size={14} className="shrink-0 transition-transform" />
                     </button>
+
+                    {directAssistEnabled && (
+                      <span
+                        className="px-1.5 py-0.5 rounded-md text-[9px] font-semibold uppercase tracking-wide text-emerald-300 bg-emerald-400/10 border border-emerald-400/20"
+                        title={t('Direct Assist sends the current request straight to the active model')}
+                        data-testid="direct-assist-badge"
+                      >
+                        {t('Direct')}
+                      </span>
+                    )}
 
                     <div className="w-px h-3 mx-1" style={appearance.dividerStyle} />
 
@@ -8735,6 +10288,37 @@ Provide only the answer, nothing else.`;
                   </button>
                 </div>
               </div>
+
+              {/* Resize handles. EAST-side only — see handleResizePointerDown
+                  for why a west-side handle cannot be made artifact-free.
+                  Double-click any of them to return to automatic sizing. */}
+              <div
+                data-resize-handle="e"
+                className="resize-handle resize-handle-e absolute top-4 bottom-4 right-0 z-50 w-4 no-drag touch-none"
+                onPointerDown={(e) => handleResizePointerDown('e', e)}
+                onDoubleClick={handleResizeReset}
+                // The strip covers the right 16px of the message list and is a
+                // SIBLING of the scroll container, so a wheel over it would
+                // otherwise do nothing at all. Forward it by hand.
+                onWheel={(e) => {
+                  scrollContainerRef.current?.scrollBy({ top: e.deltaY });
+                }}
+                title={t('Drag to resize width · double-click to reset')}
+              />
+              <div
+                data-resize-handle="s"
+                className="resize-handle resize-handle-s absolute bottom-0 left-8 right-8 z-50 h-4 no-drag touch-none"
+                onPointerDown={(e) => handleResizePointerDown('s', e)}
+                onDoubleClick={handleResizeReset}
+                title={t('Drag to resize height · double-click to reset')}
+              />
+              <div
+                data-resize-handle="se"
+                className="resize-handle resize-handle-se absolute bottom-0 right-0 z-50 h-9 w-9 no-drag touch-none"
+                onPointerDown={(e) => handleResizePointerDown('se', e)}
+                onDoubleClick={handleResizeReset}
+                title={t('Drag to resize · double-click to reset')}
+              />
             </motion.div>
           </motion.div>
       {/* end always-mounted shell */}
